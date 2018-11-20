@@ -31,6 +31,7 @@ type Token struct {
 type Tokenizer struct {
 	tokens    []Token
 	line      string
+	notEmpty  bool
 	begTok    int
 	cursorLoc int
 	cursor    byte
@@ -38,7 +39,7 @@ type Tokenizer struct {
 
 /*NewTokenizer creates a tokenizer struct and initializes all of its fields to their default values*/
 func NewTokenizer() Tokenizer {
-	return Tokenizer{[]Token{}, "", 0, 0, '0'}
+	return Tokenizer{[]Token{}, "", false, 0, 0, '0'}
 }
 
 /*Tokenize takes in an entire program as a string argument and parses it into tokens
@@ -53,7 +54,7 @@ func (t *Tokenizer) Tokenize(input string) {
 		for ; !t.AtEnd(); t.Advance() {
 			t.begTok = t.cursorLoc
 			switch t.cursor {
-			case ' ', '\t':
+			case ' ', '\t', '\r':
 				//Eat whitespace
 				continue
 			case '+':
@@ -72,11 +73,14 @@ func (t *Tokenizer) Tokenize(input string) {
 				if IsNum(t.cursor) {
 					t.Number()
 				} else {
-					ParseError(lineNo, fmt.Sprintf("near -> '%s'", t.line[t.cursorLoc:]))
+					ParseError(lineNo + 1, fmt.Sprintf("near -> '%s'", t.line[t.cursorLoc:]))
 				}
 			}
+			t.notEmpty = true
 		}
-		t.AddToken(END_LINE, "")
+		if t.notEmpty {
+			t.AddToken(END_LINE, "")
+		}
 	}
 }
 
@@ -118,6 +122,7 @@ func (t *Tokenizer) AtEnd() bool {
 /*NewLine resets the tokenizer object to read in a new line */
 func (t *Tokenizer) NewLine(line string) {
 	t.line = line
+	t.notEmpty = false
 	t.begTok = 0
 	t.cursorLoc = 0
 	t.cursor = t.line[0]

@@ -31,10 +31,11 @@ func main() {
 
 /*RunFile Reads file into biffer and then runs it */
 func RunFile(s Settings) {
-	input, err := ioutil.ReadFile(s.fileLoc)
+	inputBytes, err := ioutil.ReadFile(s.fileLoc)
 	CheckError(err)
 	tokenizer := NewTokenizer()
-	tokenizer.Tokenize(string(input))
+	inputString := string(inputBytes) + "\r\n"
+	tokenizer.Tokenize(inputString)
 	for lineNo, token := range tokenizer.tokens {
 		fmt.Printf("Token num: %d; %v\n", lineNo, token)
 	}
