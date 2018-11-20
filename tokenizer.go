@@ -46,6 +46,9 @@ func NewTokenizer() Tokenizer {
 func (t *Tokenizer) Tokenize(input string) {
 	lines := strings.Split(input, "\n")
 	for lineNo, line := range lines {
+		if line == "" {
+			continue
+		}
 		t.NewLine(line)
 		for ; !t.AtEnd(); t.Advance() {
 			t.begTok = t.cursorLoc
