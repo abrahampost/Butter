@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"io/ioutil"
 	"os"
 )
 
@@ -23,5 +23,24 @@ func main() {
 	settings := Settings{false, ""}
 	settings.Parse()
 
-	fmt.Println()
+	if settings.fromFile {
+		RunFile(settings)
+	}
+}
+
+func RunFile(s Settings) {
+	input, err := ioutil.ReadFile(s.fileLoc)
+	CheckError(err)
+	tokenizer := NewTokenizer()
+	tokenizer.Tokenize(string(input))
+}
+
+func CheckError(err error) {
+	if err != nil {
+		CompileError(err.Error())
+	}
+}
+
+func CompileError(message string) {
+	panic("ERROR: " + message)
 }
