@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"strings"
 )
 
 /*TokenType is an alias to create a const based enum to determine the type of token */
@@ -15,79 +14,71 @@ const (
 	MULT
 	DIV
 	EQUAL
-	LEFT_GROUP
-	RIGHT_GROUP
 	NUM
-	END_LINE
+	NEW_LINE
+	EOF
 )
 
 /*Token contains the Type of the token object and the value stored there */
 type Token struct {
 	Type    TokenType
 	literal string
+	line 	int
 }
 
 /*Tokenizer contains a list of tokens and information about the line currently being parsed */
 type Tokenizer struct {
+	inputString string
 	tokens    []Token
-	line      string
-	notEmpty  bool
-	begTok    int
+	begTok	int
 	cursorLoc int
 	cursor    byte
+	lineNo	  int
 }
 
 /*NewTokenizer creates a tokenizer struct and initializes all of its fields to their default values*/
-func NewTokenizer() Tokenizer {
-	return Tokenizer{[]Token{}, "", false, 0, 0, '0'}
+func NewTokenizer(inputString string) Tokenizer {
+	return Tokenizer{inputString, []Token{}, 0, 0, '0', 0}
 }
 
 /*Tokenize takes in an entire program as a string argument and parses it into tokens
   which it stores in the Tokens field of the tokenizer object it is called on */
-func (t *Tokenizer) Tokenize(input string) {
-	lines := strings.Split(input, "\n")
-	for lineNo, line := range lines {
-		if line == "" {
+func (t *Tokenizer) Tokenize() {
+	for cursor := t.inputString[0]; !t.AtEnd(); cursor = t.Advance() {
+		switch cursor {
+		case 0:
+			t.AddToken(EOF, "")
+			break
+		case ' ', '\t', '\r':
+			//Eat whitespace
 			continue
-		}
-		t.NewLine(line)
-		for ; !t.AtEnd(); t.Advance() {
-			t.begTok = t.cursorLoc
-			switch t.cursor {
-			case ' ', '\t', '\r':
-				//Eat whitespace
-				continue
-			case '+':
-				t.AddToken(PLUS, "")
-			case '-':
-				t.AddToken(MINUS, "")
-			case '*':
-				t.AddToken(MULT, "")
-			case '/':
-				t.AddToken(DIV, "")
-			case '(':
-				t.AddToken(LEFT_GROUP, "")
-			case ')':
-				t.AddToken(RIGHT_GROUP, "")
-			default:
-				if IsNum(t.cursor) {
-					t.Number()
-				} else {
-					ParseError(lineNo + 1, fmt.Sprintf("near -> '%s'", t.line[t.cursorLoc:]))
-				}
+		case '\n':
+			t.lineNo++
+			t.AddToken(NEW_LINE, "")
+		case '+':
+			t.AddToken(PLUS, "")
+		case '-':
+			t.AddToken(MINUS, "")
+		case '*':
+			t.AddToken(MULT, "")
+		case '/':
+			t.AddToken(DIV, "")
+		default:
+			if IsNum(t.cursor) {
+				t.Number()
+			} else {
+				ParseError(t.lineNo + 1, fmt.Sprintf("near -> '%c'", t.inputString[t.cursorLoc-1]))
 			}
-			t.notEmpty = true
-		}
-		if t.notEmpty {
-			t.AddToken(END_LINE, "")
 		}
 	}
+	t.AddToken(EOF, "")
 }
 
 /*IsNum returns true if the byte passes is a char corresponding to the numbers 0 through 9*/
 func IsNum(b byte) bool {
 	val := b - '0'
-	return val >= 0 && val <= 9
+	isNum := val >= 0 && val <= 9
+	return isNum
 }
 
 /*Number eats characters until it reaches a non-numeric character, then creates a new token*/
@@ -95,41 +86,34 @@ func (t *Tokenizer) Number() {
 	for !t.AtEnd() && IsNum(t.cursor) && IsNum(t.PeekNext()) {
 		t.Advance()
 	}
-	t.AddToken(NUM, t.line[t.begTok:t.cursorLoc+1])
+	t.AddToken(NUM, t.inputString[t.begTok:t.cursorLoc])
 }
 
 /*Advance advances the cursor by 1 non-whitespace value within the tokenizer object */
-func (t *Tokenizer) Advance() {
+func (t *Tokenizer) Advance() byte {
 	if !t.AtEnd() {
 		t.cursorLoc++
-		t.cursor = t.line[t.cursorLoc]
 	}
+	t.cursor = t.inputString[t.cursorLoc - 1]
+	return t.cursor
 }
 
 /*PeekNext looks at the next character after the current cursor location */
 func (t *Tokenizer) PeekNext() byte {
-	if t.cursorLoc+1 < len(t.line) {
-		return t.line[t.cursorLoc+1]
+	if t.cursorLoc < len(t.inputString) {
+		return t.inputString[t.cursorLoc]
 	}
 	return 0
 }
 
 /*AtEnd returns true if we have reached the end of the line to be read in, otherwise false */
 func (t *Tokenizer) AtEnd() bool {
-	return t.cursorLoc >= len(t.line)-1
-}
-
-/*NewLine resets the tokenizer object to read in a new line */
-func (t *Tokenizer) NewLine(line string) {
-	t.line = line
-	t.notEmpty = false
-	t.begTok = 0
-	t.cursorLoc = 0
-	t.cursor = t.line[0]
+	return t.cursorLoc > len(t.inputString)-1
 }
 
 /*AddToken adds a token to the token list contained within the Tokenizer object */
 func (t *Tokenizer) AddToken(tokenType TokenType, literal string) {
-	token := Token{tokenType, literal}
+	token := Token{tokenType, literal, t.lineNo}
+	t.begTok = t.cursorLoc
 	t.tokens = append(t.tokens, token)
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"bufio"
 )
 
 /*Settings struct Contains the settings for the current interpreter */
@@ -20,12 +21,16 @@ func (s *Settings) Parse() {
 	}
 }
 
+var interpreter Interpreter
+
 func main() {
 	settings := Settings{false, ""}
 	settings.Parse()
 
 	if settings.fromFile {
 		RunFile(settings)
+	} else {
+		RunPrompt()
 	}
 }
 
@@ -33,12 +38,29 @@ func main() {
 func RunFile(s Settings) {
 	inputBytes, err := ioutil.ReadFile(s.fileLoc)
 	CheckError(err)
-	tokenizer := NewTokenizer()
 	inputString := string(inputBytes) + "\r\n"
-	tokenizer.Tokenize(inputString)
-	for lineNo, token := range tokenizer.tokens {
-		fmt.Printf("Token num: %d; %v\n", lineNo, token)
+	tokenizer := NewTokenizer(inputString)
+	tokenizer.Tokenize()
+	parser := NewParser(tokenizer.tokens)
+	exprs := parser.Parse()
+	interpreter.Interpret(exprs)
+}
+
+func RunPrompt() {
+	reader := bufio.NewReader(os.Stdin)
+	for true {
+		fmt.Print("> ")
+		input, _ := reader.ReadString('\n')
+		Run(input)
 	}
+}
+
+func Run(source string) {
+	tokenizer := NewTokenizer(source)
+	tokenizer.Tokenize()
+	parser := NewParser(tokenizer.tokens)
+	exprs := parser.Parse()
+	interpreter.Interpret(exprs)
 }
 
 /*CheckError checks to see if an error has been reported from a function */
@@ -58,7 +80,12 @@ func ParseError(line int, message string) {
 	ReportError(errorMessage)
 }
 
+func RuntimeError(message string) {
+	ReportError("RUNTIME_ERROR: " + message)
+}
+
 /*ReportError stops execution of the program with a panic reporting the message argument */
 func ReportError(message string) {
-	panic(message)
+	fmt.Fprintf(os.Stderr, message + "\n")
+	os.Exit(1)
 }
