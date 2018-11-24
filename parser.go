@@ -17,6 +17,8 @@ func (p *Parser) Parse() []Expr {
 	var expressions []Expr
 	for !p.AtEnd() {
 		expressions = append(expressions, p.Line())
+		//Eat empty lines
+		for !p.AtEnd() && p.Match(NEW_LINE) {}
 	}
 	return expressions
 }
@@ -26,7 +28,6 @@ func (p *Parser) Line() Expr {
 	if !p.Match(NEW_LINE, EOF) {
 		ParseError(p.Current().line, "Expected end of line after expression")
 	}
-	for !p.AtEnd() && p.Match(NEW_LINE, EOF) {}
 	return expr
 }
 
@@ -78,7 +79,7 @@ func (p *Parser) Literal() Expr {
 }
 
 func (p *Parser) AtEnd() bool {
-	return p.current > len(p.tokens) - 1
+	return p.Current().Type == EOF
 }
 
 func (p *Parser) Advance() {
