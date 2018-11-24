@@ -18,6 +18,14 @@ const (
 	RIGHT_GROUP
 	NUM
 	PRINT
+	BANG
+	BANG_EQUAL
+	EQUAL_EQUAL
+	LESS
+	LESS_EQUAL
+	GREATER
+	GREATER_EQUAL
+	ASSIGN
 	IDENTIFIER
 	NEW_LINE
 	EOF
@@ -50,6 +58,22 @@ func (t Token) String() string {
 		return "Token: NUM; literal ->" + t.literal
 	case PRINT:
 		return "Token: PRINT; literal ->" + t.literal
+	case BANG:
+		return "Token: BANG; literal ->" + t.literal
+	case BANG_EQUAL:
+		return "Token: BANG_EQUAL; literal ->" + t.literal
+	case EQUAL_EQUAL:
+		return "Token: EQUAL_EQUAL; literal ->" + t.literal
+	case LESS:
+		return "Token: LESS; literal ->" + t.literal
+	case LESS_EQUAL:
+		return "Token: LESS_EQUAL; literal ->" + t.literal
+	case GREATER:
+		return "Token: GREATER; literal ->" + t.literal
+	case GREATER_EQUAL:
+		return "Token: GREATER_EQUAL; literal ->" + t.literal
+	case ASSIGN:
+		return "Token: ASSIGN; literal ->" + t.literal
 	case IDENTIFIER:
 		return "Token: IDENTIFIER; literal ->" + t.literal
 	case NEW_LINE:
@@ -107,6 +131,36 @@ func (t *Tokenizer) Tokenize() {
 			t.AddToken(LEFT_GROUP, "")
 		case ')':
 			t.AddToken(RIGHT_GROUP, "")
+		case '!':
+			if t.Match('=') {
+				t.AddToken(BANG_EQUAL, "")
+			} else {
+				t.AddToken(BANG, "")
+			}
+		case '=':
+			if t.Match('=') {
+				t.AddToken(EQUAL_EQUAL, "")
+			} else {	
+				ParseError(t.lineNo, "Expect '=' after '='")
+			}
+		case '>':
+			if t.Match('=') {
+				t.AddToken(GREATER_EQUAL, "")
+			} else {
+				t.AddToken(GREATER, "")
+			}
+		case '<':
+			if t.Match('=') {
+				t.AddToken(LESS_EQUAL, "")
+			} else {
+				t.AddToken(LESS, "")
+			}
+		case ':':
+			if t.Match('=') {
+				t.AddToken(ASSIGN, "")
+			} else {
+				ParseError(t.lineNo, "Expect '=' after ':'")
+			}
 		default:
 			if IsNum(cursor) {
 				t.Number()
@@ -163,6 +217,14 @@ func (t *Tokenizer) Advance() byte {
 	}
 	t.cursor = t.inputString[t.cursorLoc - 1]
 	return t.cursor
+}
+
+func (t *Tokenizer) Match(c byte) bool {
+	if t.PeekNext() == c {
+		t.Advance()
+		return true
+	}
+	return false
 }
 
 /*PeekNext looks at the next character after the current cursor location */

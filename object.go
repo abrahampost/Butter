@@ -4,7 +4,8 @@ type ObjType string
 
 const (
 	INTEGER_OBJ ObjType = "Integer"
-	NIL
+	BOOLEAN_OBJ ObjType = "Boolean"
+	NIL_OBJ ObjType = "Nil"
 )
 
 type Object interface {
@@ -19,25 +20,17 @@ func (i Integer) Type() string {
 	return string(INTEGER_OBJ)
 }
 
-func (i Integer) Add(j Integer) Object {
-	return Integer{i.Value + j.Value}
+type Boolean struct {
+	Value bool
 }
 
-func (i Integer) Sub(j Integer) Object {
-	return Integer{i.Value - j.Value}
-}
-
-func (i Integer) Mult(j Integer) Object {
-	return Integer{i.Value * j.Value}
-}
-
-func (i Integer) Div(j Integer) Object {
-	return Integer{i.Value / j.Value}
+func (b Boolean) Type() string {
+	return string(BOOLEAN_OBJ)
 }
 
 type Nil struct {
 }
 
 func (n Nil) Type() string {
-	return "(nil)"
+	return string(NIL_OBJ)
 }

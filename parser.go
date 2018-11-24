@@ -38,8 +38,32 @@ func (p *Parser) Line() Expr {
 
 
 func (p *Parser) Expression() Expr {
-	var expr Expr = p.Addition()
+	var expr Expr = p.Equality()
 	
+	return expr
+}
+
+func (p *Parser) Equality() Expr {
+	var expr Expr = p.Comparison()
+
+	for p.Match(EQUAL_EQUAL, BANG_EQUAL) {
+		var operator Token = p.Previous()
+		var right Expr = p.Comparison()
+		expr = Binary {expr, right, operator}
+	}
+
+	return expr
+}
+
+func (p *Parser) Comparison() Expr {
+	var expr Expr = p.Addition()
+
+	for p.Match(GREATER, GREATER_EQUAL, LESS, LESS_EQUAL) {
+		var operator Token = p.Previous()
+		var right Expr = p.Addition()
+		expr = Binary {expr, right, operator}
+	}
+
 	return expr
 }
 

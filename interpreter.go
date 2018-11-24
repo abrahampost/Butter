@@ -19,8 +19,8 @@ func (i *Interpreter) Interpret(exprs []Expr, repl bool) {
 				continue
 			default:
 				fmt.Println(Stringify(val))
-	}
-}
+			}
+		}
 	}
 }
 
@@ -46,16 +46,31 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 	if lOK && rOK {
 		switch b.operator.Type {
 		case PLUS:
-			return leftInt.Add(rightInt)
+			return Integer{leftInt.Value + rightInt.Value}
 		case MINUS:
-			return leftInt.Sub(rightInt)
+			return Integer{leftInt.Value - rightInt.Value}
 		case DIV:
 			if rightInt.Value == 0 {
 				RuntimeError("Divide by zero error")
+			} else if leftInt.Value == 0 {
+				return Integer{0}
 			}
-			return leftInt.Div(rightInt)
+			return Integer{leftInt.Value / rightInt.Value}
 		case MULT:
-			return leftInt.Mult(rightInt)
+			if leftInt.Value == 0 || rightInt.Value == 0 {
+				return Integer{0}
+			}
+			return Integer{leftInt.Value * rightInt.Value}
+		case EQUAL_EQUAL:
+			return Boolean{leftInt.Value == rightInt.Value}
+		case BANG_EQUAL:
+			return Boolean{leftInt.Value != rightInt.Value}
+		case GREATER:
+			return Boolean{leftInt.Value > rightInt.Value}
+		case GREATER_EQUAL:
+			return Boolean{leftInt.Value >= rightInt.Value}
+		case LESS_EQUAL:
+			return Boolean{leftInt.Value <= rightInt.Value}
 		}
 	}
 	return Nil{}
@@ -69,6 +84,11 @@ func Stringify(o Object) string {
 	switch t := o.(type) {
 	case Integer:
 		return strconv.Itoa(t.Value)
+	case Boolean:
+		if t.Value {
+			return "TRUE"
+		}
+		return "FALSE"
 	default:
 		return "(nil)"
 	}
