@@ -14,6 +14,8 @@ const (
 	MULT
 	DIV
 	EQUAL
+	LEFT_GROUP
+	RIGHT_GROUP
 	NUM
 	NEW_LINE
 	EOF
@@ -44,7 +46,7 @@ func NewTokenizer(inputString string) Tokenizer {
 /*Tokenize takes in an entire program as a string argument and parses it into tokens
   which it stores in the Tokens field of the tokenizer object it is called on */
 func (t *Tokenizer) Tokenize() {
-	for cursor := t.inputString[0]; !t.AtEnd(); cursor = t.Advance() {
+	for cursor := t.Advance(); !t.AtEnd(); cursor = t.Advance() {
 		switch cursor {
 		case 0:
 			t.AddToken(EOF, "")
@@ -63,6 +65,10 @@ func (t *Tokenizer) Tokenize() {
 			t.AddToken(MULT, "")
 		case '/':
 			t.AddToken(DIV, "")
+		case '(':
+			t.AddToken(LEFT_GROUP, "")
+		case ')':
+			t.AddToken(RIGHT_GROUP, "")
 		default:
 			if IsNum(t.cursor) {
 				t.Number()
