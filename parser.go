@@ -16,17 +16,24 @@ func NewParser(tokens []Token) Parser {
 func (p *Parser) Parse() []Expr {
 	var expressions []Expr
 	for !p.AtEnd() {
-		expressions = append(expressions, p.Expression())
+		expressions = append(expressions, p.Line())
 	}
 	return expressions
+}
+
+func (p *Parser) Line() Expr {
+	var expr Expr = p.Expression()
+	if !p.Match(NEW_LINE, EOF) {
+		ParseError(p.Current().line, "Expected end of line after expression")
+	}
+	for !p.AtEnd() && p.Match(NEW_LINE, EOF) {}
+	return expr
 }
 
 
 func (p *Parser) Expression() Expr {
 	var expr Expr = p.Addition()
-	if !p.Match(NEW_LINE, EOF) {
-		ParseError(p.Current().line, "Expected end of line after expression")
-	}
+	
 	return expr
 }
 
@@ -61,7 +68,12 @@ func (p *Parser) Literal() Expr {
 		CheckError(err)
 		return Literal{Integer{integer}}
 	}
-	ParseError(p.Current().line, "Unrecognized literal value: " + p.Current().literal)
+	if p.Match(LEFT_GROUP) {
+		var expr Expr = p.Expression()
+		p.Consume(RIGHT_GROUP, "Expect ')' after expression")
+		return Grouping{expr}
+	}
+	ParseError(p.Current().line, "Expect expression")
 	return nil
 }
 

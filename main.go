@@ -39,11 +39,7 @@ func RunFile(s Settings) {
 	inputBytes, err := ioutil.ReadFile(s.fileLoc)
 	CheckError(err)
 	inputString := string(inputBytes) + "\r\n"
-	tokenizer := NewTokenizer(inputString)
-	tokenizer.Tokenize()
-	parser := NewParser(tokenizer.tokens)
-	exprs := parser.Parse()
-	interpreter.Interpret(exprs)
+	Run(inputString)
 }
 
 func RunPrompt() {

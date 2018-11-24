@@ -9,18 +9,22 @@ type Interpreter struct {
 
 }
 
-func (i Interpreter) Interpret(exprs []Expr) {
+func (i *Interpreter) Interpret(exprs []Expr) {
 	for _, expr := range exprs {
 		val := i.Evaluate(expr)
 		fmt.Println(Stringify(val))
 	}
 }
 
-func (i Interpreter) Evaluate(e Expr) Object {
+func (i *Interpreter) Evaluate(e Expr) Object {
 	return e.Accept(i)
 }
 
-func (i Interpreter) visitBinary(b Binary) Object {
+func (i *Interpreter) visitGrouping(g Grouping) Object {
+	return i.Evaluate(g.expr)
+}
+
+func (i *Interpreter) visitBinary(b Binary) Object {
 	leftObj := i.Evaluate(b.left)
 	rightObj := i.Evaluate(b.right)
 	leftInt, lOK := leftObj.(Integer)
@@ -43,7 +47,7 @@ func (i Interpreter) visitBinary(b Binary) Object {
 	return Nil{}
 }
 
-func (i Interpreter) acceptLiteral(l Literal) Object {
+func (i *Interpreter) visitLiteral(l Literal) Object {
 	return l.obj
 }
 

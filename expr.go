@@ -1,7 +1,7 @@
 package main
 
 type Expr interface {
-	Accept(interpreter Interpreter) Object
+	Accept(interpreter *Interpreter) Object
 }
 
 type Binary struct {
@@ -13,10 +13,18 @@ type Literal struct {
 	obj Object
 }
 
-func (l Literal) Accept(interpreter Interpreter) Object {
-	return interpreter.acceptLiteral(l)
+type Grouping struct {
+	expr Expr
 }
 
-func (b Binary) Accept(interpreter Interpreter) Object {
+func (l Literal) Accept(interpreter *Interpreter) Object {
+	return interpreter.visitLiteral(l)
+}
+
+func (b Binary) Accept(interpreter *Interpreter) Object {
 	return interpreter.visitBinary(b)
+}
+
+func (g Grouping) Accept(interpreter *Interpreter) Object {
+	return interpreter.visitGrouping(g)
 }
