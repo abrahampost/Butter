@@ -39,7 +39,7 @@ func RunFile(s Settings) {
 	inputBytes, err := ioutil.ReadFile(s.fileLoc)
 	CheckError(err)
 	inputString := string(inputBytes) + "\r\n"
-	Run(inputString)
+	Run(inputString, false)
 }
 
 func RunPrompt() {
@@ -47,16 +47,16 @@ func RunPrompt() {
 	for true {
 		fmt.Print("> ")
 		input, _ := reader.ReadString('\n')
-		Run(input)
+		Run(input, true)
 	}
 }
 
-func Run(source string) {
+func Run(source string, repl bool) {
 	tokenizer := NewTokenizer(source)
 	tokenizer.Tokenize()
 	parser := NewParser(tokenizer.tokens)
 	exprs := parser.Parse()
-	interpreter.Interpret(exprs)
+	interpreter.Interpret(exprs, repl)
 }
 
 /*CheckError checks to see if an error has been reported from a function */

@@ -9,10 +9,18 @@ type Interpreter struct {
 
 }
 
-func (i *Interpreter) Interpret(exprs []Expr) {
+func (i *Interpreter) Interpret(exprs []Expr, repl bool) {
 	for _, expr := range exprs {
 		//TODO: Check return value to see if error object has been sent
-		i.Evaluate(expr) 
+		val := i.Evaluate(expr)
+		if repl {
+			switch val.(type) {
+			case Nil:
+				continue
+			default:
+				fmt.Println(Stringify(val))
+	}
+}
 	}
 }
 
