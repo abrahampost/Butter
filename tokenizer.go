@@ -17,6 +17,8 @@ const (
 	LEFT_GROUP
 	RIGHT_GROUP
 	NUM
+	PRINT
+	IDENTIFIER
 	NEW_LINE
 	EOF
 )
@@ -26,6 +28,37 @@ type Token struct {
 	Type    TokenType
 	literal string
 	line 	int
+}
+
+func (t Token) String() string {
+	switch t.Type {
+	case PLUS:
+		return "Token: PLUS; literal ->" + t.literal
+	case MINUS:
+		return "Token: MINUS; literal ->" + t.literal
+	case MULT:
+		return "Token: MULT; literal ->" + t.literal
+	case DIV:
+		return "Token: DIV; literal ->" + t.literal
+	case EQUAL:
+		return "Token: EQUAL; literal ->" + t.literal
+	case LEFT_GROUP:
+		return "Token: LEFT_GROUP; literal ->" + t.literal
+	case RIGHT_GROUP:
+		return "Token: RIGHT_GROUP; literal ->" + t.literal
+	case NUM:
+		return "Token: NUM; literal ->" + t.literal
+	case PRINT:
+		return "Token: PRINT; literal ->" + t.literal
+	case IDENTIFIER:
+		return "Token: IDENTIFIER; literal ->" + t.literal
+	case NEW_LINE:
+		return "Token: NEW_LINE; literal ->" + t.literal
+	case EOF:
+		return "Token: EOF; literal ->" + t.literal
+	default:
+		return "Unknown token"
+	}
 }
 
 /*Tokenizer contains a list of tokens and information about the line currently being parsed */
@@ -38,8 +71,12 @@ type Tokenizer struct {
 	lineNo	  int
 }
 
+var reserved map[string]TokenType
+
 /*NewTokenizer creates a tokenizer struct and initializes all of its fields to their default values*/
 func NewTokenizer(inputString string) Tokenizer {
+	reserved = make(map[string]TokenType)
+	reserved["print"] = PRINT
 	return Tokenizer{inputString, []Token{}, 0, 0, '0', 0}
 }
 
@@ -53,6 +90,7 @@ func (t *Tokenizer) Tokenize() {
 			break
 		case ' ', '\t', '\r':
 			//Eat whitespace
+			t.begTok++
 			continue
 		case '\n':
 			t.lineNo++
@@ -70,8 +108,10 @@ func (t *Tokenizer) Tokenize() {
 		case ')':
 			t.AddToken(RIGHT_GROUP, "")
 		default:
-			if IsNum(t.cursor) {
+			if IsNum(cursor) {
 				t.Number()
+			} else if IsAlpha(cursor) {
+				t.IdentifierOrReserved()
 			} else {
 				ParseError(t.lineNo + 1, fmt.Sprintf("near -> '%c'", t.inputString[t.cursorLoc-1]))
 			}
@@ -87,12 +127,33 @@ func IsNum(b byte) bool {
 	return isNum
 }
 
+/*IsAlphaNum returns true if the passed cursor is alphanumeric */
+func IsAlpha(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func IsAlphaNum(c byte) bool {
+	return IsAlpha(c) || IsNum(c)
+}
+
 /*Number eats characters until it reaches a non-numeric character, then creates a new token*/
 func (t *Tokenizer) Number() {
 	for !t.AtEnd() && IsNum(t.cursor) && IsNum(t.PeekNext()) {
 		t.Advance()
 	}
 	t.AddToken(NUM, t.inputString[t.begTok:t.cursorLoc])
+}
+
+func (t *Tokenizer) IdentifierOrReserved() {
+	for !t.AtEnd() && IsAlphaNum(t.cursor) {
+		t.Advance()
+	}
+	tokenType, isReserved := reserved[t.inputString[t.begTok:t.cursorLoc-1]]
+	if isReserved {
+		t.AddToken(tokenType, "")
+	} else {
+		t.AddToken(IDENTIFIER, t.inputString[t.begTok:t.cursorLoc])
+	}
 }
 
 /*Advance advances the cursor by 1 non-whitespace value within the tokenizer object */

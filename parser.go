@@ -24,7 +24,12 @@ func (p *Parser) Parse() []Expr {
 }
 
 func (p *Parser) Line() Expr {
-	var expr Expr = p.Expression()
+	var expr Expr
+	if p.Match(PRINT) {
+		expr = p.Expression()
+		return Print{expr}
+	}
+	expr = p.Expression()
 	if !p.Match(NEW_LINE, EOF) {
 		ParseError(p.Current().line, "Expected end of line after expression")
 	}

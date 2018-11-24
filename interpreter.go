@@ -11,13 +11,19 @@ type Interpreter struct {
 
 func (i *Interpreter) Interpret(exprs []Expr) {
 	for _, expr := range exprs {
-		val := i.Evaluate(expr)
-		fmt.Println(Stringify(val))
+		//TODO: Check return value to see if error object has been sent
+		i.Evaluate(expr) 
 	}
 }
 
 func (i *Interpreter) Evaluate(e Expr) Object {
 	return e.Accept(i)
+}
+
+func (i *Interpreter) visitPrint(p Print) Object {
+	result := i.Evaluate(p.expr)
+	fmt.Println(Stringify(result))
+	return Nil{}
 }
 
 func (i *Interpreter) visitGrouping(g Grouping) Object {

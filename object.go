@@ -4,6 +4,7 @@ type ObjType string
 
 const (
 	INTEGER_OBJ ObjType = "Integer"
+	NIL
 )
 
 type Object interface {
