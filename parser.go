@@ -38,8 +38,32 @@ func (p *Parser) Line() Expr {
 
 
 func (p *Parser) Expression() Expr {
-	var expr Expr = p.Equality()
+	var expr Expr = p.Or()
 	
+	return expr
+}
+
+func (p *Parser) Or() Expr {
+	var expr Expr = p.And()
+
+	for p.Match(OR) {
+		var operator Token = p.Previous()
+		var right Expr = p.And()
+		expr = Binary{expr, right, operator}
+	}
+
+	return expr
+}
+
+func (p *Parser) And() Expr {
+	var expr Expr = p.Equality()
+
+	for p.Match(AND) {
+		var operator Token = p.Previous()
+		var right Expr = p.Equality()
+		expr = Binary{expr, right, operator}
+	}
+
 	return expr
 }
 
@@ -97,6 +121,12 @@ func (p *Parser) Literal() Expr {
 		integer, err := strconv.Atoi(prev.literal)
 		CheckError(err)
 		return Literal{Integer{integer}}
+	}
+	if p.Match(TRUE) {
+		return Literal{Boolean{true}}
+	}
+	if p.Match(FALSE) {
+		return Literal{Boolean{false}}
 	}
 	if p.Match(LEFT_GROUP) {
 		var expr Expr = p.Expression()

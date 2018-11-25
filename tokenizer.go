@@ -25,6 +25,10 @@ const (
 	LESS_EQUAL
 	GREATER
 	GREATER_EQUAL
+	OR
+	AND
+	TRUE
+	FALSE
 	ASSIGN
 	IDENTIFIER
 	NEW_LINE
@@ -72,6 +76,14 @@ func (t Token) String() string {
 		return "Token: GREATER; literal ->" + t.literal
 	case GREATER_EQUAL:
 		return "Token: GREATER_EQUAL; literal ->" + t.literal
+	case OR:
+		return "Token: OR; literal ->" + t.literal
+	case AND:
+		return "Token: AND; literal ->" + t.literal
+	case TRUE:
+		return "Token: TRUE; literal ->" + t.literal
+	case FALSE:
+		return "Token: FALSE; literal ->" + t.literal
 	case ASSIGN:
 		return "Token: ASSIGN; literal ->" + t.literal
 	case IDENTIFIER:
@@ -101,6 +113,10 @@ var reserved map[string]TokenType
 func NewTokenizer(inputString string) Tokenizer {
 	reserved = make(map[string]TokenType)
 	reserved["print"] = PRINT
+	reserved["or"] = OR
+	reserved["and"] = AND
+	reserved["true"] = TRUE
+	reserved["false"] = FALSE
 	return Tokenizer{inputString, []Token{}, 0, 0, '0', 0}
 }
 
@@ -199,10 +215,10 @@ func (t *Tokenizer) Number() {
 }
 
 func (t *Tokenizer) IdentifierOrReserved() {
-	for !t.AtEnd() && IsAlphaNum(t.cursor) {
+	for IsAlphaNum(t.PeekNext()) {
 		t.Advance()
 	}
-	tokenType, isReserved := reserved[t.inputString[t.begTok:t.cursorLoc-1]]
+	tokenType, isReserved := reserved[t.inputString[t.begTok:t.cursorLoc]]
 	if isReserved {
 		t.AddToken(tokenType, "")
 	} else {
