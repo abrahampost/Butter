@@ -5,10 +5,11 @@ import (
 	"strconv"
 )
 
+/*The Interpreter struct which merely holds a bunch of methods */
 type Interpreter struct {
-
 }
 
+/*Interpret takes a list of parsed AST expressions and evaluates them */
 func (i *Interpreter) Interpret(exprs []Expr, repl bool) {
 	for _, expr := range exprs {
 		//TODO: Check return value to see if error object has been sent
@@ -24,20 +25,26 @@ func (i *Interpreter) Interpret(exprs []Expr, repl bool) {
 	}
 }
 
+/*Evaluate calls the accept method on the Expr, making sure it is passed to the correct method
+  back on the interpreter for evaluation */
 func (i *Interpreter) Evaluate(e Expr) Object {
 	return e.Accept(i)
 }
 
+/*visitPrint evaluates the expr contained within a print object and then prints that */
 func (i *Interpreter) visitPrint(p Print) Object {
 	result := i.Evaluate(p.expr)
 	fmt.Println(Stringify(result))
 	return Nil{}
 }
 
+/*visitGrouping evaluates the internal expression and then returns that */
 func (i *Interpreter) visitGrouping(g Grouping) Object {
 	return i.Evaluate(g.expr)
 }
 
+/*visitBinary evaluates the left and right subexpressions, and then performs the proper operation
+  on the two values*/
 func (i *Interpreter) visitBinary(b Binary) Object {
 	leftObj := i.Evaluate(b.left)
 	rightObj := i.Evaluate(b.right)
@@ -53,12 +60,12 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 	return Nil{}
 }
 
+/*visitLiteral return sthe underlying object value of a literal */
 func (i *Interpreter) visitLiteral(l Literal) Object {
 	return l.obj
 }
 
-
-
+/*EvaluateNum returns an object based on the operation between two integers*/
 func EvaluateNum(left Integer, right Integer, operator Token) Object {
 	switch operator.Type {
 	case PLUS:
@@ -93,6 +100,7 @@ func EvaluateNum(left Integer, right Integer, operator Token) Object {
 	}
 }
 
+/*EvaluateBoolean returns an object based on the operations of two Boolean objects */
 func EvaluateBoolean(left Boolean, right Boolean, operator Token) Object {
 	switch operator.Type {
 	case AND:
@@ -105,6 +113,7 @@ func EvaluateBoolean(left Boolean, right Boolean, operator Token) Object {
 	}
 }
 
+/*Stringify returns a string representation of an object */
 func Stringify(o Object) string {
 	switch t := o.(type) {
 	case Integer:
@@ -119,12 +128,14 @@ func Stringify(o Object) string {
 	}
 }
 
+/*CheckNumberOperands returns a tuple with the values and a positive bool if the objects are both Integers */
 func CheckNumberOperands(left Object, right Object) (Integer, Integer, bool) {
 	leftInt, lOK := left.(Integer)
 	rightInt, rOK := right.(Integer)
 	return leftInt, rightInt, lOK && rOK
 }
 
+/*CheckBoolOperands returns a tuple with the values and a positive bool if the objects are both Booleans */
 func CheckBoolOperands(left Object, right Object) (Boolean, Boolean, bool) {
 	leftBool, lOK := left.(Boolean)
 	rightBool, rOK := right.(Boolean)

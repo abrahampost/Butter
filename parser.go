@@ -4,25 +4,31 @@ import (
 	"strconv"
 )
 
+/*Parser struct contains helpful methods for recursive descvent parsing, as well as keeping track of the
+  token list, amnd token currently being processed */
 type Parser struct {
-	tokens []Token
+	tokens  []Token
 	current int
 }
 
+/*NewParser returns a parser object with all of the fields initialized correctly to begin parsing */
 func NewParser(tokens []Token) Parser {
 	return Parser{tokens, 0}
 }
 
+/*Parse parses all of the Tokens into Expression objects and returns those */
 func (p *Parser) Parse() []Expr {
 	var expressions []Expr
 	for !p.AtEnd() {
 		expressions = append(expressions, p.Line())
 		//Eat empty lines
-		for !p.AtEnd() && p.Match(NEW_LINE) {}
+		for !p.AtEnd() && p.Match(NEW_LINE) {
+		}
 	}
 	return expressions
 }
 
+/*Parses an expression, then eats any trailing whitespace */
 func (p *Parser) Line() Expr {
 	var expr Expr
 	if p.Match(PRINT) {
@@ -36,13 +42,14 @@ func (p *Parser) Line() Expr {
 	return expr
 }
 
-
+/*Expression parses an expression object */
 func (p *Parser) Expression() Expr {
 	var expr Expr = p.Or()
-	
+
 	return expr
 }
 
+/*Or parses both sides of an or, and then connects them with an or operator (if applicable) */
 func (p *Parser) Or() Expr {
 	var expr Expr = p.And()
 
@@ -55,6 +62,7 @@ func (p *Parser) Or() Expr {
 	return expr
 }
 
+/*And parses both subexpressions and then an And operator (if applicable) */
 func (p *Parser) And() Expr {
 	var expr Expr = p.Equality()
 
@@ -67,30 +75,33 @@ func (p *Parser) And() Expr {
 	return expr
 }
 
+/*Equality parses both sides of an expression, then connects them with an equality operator (if applicable) */
 func (p *Parser) Equality() Expr {
 	var expr Expr = p.Comparison()
 
 	for p.Match(EQUAL_EQUAL, BANG_EQUAL) {
 		var operator Token = p.Previous()
 		var right Expr = p.Comparison()
-		expr = Binary {expr, right, operator}
+		expr = Binary{expr, right, operator}
 	}
 
 	return expr
 }
 
+/*Comparison parses both sides of an expression, then connects them with a comparison operator (if applicable) */
 func (p *Parser) Comparison() Expr {
 	var expr Expr = p.Addition()
 
 	for p.Match(GREATER, GREATER_EQUAL, LESS, LESS_EQUAL) {
 		var operator Token = p.Previous()
 		var right Expr = p.Addition()
-		expr = Binary {expr, right, operator}
+		expr = Binary{expr, right, operator}
 	}
 
 	return expr
 }
 
+/*Addition parses both sides of an expression, then connects them with an addition operator (if applicable) */
 func (p *Parser) Addition() Expr {
 	var expr Expr = p.Multiplication()
 
@@ -103,6 +114,7 @@ func (p *Parser) Addition() Expr {
 	return expr
 }
 
+/*Multiplication parses both sides of an expression, then connects them with a multiplication operator (if applicable) */
 func (p *Parser) Multiplication() Expr {
 	var expr Expr = p.Literal()
 
@@ -115,6 +127,7 @@ func (p *Parser) Multiplication() Expr {
 	return expr
 }
 
+/*Literal returns an object of the type of the token passes, with a value parsed from the Token literal */
 func (p *Parser) Literal() Expr {
 	if p.Match(NUM) {
 		prev := p.Previous()
@@ -137,36 +150,41 @@ func (p *Parser) Literal() Expr {
 	return nil
 }
 
+/*AtEnd checks if the current token is the last one in the file and returns true if so, otherwise false */
 func (p *Parser) AtEnd() bool {
 	return p.Current().Type == EOF
 }
 
+/*Advance if not at the end, evaluate the next token */
 func (p *Parser) Advance() {
 	if !p.AtEnd() {
 		p.current++
 	}
 }
 
+/*Current returns the current token under consideration */
 func (p *Parser) Current() Token {
 	return p.tokens[p.current]
 }
 
-
+/*Preious returns the previous token under consideration */
 func (p *Parser) Previous() Token {
-	return p.tokens[p.current - 1]
+	return p.tokens[p.current-1]
 }
 
-func (p *Parser) Match(ts... TokenType) bool{
+/*Match advances if the current token matches the passed token type */
+func (p *Parser) Match(ts ...TokenType) bool {
 	for _, t := range ts {
 		if t == p.Current().Type {
 			p.Advance()
 			return true
 		}
-	} 
+	}
 
 	return false
 }
 
+/*Consume advances if the next token matches a specific tokentype, otherwise gives a ParseError */
 func (p *Parser) Consume(t TokenType, message string) {
 	if p.Check(t) {
 		p.Advance()
@@ -176,6 +194,7 @@ func (p *Parser) Consume(t TokenType, message string) {
 
 }
 
+/*Check returns true if the current token matches a passed tokentype, otherwise false */
 func (p *Parser) Check(t TokenType) bool {
 	if p.AtEnd() {
 		return false

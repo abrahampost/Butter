@@ -1,10 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io/ioutil"
 	"os"
-	"bufio"
 )
 
 /*Settings struct Contains the settings for the current interpreter */
@@ -42,6 +42,7 @@ func RunFile(s Settings) {
 	Run(inputString, false)
 }
 
+/*RunPrompt runs the REPL and feeds input to the run method as it comes in  */
 func RunPrompt() {
 	reader := bufio.NewReader(os.Stdin)
 	for true {
@@ -51,6 +52,7 @@ func RunPrompt() {
 	}
 }
 
+/*Run sends the input to the tokenizer and interpreter, evaluating the input string as it comes in*/
 func Run(source string, repl bool) {
 	tokenizer := NewTokenizer(source)
 	tokenizer.Tokenize()
@@ -66,7 +68,7 @@ func CheckError(err error) {
 	}
 }
 
-/*ParseError Reports an error during the initial tokenization of the */
+/*ParseError Reports an error during the initial tokenization and parsing of the input */
 func ParseError(line int, message string) {
 	var lineMessage string
 	if line != -1 {
@@ -76,12 +78,13 @@ func ParseError(line int, message string) {
 	ReportError(errorMessage)
 }
 
+/*RuntimeError stops the execution of the program when it encounters invalid operations duringn the running of the program */
 func RuntimeError(message string) {
 	ReportError("RUNTIME_ERROR: " + message)
 }
 
-/*ReportError stops execution of the program with a panic reporting the message argument */
+/*ReportError stops execution of the program with a panic-like error message */
 func ReportError(message string) {
-	fmt.Fprintf(os.Stderr, message + "\n")
+	fmt.Fprintf(os.Stderr, message+"\n")
 	os.Exit(1)
 }
