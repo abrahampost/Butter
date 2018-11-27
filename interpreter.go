@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 )
 
@@ -112,6 +113,9 @@ func EvaluateNum(left Integer, right Integer, operator Token) Object {
 			return Integer{0}
 		}
 		return Integer{left.Value * right.Value}
+	case EXP:
+		res := math.Pow(float64(left.Value), float64(right.Value))
+		return Integer{int(res)}
 	case EQUALEQUAL:
 		return Boolean{left.Value == right.Value}
 	case BANGEQUAL:

@@ -12,6 +12,7 @@ const (
 	PLUS TokenType = iota
 	MINUS
 	MULT
+	EXP
 	DIV
 	EQUAL
 	LEFTGROUP
@@ -44,6 +45,8 @@ func (t TokenType) String() string {
 		return "-"
 	case MULT:
 		return "*"
+	case EXP:
+		return "**"
 	case DIV:
 		return "/"
 	case EQUAL:
@@ -108,6 +111,8 @@ func (t Token) String() string {
 		return "Token: MINUS; literal ->" + t.literal
 	case MULT:
 		return "Token: MULT; literal ->" + t.literal
+	case EXP:
+		return "Token: EXP; literal ->" + t.literal
 	case DIV:
 		return "Token: DIV; literal ->" + t.literal
 	case EQUAL:
@@ -200,7 +205,11 @@ func (t *Tokenizer) Tokenize() []Token {
 		case '-':
 			t.AddToken(MINUS, "")
 		case '*':
-			t.AddToken(MULT, "")
+			if t.Match('*') {
+				t.AddToken(EXP, "")
+			} else {
+				t.AddToken(MULT, "")
+			}
 		case '/':
 			t.AddToken(DIV, "")
 		case '(':

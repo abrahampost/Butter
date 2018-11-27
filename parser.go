@@ -37,7 +37,7 @@ func (p *Parser) Line() Expr {
 	}
 	expr = p.Expression()
 	if !p.Match(NEWLINE, EOF) {
-		ParseError(p.Current().line, "Expected end of line after expression")
+		ParseError(p.Current().line, "Expected end of line after expression, received->"+p.Current().Type.String())
 	}
 	return expr
 }
@@ -90,9 +90,21 @@ func (p *Parser) Equality() Expr {
 
 /*Comparison parses both sides of an expression, then connects them with a comparison operator (if applicable) */
 func (p *Parser) Comparison() Expr {
-	expr := p.Addition()
+	expr := p.Exponent()
 
 	for p.Match(GREATER, GREATEREQUAL, LESS, LESSEQUAL) {
+		operator := p.Previous()
+		right := p.Exponent()
+		expr = Binary{expr, right, operator}
+	}
+
+	return expr
+}
+
+func (p *Parser) Exponent() Expr {
+	expr := p.Addition()
+
+	for p.Match(EXP) {
 		operator := p.Previous()
 		right := p.Addition()
 		expr = Binary{expr, right, operator}
