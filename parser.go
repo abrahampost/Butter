@@ -135,6 +135,10 @@ func (p *Parser) Literal() Expr {
 		CheckError(err)
 		return Literal{Integer{integer}}
 	}
+	if p.Match(STRING) {
+		prev := p.Previous()
+		return Literal{String{prev.literal}}
+	}
 	if p.Match(TRUE) {
 		return Literal{Boolean{true}}
 	}

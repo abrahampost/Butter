@@ -56,6 +56,9 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 	if isBool {
 		return EvaluateBoolean(leftBool, rightBool, b.operator)
 	}
+	if leftString, ok := leftObj.(String); ok {
+		return String{leftString.Value + Stringify(rightObj)}
+	}
 	RuntimeError("Mismatched operands: '" + leftObj.Type() + "' and '" + rightObj.Type() + "'")
 	return Nil{}
 }
@@ -123,6 +126,8 @@ func Stringify(o Object) string {
 			return "TRUE"
 		}
 		return "FALSE"
+	case String:
+		return t.Value
 	default:
 		return "(nil)"
 	}

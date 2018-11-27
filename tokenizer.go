@@ -30,6 +30,7 @@ const (
 	TRUE
 	FALSE
 	ASSIGN
+	STRING
 	IDENTIFIER
 	NEWLINE
 	EOF
@@ -86,6 +87,8 @@ func (t Token) String() string {
 		return "Token: FALSE; literal ->" + t.literal
 	case ASSIGN:
 		return "Token: ASSIGN; literal ->" + t.literal
+	case STRING:
+		return "Token: STRING; literal ->" + t.literal
 	case IDENTIFIER:
 		return "Token: IDENTIFIER; literal ->" + t.literal
 	case NEWLINE:
@@ -177,6 +180,14 @@ func (t *Tokenizer) Tokenize() {
 			} else {
 				ParseError(t.lineNo, "Expect '=' after ':'")
 			}
+		case '"':
+			for !t.Match('"') {
+				t.Advance()
+				if t.AtEnd() {
+					ParseError(t.lineNo, "Unclosed string literal")
+				}
+			}
+			t.AddToken(STRING, t.inputString[t.begTok+1:t.cursorLoc-1])
 		default:
 			if IsNum(cursor) {
 				t.Number()
