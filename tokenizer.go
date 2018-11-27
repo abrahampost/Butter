@@ -39,7 +39,7 @@ const (
 type Token struct {
 	Type    TokenType
 	literal string
-	line 	int
+	line    int
 }
 
 func (t Token) String() string {
@@ -100,11 +100,11 @@ func (t Token) String() string {
 /*Tokenizer contains a list of tokens and information about the line currently being parsed */
 type Tokenizer struct {
 	inputString string
-	tokens    []Token
-	begTok	int
-	cursorLoc int
-	cursor    byte
-	lineNo	  int
+	tokens      []Token
+	begTok      int
+	cursorLoc   int
+	cursor      byte
+	lineNo      int
 }
 
 var reserved map[string]TokenType
@@ -156,7 +156,7 @@ func (t *Tokenizer) Tokenize() {
 		case '=':
 			if t.Match('=') {
 				t.AddToken(EQUAL_EQUAL, "")
-			} else {	
+			} else {
 				ParseError(t.lineNo, "Expect '=' after '='")
 			}
 		case '>':
@@ -183,7 +183,7 @@ func (t *Tokenizer) Tokenize() {
 			} else if IsAlpha(cursor) {
 				t.IdentifierOrReserved()
 			} else {
-				ParseError(t.lineNo + 1, fmt.Sprintf("near -> '%c'", t.inputString[t.cursorLoc-1]))
+				ParseError(t.lineNo+1, fmt.Sprintf("near -> '%c'", t.inputString[t.cursorLoc-1]))
 			}
 		}
 	}
@@ -197,11 +197,12 @@ func IsNum(b byte) bool {
 	return isNum
 }
 
-/*IsAlphaNum returns true if the passed cursor is alphanumeric */
+/*IsAlpha returns true if the byte passed is a char corresponding to an alphabetic character */
 func IsAlpha(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
+/*IsAlphaNum returns true if the passed cursor is alpha or numeric */
 func IsAlphaNum(c byte) bool {
 	return IsAlpha(c) || IsNum(c)
 }
@@ -214,6 +215,8 @@ func (t *Tokenizer) Number() {
 	t.AddToken(NUM, t.inputString[t.begTok:t.cursorLoc])
 }
 
+/*IdentifierOrReserved advances characters until it finds a non alphanumeric character and then checks to see
+  if it is a reserved word. If not, it is saved as an identifier */
 func (t *Tokenizer) IdentifierOrReserved() {
 	for IsAlphaNum(t.PeekNext()) {
 		t.Advance()
@@ -231,10 +234,12 @@ func (t *Tokenizer) Advance() byte {
 	if !t.AtEnd() {
 		t.cursorLoc++
 	}
-	t.cursor = t.inputString[t.cursorLoc - 1]
+	t.cursor = t.inputString[t.cursorLoc-1]
 	return t.cursor
 }
 
+/*Match Advances one character if the next character to check matches the passed character. Returns true if matches,
+  false, if not */
 func (t *Tokenizer) Match(c byte) bool {
 	if t.PeekNext() == c {
 		t.Advance()

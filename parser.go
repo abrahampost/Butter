@@ -28,7 +28,7 @@ func (p *Parser) Parse() []Expr {
 	return expressions
 }
 
-/*Parses an expression, then eats any trailing whitespace */
+/*Line Parses an expression, then eats any trailing whitespace */
 func (p *Parser) Line() Expr {
 	var expr Expr
 	if p.Match(PRINT) {

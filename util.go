@@ -2,7 +2,7 @@ package main
 
 import "fmt"
 
-/* Please remove this */
+/*PrintTokens prints all parsed tokens for debugging purposes */
 func PrintTokens(ts []Token) {
 	for _, tok := range ts {
 		fmt.Println(tok)
