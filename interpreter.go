@@ -84,15 +84,15 @@ func EvaluateNum(left Integer, right Integer, operator Token) Object {
 			return Integer{0}
 		}
 		return Integer{left.Value * right.Value}
-	case EQUAL_EQUAL:
+	case EQUALEQUAL:
 		return Boolean{left.Value == right.Value}
-	case BANG_EQUAL:
+	case BANGEQUAL:
 		return Boolean{left.Value != right.Value}
 	case GREATER:
 		return Boolean{left.Value > right.Value}
-	case GREATER_EQUAL:
+	case GREATEREQUAL:
 		return Boolean{left.Value >= right.Value}
-	case LESS_EQUAL:
+	case LESSEQUAL:
 		return Boolean{left.Value <= right.Value}
 	default:
 		RuntimeError("Unsupported operation on values of type 'INTEGER'")

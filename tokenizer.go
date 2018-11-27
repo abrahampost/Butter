@@ -14,24 +14,24 @@ const (
 	MULT
 	DIV
 	EQUAL
-	LEFT_GROUP
-	RIGHT_GROUP
+	LEFTGROUP
+	RIGHTGROUP
 	NUM
 	PRINT
 	BANG
-	BANG_EQUAL
-	EQUAL_EQUAL
+	BANGEQUAL
+	EQUALEQUAL
 	LESS
-	LESS_EQUAL
+	LESSEQUAL
 	GREATER
-	GREATER_EQUAL
+	GREATEREQUAL
 	OR
 	AND
 	TRUE
 	FALSE
 	ASSIGN
 	IDENTIFIER
-	NEW_LINE
+	NEWLINE
 	EOF
 )
 
@@ -54,28 +54,28 @@ func (t Token) String() string {
 		return "Token: DIV; literal ->" + t.literal
 	case EQUAL:
 		return "Token: EQUAL; literal ->" + t.literal
-	case LEFT_GROUP:
-		return "Token: LEFT_GROUP; literal ->" + t.literal
-	case RIGHT_GROUP:
-		return "Token: RIGHT_GROUP; literal ->" + t.literal
+	case LEFTGROUP:
+		return "Token: LEFTGROUP; literal ->" + t.literal
+	case RIGHTGROUP:
+		return "Token: RIGHTGROUP; literal ->" + t.literal
 	case NUM:
 		return "Token: NUM; literal ->" + t.literal
 	case PRINT:
 		return "Token: PRINT; literal ->" + t.literal
 	case BANG:
 		return "Token: BANG; literal ->" + t.literal
-	case BANG_EQUAL:
-		return "Token: BANG_EQUAL; literal ->" + t.literal
-	case EQUAL_EQUAL:
-		return "Token: EQUAL_EQUAL; literal ->" + t.literal
+	case BANGEQUAL:
+		return "Token: BANGEQUAL; literal ->" + t.literal
+	case EQUALEQUAL:
+		return "Token: EQUALEQUAL; literal ->" + t.literal
 	case LESS:
 		return "Token: LESS; literal ->" + t.literal
-	case LESS_EQUAL:
-		return "Token: LESS_EQUAL; literal ->" + t.literal
+	case LESSEQUAL:
+		return "Token: LESSEQUAL; literal ->" + t.literal
 	case GREATER:
 		return "Token: GREATER; literal ->" + t.literal
-	case GREATER_EQUAL:
-		return "Token: GREATER_EQUAL; literal ->" + t.literal
+	case GREATEREQUAL:
+		return "Token: GREATEREQUAL; literal ->" + t.literal
 	case OR:
 		return "Token: OR; literal ->" + t.literal
 	case AND:
@@ -88,8 +88,8 @@ func (t Token) String() string {
 		return "Token: ASSIGN; literal ->" + t.literal
 	case IDENTIFIER:
 		return "Token: IDENTIFIER; literal ->" + t.literal
-	case NEW_LINE:
-		return "Token: NEW_LINE; literal ->" + t.literal
+	case NEWLINE:
+		return "Token: NEWLINE; literal ->" + t.literal
 	case EOF:
 		return "Token: EOF; literal ->" + t.literal
 	default:
@@ -134,7 +134,7 @@ func (t *Tokenizer) Tokenize() {
 			continue
 		case '\n':
 			t.lineNo++
-			t.AddToken(NEW_LINE, "")
+			t.AddToken(NEWLINE, "")
 		case '+':
 			t.AddToken(PLUS, "")
 		case '-':
@@ -144,30 +144,30 @@ func (t *Tokenizer) Tokenize() {
 		case '/':
 			t.AddToken(DIV, "")
 		case '(':
-			t.AddToken(LEFT_GROUP, "")
+			t.AddToken(LEFTGROUP, "")
 		case ')':
-			t.AddToken(RIGHT_GROUP, "")
+			t.AddToken(RIGHTGROUP, "")
 		case '!':
 			if t.Match('=') {
-				t.AddToken(BANG_EQUAL, "")
+				t.AddToken(BANGEQUAL, "")
 			} else {
 				t.AddToken(BANG, "")
 			}
 		case '=':
 			if t.Match('=') {
-				t.AddToken(EQUAL_EQUAL, "")
+				t.AddToken(EQUALEQUAL, "")
 			} else {
 				ParseError(t.lineNo, "Expect '=' after '='")
 			}
 		case '>':
 			if t.Match('=') {
-				t.AddToken(GREATER_EQUAL, "")
+				t.AddToken(GREATEREQUAL, "")
 			} else {
 				t.AddToken(GREATER, "")
 			}
 		case '<':
 			if t.Match('=') {
-				t.AddToken(LESS_EQUAL, "")
+				t.AddToken(LESSEQUAL, "")
 			} else {
 				t.AddToken(LESS, "")
 			}

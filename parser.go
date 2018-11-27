@@ -22,7 +22,7 @@ func (p *Parser) Parse() []Expr {
 	for !p.AtEnd() {
 		expressions = append(expressions, p.Line())
 		//Eat empty lines
-		for !p.AtEnd() && p.Match(NEW_LINE) {
+		for !p.AtEnd() && p.Match(NEWLINE) {
 		}
 	}
 	return expressions
@@ -36,7 +36,7 @@ func (p *Parser) Line() Expr {
 		return Print{expr}
 	}
 	expr = p.Expression()
-	if !p.Match(NEW_LINE, EOF) {
+	if !p.Match(NEWLINE, EOF) {
 		ParseError(p.Current().line, "Expected end of line after expression")
 	}
 	return expr
@@ -44,18 +44,18 @@ func (p *Parser) Line() Expr {
 
 /*Expression parses an expression object */
 func (p *Parser) Expression() Expr {
-	var expr Expr = p.Or()
+	expr := p.Or()
 
 	return expr
 }
 
 /*Or parses both sides of an or, and then connects them with an or operator (if applicable) */
 func (p *Parser) Or() Expr {
-	var expr Expr = p.And()
+	expr := p.And()
 
 	for p.Match(OR) {
-		var operator Token = p.Previous()
-		var right Expr = p.And()
+		operator := p.Previous()
+		right := p.And()
 		expr = Binary{expr, right, operator}
 	}
 
@@ -64,11 +64,11 @@ func (p *Parser) Or() Expr {
 
 /*And parses both subexpressions and then an And operator (if applicable) */
 func (p *Parser) And() Expr {
-	var expr Expr = p.Equality()
+	expr := p.Equality()
 
 	for p.Match(AND) {
-		var operator Token = p.Previous()
-		var right Expr = p.Equality()
+		operator := p.Previous()
+		right := p.Equality()
 		expr = Binary{expr, right, operator}
 	}
 
@@ -77,11 +77,11 @@ func (p *Parser) And() Expr {
 
 /*Equality parses both sides of an expression, then connects them with an equality operator (if applicable) */
 func (p *Parser) Equality() Expr {
-	var expr Expr = p.Comparison()
+	expr := p.Comparison()
 
-	for p.Match(EQUAL_EQUAL, BANG_EQUAL) {
-		var operator Token = p.Previous()
-		var right Expr = p.Comparison()
+	for p.Match(EQUALEQUAL, BANGEQUAL) {
+		operator := p.Previous()
+		right := p.Comparison()
 		expr = Binary{expr, right, operator}
 	}
 
@@ -90,11 +90,11 @@ func (p *Parser) Equality() Expr {
 
 /*Comparison parses both sides of an expression, then connects them with a comparison operator (if applicable) */
 func (p *Parser) Comparison() Expr {
-	var expr Expr = p.Addition()
+	expr := p.Addition()
 
-	for p.Match(GREATER, GREATER_EQUAL, LESS, LESS_EQUAL) {
-		var operator Token = p.Previous()
-		var right Expr = p.Addition()
+	for p.Match(GREATER, GREATEREQUAL, LESS, LESSEQUAL) {
+		operator := p.Previous()
+		right := p.Addition()
 		expr = Binary{expr, right, operator}
 	}
 
@@ -103,11 +103,11 @@ func (p *Parser) Comparison() Expr {
 
 /*Addition parses both sides of an expression, then connects them with an addition operator (if applicable) */
 func (p *Parser) Addition() Expr {
-	var expr Expr = p.Multiplication()
+	expr := p.Multiplication()
 
 	for p.Match(MINUS, PLUS) {
-		var operator Token = p.Previous()
-		var right Expr = p.Multiplication()
+		operator := p.Previous()
+		right := p.Multiplication()
 		expr = Binary{expr, right, operator}
 	}
 
@@ -116,11 +116,11 @@ func (p *Parser) Addition() Expr {
 
 /*Multiplication parses both sides of an expression, then connects them with a multiplication operator (if applicable) */
 func (p *Parser) Multiplication() Expr {
-	var expr Expr = p.Literal()
+	expr := p.Literal()
 
 	for p.Match(MULT, DIV) {
-		var operator Token = p.Previous()
-		var right Expr = p.Literal()
+		operator := p.Previous()
+		right := p.Literal()
 		expr = Binary{expr, right, operator}
 	}
 
@@ -141,9 +141,9 @@ func (p *Parser) Literal() Expr {
 	if p.Match(FALSE) {
 		return Literal{Boolean{false}}
 	}
-	if p.Match(LEFT_GROUP) {
-		var expr Expr = p.Expression()
-		p.Consume(RIGHT_GROUP, "Expect ')' after expression")
+	if p.Match(LEFTGROUP) {
+		expr := p.Expression()
+		p.Consume(RIGHTGROUP, "Expect ')' after expression")
 		return Grouping{expr}
 	}
 	ParseError(p.Current().line, "Expect expression")
@@ -167,7 +167,7 @@ func (p *Parser) Current() Token {
 	return p.tokens[p.current]
 }
 
-/*Preious returns the previous token under consideration */
+/*Previous returns the previous token under consideration */
 func (p *Parser) Previous() Token {
 	return p.tokens[p.current-1]
 }
