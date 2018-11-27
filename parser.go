@@ -154,9 +154,8 @@ func (p *Parser) Literal() Expr {
 		prev := p.Previous()
 		if p.Match(ASSIGN) {
 			return Assign{prev, p.Expression()}
-		} else {
-			return Variable{prev}
 		}
+		return Variable{prev}
 	}
 	ParseError(p.Current().line, "Expect expression")
 	return nil

@@ -38,12 +38,14 @@ func (i *Interpreter) Evaluate(e Expr) Object {
 	return e.Accept(i)
 }
 
+/*visitAssign visits an assignment operation and then saves it to the environment variable */
 func (i *Interpreter) visitAssign(a Assign) Object {
 	result := i.Evaluate(a.initializer)
 	i.env.define(a.identifier.literal, result)
-	return Nil{}
+	return NIL
 }
 
+/*visitVariable looks up a variable in the environment and returns it */
 func (i *Interpreter) visitVariable(v Variable) Object {
 	return i.env.get(v.identifier.literal)
 }
@@ -52,7 +54,7 @@ func (i *Interpreter) visitVariable(v Variable) Object {
 func (i *Interpreter) visitPrint(p Print) Object {
 	result := i.Evaluate(p.expr)
 	fmt.Println(Stringify(result))
-	return Nil{}
+	return NIL
 }
 
 /*visitGrouping evaluates the internal expression and then returns that */
@@ -82,7 +84,7 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 		}
 	}
 	RuntimeError("Mismatched operands: '" + leftObj.Type() + "' and '" + rightObj.Type() + "'")
-	return Nil{}
+	return NIL
 }
 
 /*visitLiteral return sthe underlying object value of a literal */
@@ -121,7 +123,7 @@ func EvaluateNum(left Integer, right Integer, operator Token) Object {
 		return Boolean{left.Value <= right.Value}
 	default:
 		RuntimeError("Unsupported operation on values of type 'INTEGER'")
-		return Nil{}
+		return NIL
 	}
 }
 
@@ -134,7 +136,7 @@ func EvaluateBoolean(left Boolean, right Boolean, operator Token) Object {
 		return Boolean{left.Value || right.Value}
 	default:
 		RuntimeError("Unsupported operation on values of type 'BOOLEAN'")
-		return Nil{}
+		return NIL
 	}
 }
 

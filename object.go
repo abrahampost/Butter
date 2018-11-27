@@ -53,3 +53,6 @@ type Nil struct {
 func (n Nil) Type() string {
 	return string(NILOBJ)
 }
+
+/*NIL is a singleton which all nil objects will reference */
+var NIL Nil
