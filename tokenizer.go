@@ -182,7 +182,7 @@ func NewTokenizer(inputString string) Tokenizer {
 
 /*Tokenize takes in an entire program as a string argument and parses it into tokens
   which it stores in the Tokens field of the tokenizer object it is called on */
-func (t *Tokenizer) Tokenize() {
+func (t *Tokenizer) Tokenize() []Token {
 	for cursor := t.Advance(); !t.AtEnd(); cursor = t.Advance() {
 		switch cursor {
 		case 0:
@@ -256,6 +256,7 @@ func (t *Tokenizer) Tokenize() {
 		}
 	}
 	t.AddToken(EOF, "")
+	return t.tokens
 }
 
 /*IsNum returns true if the byte passes is a char corresponding to the numbers 0 through 9*/

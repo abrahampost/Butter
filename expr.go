@@ -40,10 +40,12 @@ type Grouping struct {
 	expr Expr
 }
 
+/*Accept passes assign to the visitAssign method on the interpreter */
 func (a Assign) Accept(interpreter *Interpreter) Object {
 	return interpreter.visitAssign(a)
 }
 
+/*Accept passes assign to the visitVariable method on the interpreter */
 func (v Variable) Accept(interpreter *Interpreter) Object {
 	return interpreter.visitVariable(v)
 }

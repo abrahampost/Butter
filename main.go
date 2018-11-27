@@ -27,7 +27,7 @@ func main() {
 	settings := Settings{false, ""}
 	settings.Parse()
 
-	interpreter = NewIntepreter()
+	interpreter = NewInterpreter()
 
 	if settings.fromFile {
 		RunFile(settings)
@@ -57,8 +57,8 @@ func RunPrompt() {
 /*Run sends the input to the tokenizer and interpreter, evaluating the input string as it comes in*/
 func Run(source string, repl bool) {
 	tokenizer := NewTokenizer(source)
-	tokenizer.Tokenize()
-	parser := NewParser(tokenizer.tokens)
+	tokens := tokenizer.Tokenize()
+	parser := NewParser(tokens)
 	exprs := parser.Parse()
 	interpreter.Interpret(exprs, repl)
 }

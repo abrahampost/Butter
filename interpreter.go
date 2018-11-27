@@ -10,7 +10,8 @@ type Interpreter struct {
 	env Env
 }
 
-func NewIntepreter() Interpreter {
+/*NewInterpreter returns a new Interpreter object with a properly initialized environment */
+func NewInterpreter() Interpreter {
 	i := Interpreter{}
 	i.env = NewEnvironment()
 	return i
