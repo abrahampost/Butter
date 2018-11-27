@@ -150,6 +150,14 @@ func (p *Parser) Literal() Expr {
 		p.Consume(RIGHTGROUP, "Expect ')' after expression")
 		return Grouping{expr}
 	}
+	if p.Match(IDENTIFIER) {
+		prev := p.Previous()
+		if p.Match(ASSIGN) {
+			return Assign{prev, p.Expression()}
+		} else {
+			return Variable{prev}
+		}
+	}
 	ParseError(p.Current().line, "Expect expression")
 	return nil
 }

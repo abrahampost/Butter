@@ -27,6 +27,8 @@ func main() {
 	settings := Settings{false, ""}
 	settings.Parse()
 
+	interpreter = NewIntepreter()
+
 	if settings.fromFile {
 		RunFile(settings)
 	} else {

@@ -36,6 +36,63 @@ const (
 	EOF
 )
 
+func (t TokenType) String() string {
+	switch t {
+	case PLUS:
+		return "+"
+	case MINUS:
+		return "-"
+	case MULT:
+		return "*"
+	case DIV:
+		return "/"
+	case EQUAL:
+		return "="
+	case LEFTGROUP:
+		return "("
+	case RIGHTGROUP:
+		return ")"
+	case NUM:
+		return "NUM"
+	case PRINT:
+		return "PRINT"
+	case BANG:
+		return "!"
+	case BANGEQUAL:
+		return "!="
+	case EQUALEQUAL:
+		return "=="
+	case LESS:
+		return "<"
+	case LESSEQUAL:
+		return "<="
+	case GREATER:
+		return ">"
+	case GREATEREQUAL:
+		return ">="
+	case OR:
+		return "OR"
+	case AND:
+		return "AND"
+	case TRUE:
+		return "TRUE"
+	case FALSE:
+		return "FALSE"
+	case ASSIGN:
+		return "ASSIGN"
+	case STRING:
+		return "STRING"
+	case IDENTIFIER:
+		return "IDENTIFIER"
+	case NEWLINE:
+		return "\n"
+	case EOF:
+		return "EOF"
+	default:
+		return "(nil)"
+	}
+}
+
 /*Token contains the Type of the token object and the value stored there */
 type Token struct {
 	Type    TokenType

@@ -7,6 +7,13 @@ import (
 
 /*The Interpreter struct which merely holds a bunch of methods */
 type Interpreter struct {
+	env Env
+}
+
+func NewIntepreter() Interpreter {
+	i := Interpreter{}
+	i.env = NewEnvironment()
+	return i
 }
 
 /*Interpret takes a list of parsed AST expressions and evaluates them */
@@ -29,6 +36,16 @@ func (i *Interpreter) Interpret(exprs []Expr, repl bool) {
   back on the interpreter for evaluation */
 func (i *Interpreter) Evaluate(e Expr) Object {
 	return e.Accept(i)
+}
+
+func (i *Interpreter) visitAssign(a Assign) Object {
+	result := i.Evaluate(a.initializer)
+	i.env.define(a.identifier.literal, result)
+	return Nil{}
+}
+
+func (i *Interpreter) visitVariable(v Variable) Object {
+	return i.env.get(v.identifier.literal)
 }
 
 /*visitPrint evaluates the expr contained within a print object and then prints that */
@@ -57,7 +74,12 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 		return EvaluateBoolean(leftBool, rightBool, b.operator)
 	}
 	if leftString, ok := leftObj.(String); ok {
-		return String{leftString.Value + Stringify(rightObj)}
+		switch b.operator.Type {
+		case PLUS:
+			return String{leftString.Value + Stringify(rightObj)}
+		default:
+			RuntimeError("string does not support '" + b.operator.Type.String() + "' operator")
+		}
 	}
 	RuntimeError("Mismatched operands: '" + leftObj.Type() + "' and '" + rightObj.Type() + "'")
 	return Nil{}

@@ -10,6 +10,18 @@ type Print struct {
 	expr Expr
 }
 
+/*Assign is an expr which will evaluate the righthand expression and assign it to the identifier
+  on the left within the env */
+type Assign struct {
+	identifier  Token
+	initializer Expr
+}
+
+/*Variable is an expression which will retrieve the contents of a variable from Env memory */
+type Variable struct {
+	identifier Token
+}
+
 /*Binary contains a left and right subexpression, and then an operation which will
   operate on the resulting values */
 type Binary struct {
@@ -26,6 +38,14 @@ type Literal struct {
   before the grouping's value is returned */
 type Grouping struct {
 	expr Expr
+}
+
+func (a Assign) Accept(interpreter *Interpreter) Object {
+	return interpreter.visitAssign(a)
+}
+
+func (v Variable) Accept(interpreter *Interpreter) Object {
+	return interpreter.visitVariable(v)
 }
 
 /*Accept finds the visitPrint method on the interpreter */
