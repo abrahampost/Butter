@@ -17,7 +17,8 @@ const (
 	EQUAL
 	LEFTGROUP
 	RIGHTGROUP
-	NUM
+	INT
+	FLOAT
 	PRINT
 	BANG
 	BANGEQUAL
@@ -55,8 +56,10 @@ func (t TokenType) String() string {
 		return "("
 	case RIGHTGROUP:
 		return ")"
-	case NUM:
-		return "NUM"
+	case INT:
+		return "INT"
+	case FLOAT:
+		return "FLOAT"
 	case PRINT:
 		return "PRINT"
 	case BANG:
@@ -121,8 +124,10 @@ func (t Token) String() string {
 		return "Token: LEFTGROUP; literal ->" + t.literal
 	case RIGHTGROUP:
 		return "Token: RIGHTGROUP; literal ->" + t.literal
-	case NUM:
-		return "Token: NUM; literal ->" + t.literal
+	case INT:
+		return "Token: INT; literal ->" + t.literal
+	case FLOAT:
+		return "Token: FLOAT; literal ->" + t.literal
 	case PRINT:
 		return "Token: PRINT; literal ->" + t.literal
 	case BANG:
@@ -290,7 +295,16 @@ func (t *Tokenizer) Number() {
 	for !t.AtEnd() && IsNum(t.cursor) && IsNum(t.PeekNext()) {
 		t.Advance()
 	}
-	t.AddToken(NUM, t.inputString[t.begTok:t.cursorLoc])
+	potFloatingPoint := t.cursorLoc
+	if t.Match('.') {
+		for !t.AtEnd() && IsNum(t.PeekNext()) {
+			t.Advance()
+		}
+		t.AddToken(FLOAT, t.inputString[t.begTok:potFloatingPoint]+"."+t.inputString[potFloatingPoint+1:t.cursorLoc])
+	} else {
+		t.AddToken(INT, t.inputString[t.begTok:t.cursorLoc])
+	}
+
 }
 
 /*IdentifierOrReserved advances characters until it finds a non alphanumeric character and then checks to see

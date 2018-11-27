@@ -5,6 +5,7 @@ type ObjType string
 
 const (
 	INTEGEROBJ ObjType = "Integer"
+	FLOATOBJ   ObjType = "Float"
 	BOOLEANOBJ ObjType = "Boolean"
 	STRINGOBJ  ObjType = "String"
 	NILOBJ     ObjType = "Nil"
@@ -23,6 +24,16 @@ type Integer struct {
 /*Type returns a string representation of the integer object's type */
 func (i Integer) Type() string {
 	return string(INTEGEROBJ)
+}
+
+/*Float is an object implementation containting a float value */
+type Float struct {
+	Value float64
+}
+
+/*Type returns a string representation of the float object's type */
+func (f Float) Type() string {
+	return string(FLOATOBJ)
 }
 
 /*Boolean is on object implementaiton only containing a bool value */

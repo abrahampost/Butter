@@ -69,9 +69,26 @@ func (i *Interpreter) visitGrouping(g Grouping) Object {
 func (i *Interpreter) visitBinary(b Binary) Object {
 	leftObj := i.Evaluate(b.left)
 	rightObj := i.Evaluate(b.right)
-	leftInt, rightInt, isNum := CheckNumberOperands(leftObj, rightObj)
+	isNum := CheckNumberOperands(leftObj, rightObj)
 	if isNum {
-		return EvaluateNum(leftInt, rightInt, b.operator)
+		lFloat, lIsFloat := leftObj.(Float)
+		rFloat, rIsFloat := rightObj.(Float)
+		//if either is a float, figure out which is a float and then cast to floats
+		if lIsFloat || rIsFloat {
+			if !lIsFloat {
+				leftInt := leftObj.(Integer)
+				lFloat = Float{float64(leftInt.Value)}
+			}
+			if !rIsFloat {
+				rightInt := rightObj.(Integer)
+				rFloat = Float{float64(rightInt.Value)}
+			}
+			return EvaluateFloat(lFloat, rFloat, b.operator)
+		} else {
+			lInteger := leftObj.(Integer)
+			rInteger := rightObj.(Integer)
+			return EvaluateInt(lInteger, rInteger, b.operator)
+		}
 	}
 	leftBool, rightBool, isBool := CheckBoolOperands(leftObj, rightObj)
 	if isBool {
@@ -94,8 +111,46 @@ func (i *Interpreter) visitLiteral(l Literal) Object {
 	return l.obj
 }
 
-/*EvaluateNum returns an object based on the operation between two integers*/
-func EvaluateNum(left Integer, right Integer, operator Token) Object {
+/*EvaluateFloat evaluates mathematical operation on two floats and returns an Object*/
+func EvaluateFloat(left Float, right Float, operator Token) Object {
+	switch operator.Type {
+	case PLUS:
+		return Float{left.Value + right.Value}
+	case MINUS:
+		return Float{left.Value - right.Value}
+	case DIV:
+		if right.Value == 0 {
+			RuntimeError("Divide by zero error")
+		} else if left.Value == 0 {
+			return Float{0}
+		}
+		return Float{left.Value / right.Value}
+	case MULT:
+		if left.Value == 0 || right.Value == 0 {
+			return Float{0}
+		}
+		return Float{left.Value * right.Value}
+	case EXP:
+		res := math.Pow(left.Value, right.Value)
+		return Float{res}
+	case EQUALEQUAL:
+		return Boolean{left.Value == right.Value}
+	case BANGEQUAL:
+		return Boolean{left.Value != right.Value}
+	case GREATER:
+		return Boolean{left.Value > right.Value}
+	case GREATEREQUAL:
+		return Boolean{left.Value >= right.Value}
+	case LESSEQUAL:
+		return Boolean{left.Value <= right.Value}
+	default:
+		RuntimeError("Unsupported operation on values of type 'FLOAT'")
+		return NIL
+	}
+}
+
+/*EvaluateInt returns an object based on the operation between two integers*/
+func EvaluateInt(left Integer, right Integer, operator Token) Object {
 	switch operator.Type {
 	case PLUS:
 		return Integer{left.Value + right.Value}
@@ -150,6 +205,12 @@ func Stringify(o Object) string {
 	switch t := o.(type) {
 	case Integer:
 		return strconv.Itoa(t.Value)
+	case Float:
+		//if the value is almost equal to a whole number, then only print .0 at the end and nothing crazy
+		if t.Value-float64(int(t.Value)) < .000001 {
+			return fmt.Sprintf("%.0f.0", t.Value)
+		}
+		return fmt.Sprintf("%f", t.Value)
 	case Boolean:
 		if t.Value {
 			return "TRUE"
@@ -163,10 +224,12 @@ func Stringify(o Object) string {
 }
 
 /*CheckNumberOperands returns a tuple with the values and a positive bool if the objects are both Integers */
-func CheckNumberOperands(left Object, right Object) (Integer, Integer, bool) {
-	leftInt, lOK := left.(Integer)
-	rightInt, rOK := right.(Integer)
-	return leftInt, rightInt, lOK && rOK
+func CheckNumberOperands(left Object, right Object) bool {
+	_, lInt := left.(Integer)
+	_, rInt := right.(Integer)
+	_, lFloat := left.(Float)
+	_, rFloat := right.(Float)
+	return (lInt || lFloat) && (rInt || rFloat)
 }
 
 /*CheckBoolOperands returns a tuple with the values and a positive bool if the objects are both Booleans */

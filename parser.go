@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strconv"
 )
 
@@ -37,7 +38,7 @@ func (p *Parser) Line() Expr {
 	}
 	expr = p.Expression()
 	if !p.Match(NEWLINE, EOF) {
-		ParseError(p.Current().line, "Expected end of line after expression, received->"+p.Current().Type.String())
+		ParseError(p.Current().line, fmt.Sprintf("Expected end of line after expression, received->%s %s", p.Current().Type.String(), p.Current().literal))
 	}
 	return expr
 }
@@ -141,11 +142,19 @@ func (p *Parser) Multiplication() Expr {
 
 /*Literal returns an object of the type of the token passes, with a value parsed from the Token literal */
 func (p *Parser) Literal() Expr {
-	if p.Match(NUM) {
+	if p.Match(INT) {
 		prev := p.Previous()
 		integer, err := strconv.Atoi(prev.literal)
 		CheckError(err)
 		return Literal{Integer{integer}}
+	}
+	if p.Match(FLOAT) {
+		prev := p.Previous()
+		float, err := strconv.ParseFloat(prev.literal, 64)
+		if err != nil {
+			ParseError(prev.line, "Unable to parse float")
+		}
+		return Literal{Float{float}}
 	}
 	if p.Match(STRING) {
 		prev := p.Previous()
