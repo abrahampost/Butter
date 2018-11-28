@@ -18,34 +18,87 @@ func NewParser(tokens []Token) Parser {
 }
 
 /*Parse parses all of the Tokens into Expression objects and returns those */
-func (p *Parser) Parse() []Expr {
-	var expressions []Expr
+func (p *Parser) Parse() []Stmt {
+	var statements []Stmt
 	for !p.AtEnd() {
-		expressions = append(expressions, p.Line())
-		//Eat empty lines
+		statements = append(statements, p.Declaration())
+		//Eat empty lines between statements
 		for !p.AtEnd() && p.Match(NEWLINE) {
 		}
 	}
-	return expressions
+	return statements
+}
+
+func (p *Parser) Declaration() Stmt {
+	if p.Match(INTTYPE, FLOATTYPE, STRINGTYPE, BOOLTYPE) {
+		return p.VarDeclaration()
+	}
+	return p.Statement()
+}
+
+func (p *Parser) VarDeclaration() Stmt {
+	varType := p.Previous()
+	fmt.Println("VarType: " + varType.String())
+	if p.Match(IDENTIFIER) {
+		identifier := p.Previous()
+		if p.Check(ASSIGN) {
+			p.Advance()
+			fmt.Println("Identifier" + p.Previous().String())
+			initializer := p.Expression()
+			return VarDeclaration{varType, identifier, initializer}
+		} else {
+			//if there isn't an initializing statement, initialize the value to the zero value for that data type
+			switch varType.Type {
+			case INTTYPE:
+				return VarDeclaration{varType, identifier, Literal{Integer{0}}}
+			case FLOATTYPE:
+				return VarDeclaration{varType, identifier, Literal{Float{0}}}
+			case BOOLTYPE:
+				return VarDeclaration{varType, identifier, Literal{Boolean{false}}}
+			case STRINGTYPE:
+				return VarDeclaration{varType, identifier, Literal{String{""}}}
+			}
+		}
+	} else {
+		ParseError(p.Previous().line, "expect variable declaration")
+	}
+	//as of now ErrorStmt will never be used, but will eventually catch error
+	return ErrorStmt{"Expect variable declaration"}
 }
 
 /*Line Parses an expression, then eats any trailing whitespace */
-func (p *Parser) Line() Expr {
-	var expr Expr
+func (p *Parser) Statement() Stmt {
 	if p.Match(PRINT) {
-		expr = p.Expression()
+		expr := p.Expression()
 		return Print{expr}
 	}
-	expr = p.Expression()
-	if !p.Match(NEWLINE, EOF) {
-		ParseError(p.Current().line, fmt.Sprintf("Expected end of line after expression, received->%s %s", p.Current().Type.String(), p.Current().literal))
-	}
-	return expr
+	return p.ExpressionStatement()
+}
+
+func (p *Parser) ExpressionStatement() Stmt {
+	exprStmt := ExprStmt{p.Expression()}
+	p.CheckNewLine()
+	return exprStmt
 }
 
 /*Expression parses an expression object */
 func (p *Parser) Expression() Expr {
+	expr := p.Assignment()
+
+	return expr
+}
+
+func (p *Parser) Assignment() Expr {
 	expr := p.Or()
+
+	if p.Match(ASSIGN) {
+		value := p.Assignment()
+		if e, ok := expr.(Variable); ok {
+			return Assign{e.identifier, value}
+		} else {
+			ParseError(p.Previous().line, "Invalid assignment target")
+		}
+	}
 
 	return expr
 }
@@ -183,12 +236,9 @@ func (p *Parser) Literal() Expr {
 	}
 	if p.Match(IDENTIFIER) {
 		prev := p.Previous()
-		if p.Match(ASSIGN) {
-			return Assign{prev, p.Expression()}
-		}
 		return Variable{prev}
 	}
-	ParseError(p.Current().line, "Expect expression")
+	ParseError(p.Current().line, "Expect expression, received->"+p.Previous().Type.String())
 	return nil
 }
 
@@ -242,4 +292,10 @@ func (p *Parser) Check(t TokenType) bool {
 		return false
 	}
 	return p.Current().Type == t
+}
+
+func (p *Parser) CheckNewLine() {
+	if !p.Match(NEWLINE, EOF) {
+		ParseError(p.Current().line, fmt.Sprintf("Expected end of line after expression, received->%s %s", p.Current().Type.String(), p.Current().literal))
+	}
 }

@@ -34,6 +34,10 @@ const (
 	FALSE
 	ASSIGN
 	STRING
+	INTTYPE
+	FLOATTYPE
+	BOOLTYPE
+	STRINGTYPE
 	IDENTIFIER
 	NEWLINE
 	EOF
@@ -91,6 +95,14 @@ func (t TokenType) String() string {
 		return "ASSIGN"
 	case STRING:
 		return "STRING"
+	case INTTYPE:
+		return "INTTYPE"
+	case FLOATTYPE:
+		return "FLOATTYPE"
+	case BOOLTYPE:
+		return "BOOLTYPE"
+	case STRINGTYPE:
+		return "STRINGTYPE"
 	case IDENTIFIER:
 		return "IDENTIFIER"
 	case NEWLINE:
@@ -161,6 +173,14 @@ func (t Token) String() string {
 		return "Token: ASSIGN; literal ->" + t.literal
 	case STRING:
 		return "Token: STRING; literal ->" + t.literal
+	case INTTYPE:
+		return "Token: INTTYPE; literal ->" + t.literal
+	case FLOATTYPE:
+		return "Token: FLOATTYPE; literal ->" + t.literal
+	case BOOLTYPE:
+		return "Token: BOOLTYPE; literal ->" + t.literal
+	case STRINGTYPE:
+		return "Token: STRINGTYPE; literal ->" + t.literal
 	case IDENTIFIER:
 		return "Token: IDENTIFIER; literal ->" + t.literal
 	case NEWLINE:
@@ -192,6 +212,10 @@ func NewTokenizer(inputString string) Tokenizer {
 	reserved["and"] = AND
 	reserved["true"] = TRUE
 	reserved["false"] = FALSE
+	reserved["int"] = INTTYPE
+	reserved["float"] = FLOATTYPE
+	reserved["bool"] = BOOLTYPE
+	reserved["string"] = STRINGTYPE
 	return Tokenizer{inputString, []Token{}, 0, 0, '0', 0}
 }
 
