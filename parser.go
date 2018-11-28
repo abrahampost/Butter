@@ -131,7 +131,7 @@ func (p *Parser) Addition() Expr {
 func (p *Parser) Multiplication() Expr {
 	expr := p.Unary()
 
-	for p.Match(MULT, DIV) {
+	for p.Match(MULT, DIV, MOD) {
 		operator := p.Previous()
 		right := p.Unary()
 		expr = Binary{expr, right, operator}

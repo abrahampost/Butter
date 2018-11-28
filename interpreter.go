@@ -85,6 +85,7 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 			}
 			return EvaluateFloat(lFloat, rFloat, b.operator)
 		} else {
+			//If neither are floats, they must be integers and should use integer math
 			lInteger := leftObj.(Integer)
 			rInteger := rightObj.(Integer)
 			return EvaluateInt(lInteger, rInteger, b.operator)
@@ -165,7 +166,7 @@ func EvaluateFloat(left Float, right Float, operator Token) Object {
 	case LESSEQUAL:
 		return Boolean{left.Value <= right.Value}
 	default:
-		RuntimeError("Unsupported operation on values of type 'FLOAT'")
+		RuntimeError(fmt.Sprintf("Unsupported operation (%s) on values of type 'FLOAT'", operator.Type.String()))
 		return NIL
 	}
 }
@@ -184,6 +185,11 @@ func EvaluateInt(left Integer, right Integer, operator Token) Object {
 			return Integer{0}
 		}
 		return Integer{left.Value / right.Value}
+	case MOD:
+		if right.Value == 0 {
+			RuntimeError("Module by zero error")
+		}
+		return Integer{left.Value % right.Value}
 	case MULT:
 		if left.Value == 0 || right.Value == 0 {
 			return Integer{0}
@@ -203,7 +209,7 @@ func EvaluateInt(left Integer, right Integer, operator Token) Object {
 	case LESSEQUAL:
 		return Boolean{left.Value <= right.Value}
 	default:
-		RuntimeError("Unsupported operation on values of type 'INTEGER'")
+		RuntimeError(fmt.Sprintf("Unsupported operation (%s) on values of type 'INTEGER'", operator.Type.String()))
 		return NIL
 	}
 }
