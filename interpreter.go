@@ -106,6 +106,27 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 	return NIL
 }
 
+func (i *Interpreter) visitUnary(u Unary) Object {
+	result := i.Evaluate(u.right)
+
+	switch u.operator.Type {
+	case BANG:
+		if val, ok := result.(Boolean); ok {
+			return Boolean{!val.Value}
+		}
+		RuntimeError("Cannot negate non-boolean object")
+	case MINUS:
+		if val, ok := result.(Integer); ok {
+			return Integer{-val.Value}
+		}
+		if val, ok := result.(Float); ok {
+			return Float{-val.Value}
+		}
+		RuntimeError("Cannot have negative non-number type")
+	}
+	return NIL
+}
+
 /*visitLiteral return sthe underlying object value of a literal */
 func (i *Interpreter) visitLiteral(l Literal) Object {
 	return l.obj

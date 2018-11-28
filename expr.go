@@ -29,6 +29,12 @@ type Binary struct {
 	operator    Token
 }
 
+/*Unary contains an operator and an expression and performs the operation on the expression */
+type Unary struct {
+	right    Expr
+	operator Token
+}
+
 /*Literal is an expr that returns the value of an object */
 type Literal struct {
 	obj Object
@@ -60,9 +66,14 @@ func (l Literal) Accept(interpreter *Interpreter) Object {
 	return interpreter.visitLiteral(l)
 }
 
-/*Accept finds the visitBinary method on the inrepreter */
+/*Accept finds the visitBinary method on the interpreter */
 func (b Binary) Accept(interpreter *Interpreter) Object {
 	return interpreter.visitBinary(b)
+}
+
+/*Accept finds the visitUnary method on the interpreter*/
+func (u Unary) Accept(interpreter *Interpreter) Object {
+	return interpreter.visitUnary(u)
 }
 
 /*Accept visits the visitGrouping method on the interpreter */
