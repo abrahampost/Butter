@@ -221,6 +221,10 @@ func EvaluateBoolean(left Boolean, right Boolean, operator Token) Object {
 		return Boolean{left.Value && right.Value}
 	case OR:
 		return Boolean{left.Value || right.Value}
+	case EQUAL:
+		return Boolean{left.Value == right.Value}
+	case BANGEQUAL:
+		return Boolean{left.Value != right.Value}
 	default:
 		RuntimeError("Unsupported operation on values of type 'BOOLEAN'")
 		return NIL
