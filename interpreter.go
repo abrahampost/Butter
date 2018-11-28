@@ -228,10 +228,10 @@ func Stringify(o Object) string {
 		return strconv.Itoa(t.Value)
 	case Float:
 		//if the value is almost equal to a whole number, then only print .0 at the end and nothing crazy
-		if t.Value-float64(int(t.Value)) < .000001 {
+		if t.Value-float64(int(t.Value)) < .0000000001 {
 			return fmt.Sprintf("%.0f.0", t.Value)
 		}
-		return fmt.Sprintf("%f", t.Value)
+		return fmt.Sprint(t.Value)
 	case Boolean:
 		if t.Value {
 			return "TRUE"
