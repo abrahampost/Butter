@@ -8,7 +8,7 @@ Goal is to implement a toy programming language in Go
 * Boolean logic implemented
 * Print statements
 * Implicitly typed variables
- * can assign with <var_name> := <expr>
+ * can assign with `<var_name> := <expr>`
 
 
 Lots of features and improvements coming in the next few weeks.
