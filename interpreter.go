@@ -85,6 +85,7 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 			}
 			return EvaluateFloat(lFloat, rFloat, b.operator)
 		} else {
+			//If neither are floats, they must be integers and should use integer math
 			lInteger := leftObj.(Integer)
 			rInteger := rightObj.(Integer)
 			return EvaluateInt(lInteger, rInteger, b.operator)
@@ -103,6 +104,27 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 		}
 	}
 	RuntimeError("Mismatched operands: '" + leftObj.Type() + "' and '" + rightObj.Type() + "'")
+	return NIL
+}
+
+func (i *Interpreter) visitUnary(u Unary) Object {
+	result := i.Evaluate(u.right)
+
+	switch u.operator.Type {
+	case BANG:
+		if val, ok := result.(Boolean); ok {
+			return Boolean{!val.Value}
+		}
+		RuntimeError("Cannot negate non-boolean object")
+	case MINUS:
+		if val, ok := result.(Integer); ok {
+			return Integer{-val.Value}
+		}
+		if val, ok := result.(Float); ok {
+			return Float{-val.Value}
+		}
+		RuntimeError("Cannot have negative non-number type")
+	}
 	return NIL
 }
 
@@ -144,7 +166,7 @@ func EvaluateFloat(left Float, right Float, operator Token) Object {
 	case LESSEQUAL:
 		return Boolean{left.Value <= right.Value}
 	default:
-		RuntimeError("Unsupported operation on values of type 'FLOAT'")
+		RuntimeError(fmt.Sprintf("Unsupported operation (%s) on values of type 'FLOAT'", operator.Type.String()))
 		return NIL
 	}
 }
@@ -163,6 +185,11 @@ func EvaluateInt(left Integer, right Integer, operator Token) Object {
 			return Integer{0}
 		}
 		return Integer{left.Value / right.Value}
+	case MOD:
+		if right.Value == 0 {
+			RuntimeError("Module by zero error")
+		}
+		return Integer{left.Value % right.Value}
 	case MULT:
 		if left.Value == 0 || right.Value == 0 {
 			return Integer{0}
@@ -182,7 +209,7 @@ func EvaluateInt(left Integer, right Integer, operator Token) Object {
 	case LESSEQUAL:
 		return Boolean{left.Value <= right.Value}
 	default:
-		RuntimeError("Unsupported operation on values of type 'INTEGER'")
+		RuntimeError(fmt.Sprintf("Unsupported operation (%s) on values of type 'INTEGER'", operator.Type.String()))
 		return NIL
 	}
 }
@@ -194,6 +221,10 @@ func EvaluateBoolean(left Boolean, right Boolean, operator Token) Object {
 		return Boolean{left.Value && right.Value}
 	case OR:
 		return Boolean{left.Value || right.Value}
+	case EQUAL:
+		return Boolean{left.Value == right.Value}
+	case BANGEQUAL:
+		return Boolean{left.Value != right.Value}
 	default:
 		RuntimeError("Unsupported operation on values of type 'BOOLEAN'")
 		return NIL
@@ -207,10 +238,10 @@ func Stringify(o Object) string {
 		return strconv.Itoa(t.Value)
 	case Float:
 		//if the value is almost equal to a whole number, then only print .0 at the end and nothing crazy
-		if t.Value-float64(int(t.Value)) < .000001 {
+		if t.Value-float64(int(t.Value)) < .0000000001 {
 			return fmt.Sprintf("%.0f.0", t.Value)
 		}
-		return fmt.Sprintf("%f", t.Value)
+		return fmt.Sprint(t.Value)
 	case Boolean:
 		if t.Value {
 			return "TRUE"

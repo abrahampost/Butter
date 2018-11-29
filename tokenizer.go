@@ -14,6 +14,7 @@ const (
 	MULT
 	EXP
 	DIV
+	MOD
 	EQUAL
 	LEFTGROUP
 	RIGHTGROUP
@@ -50,6 +51,8 @@ func (t TokenType) String() string {
 		return "**"
 	case DIV:
 		return "/"
+	case MOD:
+		return "%%"
 	case EQUAL:
 		return "="
 	case LEFTGROUP:
@@ -91,7 +94,7 @@ func (t TokenType) String() string {
 	case IDENTIFIER:
 		return "IDENTIFIER"
 	case NEWLINE:
-		return "\n"
+		return "%\n"
 	case EOF:
 		return "EOF"
 	default:
@@ -118,6 +121,8 @@ func (t Token) String() string {
 		return "Token: EXP; literal ->" + t.literal
 	case DIV:
 		return "Token: DIV; literal ->" + t.literal
+	case MOD:
+		return "Token: MOD; literal ->" + t.literal
 	case EQUAL:
 		return "Token: EQUAL; literal ->" + t.literal
 	case LEFTGROUP:
@@ -217,6 +222,8 @@ func (t *Tokenizer) Tokenize() []Token {
 			}
 		case '/':
 			t.AddToken(DIV, "")
+		case '%':
+			t.AddToken(MOD, "")
 		case '(':
 			t.AddToken(LEFTGROUP, "")
 		case ')':

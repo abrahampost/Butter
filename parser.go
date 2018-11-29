@@ -129,15 +129,25 @@ func (p *Parser) Addition() Expr {
 
 /*Multiplication parses both sides of an expression, then connects them with a multiplication operator (if applicable) */
 func (p *Parser) Multiplication() Expr {
-	expr := p.Literal()
+	expr := p.Unary()
 
-	for p.Match(MULT, DIV) {
+	for p.Match(MULT, DIV, MOD) {
 		operator := p.Previous()
-		right := p.Literal()
+		right := p.Unary()
 		expr = Binary{expr, right, operator}
 	}
 
 	return expr
+}
+
+func (p *Parser) Unary() Expr {
+	for p.Match(BANG, MINUS) {
+		operator := p.Previous()
+		right := p.Literal()
+		return Unary{right, operator}
+	}
+
+	return p.Literal()
 }
 
 /*Literal returns an object of the type of the token passes, with a value parsed from the Token literal */

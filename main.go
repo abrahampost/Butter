@@ -7,6 +7,8 @@ import (
 	"os"
 )
 
+var VERSION string = "0.1"
+
 /*Settings struct Contains the settings for the current interpreter */
 type Settings struct {
 	fromFile bool
@@ -46,6 +48,7 @@ func RunFile(s Settings) {
 
 /*RunPrompt runs the REPL and feeds input to the run method as it comes in  */
 func RunPrompt() {
+	fmt.Printf("Butterv%s (repl)\n", VERSION)
 	reader := bufio.NewReader(os.Stdin)
 	for true {
 		fmt.Print("> ")
