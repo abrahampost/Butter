@@ -27,11 +27,11 @@ The following variables are override-able at the command line, like
 `BINARY=myprog make`
 
 - `BINARY`: controls the name of the output binary
-  default: `Butter`
+  - default: `Butter`
 - `GO`: the `go` executable to use
-  default: `go`
+  - default: `go`
 - `PKGS`: the packages to act on
-  default: `./...`
+  - default: `./...`
 
 The following targets are provided:
 
