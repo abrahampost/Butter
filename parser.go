@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"strconv"
 )
 
@@ -22,14 +21,14 @@ func (p *Parser) Parse() []Stmt {
 	var statements []Stmt
 	for !p.AtEnd() {
 		statements = append(statements, p.Declaration())
+		//Eat newlines before statements
+		for !p.AtEnd() && p.Match(NEWLINE) {
+		}
 	}
 	return statements
 }
 
 func (p *Parser) Declaration() Stmt {
-	//Eat newlines before statements
-	for !p.AtEnd() && p.Match(NEWLINE) {
-	}
 	if p.Match(INTTYPE, FLOATTYPE, STRINGTYPE, BOOLTYPE) {
 		return p.VarDeclaration()
 	}
@@ -43,11 +42,12 @@ func (p *Parser) VarDeclaration() Stmt {
 	varType := p.Previous()
 	if p.Match(IDENTIFIER) {
 		identifier := p.Previous()
-		if p.Check(ASSIGN) {
-			p.Advance()
+		if p.Match(ASSIGN) {
 			initializer := p.Expression()
+			p.CheckEndline()
 			return VarDeclaration{varType, identifier, initializer}
 		} else {
+			p.CheckEndline()
 			//if there isn't an initializing statement, initialize the value to the zero value for that data type
 			switch varType.Type {
 			case INTTYPE:
@@ -81,7 +81,7 @@ func (p *Parser) Block() []Stmt {
 func (p *Parser) Statement() Stmt {
 	if p.Match(PRINT) {
 		expr := p.Expression()
-		p.Consume(NEWLINE, "Expect newline after statement")
+		p.CheckEndline()
 		return Print{expr}
 	}
 	return p.ExpressionStatement()
@@ -89,7 +89,7 @@ func (p *Parser) Statement() Stmt {
 
 func (p *Parser) ExpressionStatement() Stmt {
 	exprStmt := ExprStmt{p.Expression()}
-	p.Consume(NEWLINE, "Expect newline after statement")
+	p.CheckEndline()
 	return exprStmt
 }
 
@@ -293,7 +293,6 @@ func (p *Parser) Consume(t TokenType, message string) {
 	if p.Check(t) {
 		p.Advance()
 	} else {
-		fmt.Println("Found: " + p.Current().Type.String())
 		ParseError(p.Current().line, message)
 	}
 
@@ -305,4 +304,12 @@ func (p *Parser) Check(t TokenType) bool {
 		return false
 	}
 	return p.Current().Type == t
+}
+
+func (p *Parser) CheckEndline() bool {
+	if p.Match(NEWLINE, EOF) {
+		return true
+	}
+	ParseError(p.Current().line, "Expected new line after statement")
+	return false
 }

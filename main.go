@@ -61,7 +61,6 @@ func RunPrompt() {
 func Run(source string, repl bool) {
 	tokenizer := NewTokenizer(source)
 	tokens := tokenizer.Tokenize()
-	PrintTokens(tokens)
 	parser := NewParser(tokens)
 	stmts := parser.Parse()
 	interpreter.Interpret(stmts, repl)
