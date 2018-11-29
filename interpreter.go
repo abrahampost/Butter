@@ -65,6 +65,19 @@ func (i *Interpreter) visitPrint(p Print) {
 	fmt.Println(Stringify(result))
 }
 
+func (i *Interpreter) visitIf(ifStmt If) {
+	condition := i.Evaluate(ifStmt.condition)
+	if res, ok := condition.(Boolean); ok {
+		if res.Value {
+			i.Execute(ifStmt.ifTrue)
+		} else if ifStmt.ifFalse != nil {
+			i.Execute(ifStmt.ifFalse)
+		}
+	} else {
+		RuntimeError("Cannot use non boolean value in if conditional")
+	}
+}
+
 func (i *Interpreter) visitBlock(b Block) {
 	prevEnv := i.env
 	i.env = NewEnvironment(&prevEnv)
@@ -221,6 +234,8 @@ func EvaluateInt(left Integer, right Integer, operator Token) Object {
 		return Boolean{left.Value > right.Value}
 	case GREATEREQUAL:
 		return Boolean{left.Value >= right.Value}
+	case LESS:
+		return Boolean{left.Value < right.Value}
 	case LESSEQUAL:
 		return Boolean{left.Value <= right.Value}
 	default:

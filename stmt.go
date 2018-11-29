@@ -21,6 +21,12 @@ type VarDeclaration struct {
 	initializer Expr
 }
 
+type If struct {
+	condition Expr
+	ifTrue    Stmt
+	ifFalse   Stmt
+}
+
 type Block struct {
 	stmts []Stmt
 }
@@ -40,6 +46,10 @@ func (e ExprStmt) Accept(interpreter *Interpreter) {
 
 func (vd VarDeclaration) Accept(interpreter *Interpreter) {
 	interpreter.visitVarDeclaration(vd)
+}
+
+func (i If) Accept(interpreter *Interpreter) {
+	interpreter.visitIf(i)
 }
 
 func (b Block) Accept(interpreter *Interpreter) {

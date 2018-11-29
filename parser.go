@@ -22,8 +22,7 @@ func (p *Parser) Parse() []Stmt {
 	for !p.AtEnd() {
 		statements = append(statements, p.Declaration())
 		//Eat newlines before statements
-		for !p.AtEnd() && p.Match(NEWLINE) {
-		}
+		p.IgnoreNewlines()
 	}
 	return statements
 }
@@ -34,6 +33,9 @@ func (p *Parser) Declaration() Stmt {
 	}
 	if p.Match(LEFTBRACE) {
 		return Block{p.Block()}
+	}
+	if p.Match(IF) {
+		return p.IfStmt()
 	}
 	return p.Statement()
 }
@@ -75,6 +77,17 @@ func (p *Parser) Block() []Stmt {
 	}
 	p.Consume(RIGHTBRACE, "Expect '}' after block.")
 	return stmts
+}
+
+func (p *Parser) IfStmt() Stmt {
+	condition := p.Expression()
+	ifTrue := p.Declaration()
+	p.IgnoreNewlines()
+	var ifFalse Stmt
+	if p.Match(ELSE) {
+		ifFalse = p.Declaration()
+	}
+	return If{condition, ifTrue, ifFalse}
 }
 
 /*Line Parses an expression, then eats any trailing whitespace */
@@ -304,6 +317,11 @@ func (p *Parser) Check(t TokenType) bool {
 		return false
 	}
 	return p.Current().Type == t
+}
+
+func (p *Parser) IgnoreNewlines() {
+	for !p.AtEnd() && p.Match(NEWLINE) {
+	}
 }
 
 func (p *Parser) CheckEndline() bool {
