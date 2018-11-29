@@ -22,28 +22,29 @@ func (p *Parser) Parse() []Stmt {
 	var statements []Stmt
 	for !p.AtEnd() {
 		statements = append(statements, p.Declaration())
-		//Eat empty lines between statements
-		for !p.AtEnd() && p.Match(NEWLINE) {
-		}
 	}
 	return statements
 }
 
 func (p *Parser) Declaration() Stmt {
+	//Eat newlines before statements
+	for !p.AtEnd() && p.Match(NEWLINE) {
+	}
 	if p.Match(INTTYPE, FLOATTYPE, STRINGTYPE, BOOLTYPE) {
 		return p.VarDeclaration()
+	}
+	if p.Match(LEFTBRACE) {
+		return Block{p.Block()}
 	}
 	return p.Statement()
 }
 
 func (p *Parser) VarDeclaration() Stmt {
 	varType := p.Previous()
-	fmt.Println("VarType: " + varType.String())
 	if p.Match(IDENTIFIER) {
 		identifier := p.Previous()
 		if p.Check(ASSIGN) {
 			p.Advance()
-			fmt.Println("Identifier" + p.Previous().String())
 			initializer := p.Expression()
 			return VarDeclaration{varType, identifier, initializer}
 		} else {
@@ -66,10 +67,21 @@ func (p *Parser) VarDeclaration() Stmt {
 	return ErrorStmt{"Expect variable declaration"}
 }
 
+func (p *Parser) Block() []Stmt {
+	p.Consume(NEWLINE, "Expect newline after block")
+	var stmts []Stmt
+	for !p.Check(RIGHTBRACE) && !p.AtEnd() {
+		stmts = append(stmts, p.Declaration())
+	}
+	p.Consume(RIGHTBRACE, "Expect '}' after block.")
+	return stmts
+}
+
 /*Line Parses an expression, then eats any trailing whitespace */
 func (p *Parser) Statement() Stmt {
 	if p.Match(PRINT) {
 		expr := p.Expression()
+		p.Consume(NEWLINE, "Expect newline after statement")
 		return Print{expr}
 	}
 	return p.ExpressionStatement()
@@ -77,7 +89,7 @@ func (p *Parser) Statement() Stmt {
 
 func (p *Parser) ExpressionStatement() Stmt {
 	exprStmt := ExprStmt{p.Expression()}
-	p.CheckNewLine()
+	p.Consume(NEWLINE, "Expect newline after statement")
 	return exprStmt
 }
 
@@ -238,7 +250,7 @@ func (p *Parser) Literal() Expr {
 		prev := p.Previous()
 		return Variable{prev}
 	}
-	ParseError(p.Current().line, "Expect expression, received->"+p.Previous().Type.String())
+	ParseError(p.Current().line, "Expect expression, received->"+p.Current().Type.String()+" "+p.Current().literal)
 	return nil
 }
 
@@ -281,6 +293,7 @@ func (p *Parser) Consume(t TokenType, message string) {
 	if p.Check(t) {
 		p.Advance()
 	} else {
+		fmt.Println("Found: " + p.Current().Type.String())
 		ParseError(p.Current().line, message)
 	}
 
@@ -292,10 +305,4 @@ func (p *Parser) Check(t TokenType) bool {
 		return false
 	}
 	return p.Current().Type == t
-}
-
-func (p *Parser) CheckNewLine() {
-	if !p.Match(NEWLINE, EOF) {
-		ParseError(p.Current().line, fmt.Sprintf("Expected end of line after expression, received->%s %s", p.Current().Type.String(), p.Current().literal))
-	}
 }

@@ -21,6 +21,10 @@ type VarDeclaration struct {
 	initializer Expr
 }
 
+type Block struct {
+	stmts []Stmt
+}
+
 type ErrorStmt struct {
 	message string
 }
@@ -36,6 +40,10 @@ func (e ExprStmt) Accept(interpreter *Interpreter) {
 
 func (vd VarDeclaration) Accept(interpreter *Interpreter) {
 	interpreter.visitVarDeclaration(vd)
+}
+
+func (b Block) Accept(interpreter *Interpreter) {
+	interpreter.visitBlock(b)
 }
 
 func (e ErrorStmt) Accept(interpreter *Interpreter) {

@@ -18,9 +18,13 @@ const (
 	EQUAL
 	LEFTGROUP
 	RIGHTGROUP
+	LEFTBRACE
+	RIGHTBRACE
 	INT
 	FLOAT
 	PRINT
+	IF
+	ELSE
 	BANG
 	BANGEQUAL
 	EQUALEQUAL
@@ -63,12 +67,20 @@ func (t TokenType) String() string {
 		return "("
 	case RIGHTGROUP:
 		return ")"
+	case LEFTBRACE:
+		return "{"
+	case RIGHTBRACE:
+		return "}"
 	case INT:
 		return "INT"
 	case FLOAT:
 		return "FLOAT"
 	case PRINT:
 		return "PRINT"
+	case IF:
+		return "IF"
+	case ELSE:
+		return "ELSE"
 	case BANG:
 		return "!"
 	case BANGEQUAL:
@@ -106,7 +118,7 @@ func (t TokenType) String() string {
 	case IDENTIFIER:
 		return "IDENTIFIER"
 	case NEWLINE:
-		return "%\n"
+		return "\\n"
 	case EOF:
 		return "EOF"
 	default:
@@ -141,12 +153,20 @@ func (t Token) String() string {
 		return "Token: LEFTGROUP; literal ->" + t.literal
 	case RIGHTGROUP:
 		return "Token: RIGHTGROUP; literal ->" + t.literal
+	case LEFTBRACE:
+		return "Token: LEFTBRACE; literal ->" + t.literal
+	case RIGHTBRACE:
+		return "Token: RIGHTBRACE; literal ->" + t.literal
 	case INT:
 		return "Token: INT; literal ->" + t.literal
 	case FLOAT:
 		return "Token: FLOAT; literal ->" + t.literal
 	case PRINT:
 		return "Token: PRINT; literal ->" + t.literal
+	case IF:
+		return "Token: IF; literal ->" + t.literal
+	case ELSE:
+		return "Token: ELSE; literal ->" + t.literal
 	case BANG:
 		return "Token: BANG; literal ->" + t.literal
 	case BANGEQUAL:
@@ -208,6 +228,8 @@ var reserved map[string]TokenType
 func NewTokenizer(inputString string) Tokenizer {
 	reserved = make(map[string]TokenType)
 	reserved["print"] = PRINT
+	reserved["if"] = IF
+	reserved["else"] = ELSE
 	reserved["or"] = OR
 	reserved["and"] = AND
 	reserved["true"] = TRUE
@@ -252,6 +274,10 @@ func (t *Tokenizer) Tokenize() []Token {
 			t.AddToken(LEFTGROUP, "")
 		case ')':
 			t.AddToken(RIGHTGROUP, "")
+		case '{':
+			t.AddToken(LEFTBRACE, "")
+		case '}':
+			t.AddToken(RIGHTBRACE, "")
 		case '!':
 			if t.Match('=') {
 				t.AddToken(BANGEQUAL, "")

@@ -14,7 +14,7 @@ type Interpreter struct {
 /*NewInterpreter returns a new Interpreter object with a properly initialized environment */
 func NewInterpreter() Interpreter {
 	i := Interpreter{}
-	i.env = NewEnvironment()
+	i.env = NewEnvironment(nil)
 	return i
 }
 
@@ -42,29 +42,6 @@ func (i *Interpreter) visitVarDeclaration(vd VarDeclaration) {
 	val := i.Evaluate(vd.initializer)
 	CheckVarType(vd.tokenType, val)
 	i.env.define(vd.identifier.literal, val)
-	// switch vd.tokenType.Type {
-	// case INTTYPE:
-	// 	if _, ok := val.(Integer); !ok {
-	// 		RuntimeError("TypeError -> cannot assign value to int type")
-	// 	}
-	// 	i.env.define(vd.identifier.literal, val)
-	// case FLOATTYPE:
-	// 	if _, ok := val.(Float); !ok {
-	// 		RuntimeError("TypeError -> cannot assign value to float type")
-	// 	}
-	// 	i.env.define(vd.identifier.literal, val)
-	// case BOOLTYPE:
-	// 	if _, ok := val.(Boolean); !ok {
-	// 		RuntimeError("TypeError -> cannot assign value to bool type")
-	// 	}
-	// 	i.env.define(vd.identifier.literal, val)
-	// case STRINGTYPE:
-	// 	if _, ok := val.(String); !ok {
-	// 		RuntimeError("TypeError -> cannot assign value to string type")
-	// 	}
-	// default:
-	// 	RuntimeError("TypeError -> Unknown assignment type")
-	// }
 }
 func (i *Interpreter) visitErrorStmt(e ErrorStmt) {
 	fmt.Println(e.message)
@@ -83,10 +60,18 @@ func (i *Interpreter) visitVariable(v Variable) Object {
 }
 
 /*visitPrint evaluates the expr contained within a print object and then prints that */
-func (i *Interpreter) visitPrint(p Print) Object {
+func (i *Interpreter) visitPrint(p Print) {
 	result := i.Evaluate(p.expr)
 	fmt.Println(Stringify(result))
-	return NIL
+}
+
+func (i *Interpreter) visitBlock(b Block) {
+	prevEnv := i.env
+	i.env = NewEnvironment(&prevEnv)
+	defer func() { i.env = prevEnv }()
+	for _, stmt := range b.stmts {
+		i.Execute(stmt)
+	}
 }
 
 /*visitGrouping evaluates the internal expression and then returns that */

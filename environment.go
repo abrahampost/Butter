@@ -2,14 +2,20 @@ package main
 
 /*Env is an environment object where variables can be defined */
 type Env struct {
+	parent *Env
 	values map[string]Object
 }
 
 /*NewEnvironment creates a new environment and initializes the array */
-func NewEnvironment() Env {
-	env := Env{}
-	env.values = make(map[string]Object)
-	return env
+func NewEnvironment(parent *Env) Env {
+	return Env{
+		parent: parent,
+		values: make(map[string]Object),
+	}
+}
+
+func (e *Env) SetParent(parent *Env) {
+	e.parent = parent
 }
 
 func (e *Env) define(varName string, value Object) {
@@ -41,15 +47,20 @@ func (e *Env) assign(varName string, value Object) {
 			}
 		}
 		e.values[varName] = value
+	} else if e.parent != nil {
+		e.parent.assign(varName, value)
 	} else {
 		RuntimeError("Attempting to assign to undefined variable")
 	}
 }
 
 func (e *Env) get(varName string) Object {
-	result, ok := e.values[varName]
-	if !ok {
-		RuntimeError("Undefined variable: '" + varName + "'")
+	if result, ok := e.values[varName]; ok {
+		return result
+	} else if e.parent != nil {
+		return e.parent.get(varName)
 	}
-	return result
+
+	RuntimeError("Undefined variable: '" + varName + "'")
+	return NIL //unreachable code
 }
