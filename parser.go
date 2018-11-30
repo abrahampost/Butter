@@ -20,9 +20,9 @@ func NewParser(tokens []Token) Parser {
 func (p *Parser) Parse() []Stmt {
 	var statements []Stmt
 	for !p.AtEnd() {
-		statements = append(statements, p.Declaration())
 		//Eat newlines before statements
 		p.IgnoreNewlines()
+		statements = append(statements, p.Declaration())
 	}
 	return statements
 }

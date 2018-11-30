@@ -273,7 +273,13 @@ func (t *Tokenizer) Tokenize() []Token {
 				t.AddToken(MULT, "")
 			}
 		case '/':
-			t.AddToken(DIV, "")
+			if t.Match('/') {
+				for t.PeekNext() != '\n' && !t.AtEnd() {
+					t.Advance()
+				}
+			} else {
+				t.AddToken(DIV, "")
+			}
 		case '%':
 			t.AddToken(MOD, "")
 		case '(':
