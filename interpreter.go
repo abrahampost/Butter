@@ -8,7 +8,8 @@ import (
 
 /*The Interpreter struct which merely holds a bunch of methods */
 type Interpreter struct {
-	env Env
+	env    Env
+	isRepl bool
 }
 
 /*NewInterpreter returns a new Interpreter object with a properly initialized environment */
@@ -20,6 +21,7 @@ func NewInterpreter() Interpreter {
 
 /*Interpret takes a list of parsed AST expressions and evaluates them */
 func (i *Interpreter) Interpret(stmts []Stmt, repl bool) {
+	i.isRepl = true
 	for _, stmt := range stmts {
 		i.Execute(stmt)
 	}
@@ -36,7 +38,10 @@ func (i *Interpreter) Evaluate(e Expr) Object {
 }
 
 func (i *Interpreter) visitExprStmt(e ExprStmt) {
-	i.Evaluate(e.expr)
+	val := i.Evaluate(e.expr)
+	if i.isRepl {
+		fmt.Println(Stringify(val))
+	}
 }
 func (i *Interpreter) visitVarDeclaration(vd VarDeclaration) {
 	val := i.Evaluate(vd.initializer)
