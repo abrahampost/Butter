@@ -62,8 +62,8 @@ func Run(source string, repl bool) {
 	tokenizer := NewTokenizer(source)
 	tokens := tokenizer.Tokenize()
 	parser := NewParser(tokens)
-	exprs := parser.Parse()
-	interpreter.Interpret(exprs, repl)
+	stmts := parser.Parse()
+	interpreter.Interpret(stmts, repl)
 }
 
 /*CheckError checks to see if an error has been reported from a function */

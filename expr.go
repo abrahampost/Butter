@@ -5,9 +5,9 @@ type Expr interface {
 	Accept(interpreter *Interpreter) Object
 }
 
-/*Print contains an expr, and will evaluate and print the expression */
-type Print struct {
-	expr Expr
+/*Variable is an expression which will retrieve the contents of a variable from Env memory */
+type Variable struct {
+	identifier Token
 }
 
 /*Assign is an expr which will evaluate the righthand expression and assign it to the identifier
@@ -15,11 +15,6 @@ type Print struct {
 type Assign struct {
 	identifier  Token
 	initializer Expr
-}
-
-/*Variable is an expression which will retrieve the contents of a variable from Env memory */
-type Variable struct {
-	identifier Token
 }
 
 /*Binary contains a left and right subexpression, and then an operation which will
@@ -54,11 +49,6 @@ func (a Assign) Accept(interpreter *Interpreter) Object {
 /*Accept passes assign to the visitVariable method on the interpreter */
 func (v Variable) Accept(interpreter *Interpreter) Object {
 	return interpreter.visitVariable(v)
-}
-
-/*Accept finds the visitPrint method on the interpreter */
-func (p Print) Accept(intepreter *Interpreter) Object {
-	return interpreter.visitPrint(p)
 }
 
 /*Accept finds the visitLiteral method on the interpreter */

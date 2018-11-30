@@ -18,9 +18,14 @@ const (
 	EQUAL
 	LEFTGROUP
 	RIGHTGROUP
+	LEFTBRACE
+	RIGHTBRACE
 	INT
 	FLOAT
 	PRINT
+	IF
+	ELSE
+	WHILE
 	BANG
 	BANGEQUAL
 	EQUALEQUAL
@@ -34,6 +39,10 @@ const (
 	FALSE
 	ASSIGN
 	STRING
+	INTTYPE
+	FLOATTYPE
+	BOOLTYPE
+	STRINGTYPE
 	IDENTIFIER
 	NEWLINE
 	EOF
@@ -59,12 +68,22 @@ func (t TokenType) String() string {
 		return "("
 	case RIGHTGROUP:
 		return ")"
+	case LEFTBRACE:
+		return "{"
+	case RIGHTBRACE:
+		return "}"
 	case INT:
 		return "INT"
 	case FLOAT:
 		return "FLOAT"
 	case PRINT:
 		return "PRINT"
+	case IF:
+		return "IF"
+	case WHILE:
+		return "WHILE"
+	case ELSE:
+		return "ELSE"
 	case BANG:
 		return "!"
 	case BANGEQUAL:
@@ -91,10 +110,18 @@ func (t TokenType) String() string {
 		return "ASSIGN"
 	case STRING:
 		return "STRING"
+	case INTTYPE:
+		return "INTTYPE"
+	case FLOATTYPE:
+		return "FLOATTYPE"
+	case BOOLTYPE:
+		return "BOOLTYPE"
+	case STRINGTYPE:
+		return "STRINGTYPE"
 	case IDENTIFIER:
 		return "IDENTIFIER"
 	case NEWLINE:
-		return "%\n"
+		return "\\n"
 	case EOF:
 		return "EOF"
 	default:
@@ -129,12 +156,22 @@ func (t Token) String() string {
 		return "Token: LEFTGROUP; literal ->" + t.literal
 	case RIGHTGROUP:
 		return "Token: RIGHTGROUP; literal ->" + t.literal
+	case LEFTBRACE:
+		return "Token: LEFTBRACE; literal ->" + t.literal
+	case RIGHTBRACE:
+		return "Token: RIGHTBRACE; literal ->" + t.literal
 	case INT:
 		return "Token: INT; literal ->" + t.literal
 	case FLOAT:
 		return "Token: FLOAT; literal ->" + t.literal
 	case PRINT:
 		return "Token: PRINT; literal ->" + t.literal
+	case IF:
+		return "Token: IF; literal ->" + t.literal
+	case ELSE:
+		return "Token: ELSE; literal ->" + t.literal
+	case WHILE:
+		return "Token: WHILE; literal ->" + t.literal
 	case BANG:
 		return "Token: BANG; literal ->" + t.literal
 	case BANGEQUAL:
@@ -161,6 +198,14 @@ func (t Token) String() string {
 		return "Token: ASSIGN; literal ->" + t.literal
 	case STRING:
 		return "Token: STRING; literal ->" + t.literal
+	case INTTYPE:
+		return "Token: INTTYPE; literal ->" + t.literal
+	case FLOATTYPE:
+		return "Token: FLOATTYPE; literal ->" + t.literal
+	case BOOLTYPE:
+		return "Token: BOOLTYPE; literal ->" + t.literal
+	case STRINGTYPE:
+		return "Token: STRINGTYPE; literal ->" + t.literal
 	case IDENTIFIER:
 		return "Token: IDENTIFIER; literal ->" + t.literal
 	case NEWLINE:
@@ -188,10 +233,17 @@ var reserved map[string]TokenType
 func NewTokenizer(inputString string) Tokenizer {
 	reserved = make(map[string]TokenType)
 	reserved["print"] = PRINT
+	reserved["if"] = IF
+	reserved["else"] = ELSE
+	reserved["while"] = WHILE
 	reserved["or"] = OR
 	reserved["and"] = AND
 	reserved["true"] = TRUE
 	reserved["false"] = FALSE
+	reserved["int"] = INTTYPE
+	reserved["float"] = FLOATTYPE
+	reserved["bool"] = BOOLTYPE
+	reserved["string"] = STRINGTYPE
 	return Tokenizer{inputString, []Token{}, 0, 0, '0', 0}
 }
 
@@ -228,6 +280,10 @@ func (t *Tokenizer) Tokenize() []Token {
 			t.AddToken(LEFTGROUP, "")
 		case ')':
 			t.AddToken(RIGHTGROUP, "")
+		case '{':
+			t.AddToken(LEFTBRACE, "")
+		case '}':
+			t.AddToken(RIGHTBRACE, "")
 		case '!':
 			if t.Match('=') {
 				t.AddToken(BANGEQUAL, "")

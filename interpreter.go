@@ -14,24 +14,19 @@ type Interpreter struct {
 /*NewInterpreter returns a new Interpreter object with a properly initialized environment */
 func NewInterpreter() Interpreter {
 	i := Interpreter{}
-	i.env = NewEnvironment()
+	i.env = NewEnvironment(nil)
 	return i
 }
 
 /*Interpret takes a list of parsed AST expressions and evaluates them */
-func (i *Interpreter) Interpret(exprs []Expr, repl bool) {
-	for _, expr := range exprs {
-		//TODO: Check return value to see if error object has been sent
-		val := i.Evaluate(expr)
-		if repl {
-			switch val.(type) {
-			case Nil:
-				continue
-			default:
-				fmt.Println(Stringify(val))
-			}
-		}
+func (i *Interpreter) Interpret(stmts []Stmt, repl bool) {
+	for _, stmt := range stmts {
+		i.Execute(stmt)
 	}
+}
+
+func (i *Interpreter) Execute(s Stmt) {
+	s.Accept(i)
 }
 
 /*Evaluate calls the accept method on the Expr, making sure it is passed to the correct method
@@ -40,10 +35,22 @@ func (i *Interpreter) Evaluate(e Expr) Object {
 	return e.Accept(i)
 }
 
+func (i *Interpreter) visitExprStmt(e ExprStmt) {
+	i.Evaluate(e.expr)
+}
+func (i *Interpreter) visitVarDeclaration(vd VarDeclaration) {
+	val := i.Evaluate(vd.initializer)
+	CheckVarType(vd.tokenType, val)
+	i.env.define(vd.identifier.literal, val)
+}
+func (i *Interpreter) visitErrorStmt(e ErrorStmt) {
+	fmt.Println(e.message)
+}
+
 /*visitAssign visits an assignment operation and then saves it to the environment variable */
 func (i *Interpreter) visitAssign(a Assign) Object {
-	result := i.Evaluate(a.initializer)
-	i.env.define(a.identifier.literal, result)
+	val := i.Evaluate(a.initializer)
+	i.env.assign(a.identifier.literal, val)
 	return NIL
 }
 
@@ -53,10 +60,47 @@ func (i *Interpreter) visitVariable(v Variable) Object {
 }
 
 /*visitPrint evaluates the expr contained within a print object and then prints that */
-func (i *Interpreter) visitPrint(p Print) Object {
+func (i *Interpreter) visitPrint(p Print) {
 	result := i.Evaluate(p.expr)
 	fmt.Println(Stringify(result))
-	return NIL
+}
+
+func (i *Interpreter) visitIf(ifStmt If) {
+	condition := i.Evaluate(ifStmt.condition)
+	if res, ok := condition.(Boolean); ok {
+		if res.Value {
+			i.Execute(ifStmt.ifTrue)
+		} else if ifStmt.ifFalse != nil {
+			i.Execute(ifStmt.ifFalse)
+		}
+	} else {
+		RuntimeError("Cannot use non boolean value in if conditional")
+	}
+}
+
+func (i *Interpreter) visitWhile(w While) {
+	condition := i.Evaluate(w.condition)
+	condBool, ok := condition.(Boolean)
+	if !ok {
+		RuntimeError("Cannot use non boolean value in while condition")
+	}
+	for condBool.Value {
+		i.Execute(w.body)
+		condition := i.Evaluate(w.condition)
+		condBool, ok = condition.(Boolean)
+		if !ok {
+			RuntimeError("Cannot use non boolean value in while condition")
+		}
+	}
+}
+
+func (i *Interpreter) visitBlock(b Block) {
+	prevEnv := i.env
+	i.env = NewEnvironment(&prevEnv)
+	defer func() { i.env = prevEnv }()
+	for _, stmt := range b.stmts {
+		i.Execute(stmt)
+	}
 }
 
 /*visitGrouping evaluates the internal expression and then returns that */
@@ -163,6 +207,8 @@ func EvaluateFloat(left Float, right Float, operator Token) Object {
 		return Boolean{left.Value > right.Value}
 	case GREATEREQUAL:
 		return Boolean{left.Value >= right.Value}
+	case LESS:
+		return Boolean{left.Value < right.Value}
 	case LESSEQUAL:
 		return Boolean{left.Value <= right.Value}
 	default:
@@ -206,6 +252,8 @@ func EvaluateInt(left Integer, right Integer, operator Token) Object {
 		return Boolean{left.Value > right.Value}
 	case GREATEREQUAL:
 		return Boolean{left.Value >= right.Value}
+	case LESS:
+		return Boolean{left.Value < right.Value}
 	case LESSEQUAL:
 		return Boolean{left.Value <= right.Value}
 	default:
@@ -268,4 +316,32 @@ func CheckBoolOperands(left Object, right Object) (Boolean, Boolean, bool) {
 	leftBool, lOK := left.(Boolean)
 	rightBool, rOK := right.(Boolean)
 	return leftBool, rightBool, lOK && rOK
+}
+
+func CheckVarType(varType Token, val Object) bool {
+	switch varType.Type {
+	case INTTYPE:
+		if _, ok := val.(Integer); !ok {
+			RuntimeError("TypeError -> cannot assign value to int type")
+		}
+		return true
+	case FLOATTYPE:
+		if _, ok := val.(Float); !ok {
+			RuntimeError("TypeError -> cannot assign value to float type")
+		}
+		return true
+	case BOOLTYPE:
+		if _, ok := val.(Boolean); !ok {
+			RuntimeError("TypeError -> cannot assign value to bool type")
+		}
+		return true
+	case STRINGTYPE:
+		if _, ok := val.(String); !ok {
+			RuntimeError("TypeError -> cannot assign value to string type")
+		}
+		return true
+	default:
+		RuntimeError("TypeError -> Unknown assignment type")
+	}
+	return false
 }
