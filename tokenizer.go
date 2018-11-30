@@ -277,6 +277,19 @@ func (t *Tokenizer) Tokenize() []Token {
 				for t.PeekNext() != '\n' && !t.AtEnd() {
 					t.Advance()
 				}
+			} else if t.Match('*') {
+				for (t.PeekNext() != '*' || t.PeekNextNext() != '/') && !t.AtEnd() {
+					if t.PeekNext() == '\n' {
+						//make sure to update the line count in a comment so that line reporting is accurate
+						t.lineNo++
+					}
+					t.Advance()
+				}
+				t.Advance()
+				t.Advance()
+				if t.AtEnd() {
+					ParseError(t.lineNo, "Unclosed multiline comment")
+				}
 			} else {
 				t.AddToken(DIV, "")
 			}
@@ -413,6 +426,13 @@ func (t *Tokenizer) Match(c byte) bool {
 func (t *Tokenizer) PeekNext() byte {
 	if t.cursorLoc < len(t.inputString) {
 		return t.inputString[t.cursorLoc]
+	}
+	return 0
+}
+
+func (t *Tokenizer) PeekNextNext() byte {
+	if t.cursorLoc+1 < len(t.inputString) {
+		return t.inputString[t.cursorLoc+1]
 	}
 	return 0
 }

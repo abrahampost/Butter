@@ -18,11 +18,14 @@ func NewParser(tokens []Token) Parser {
 
 /*Parse parses all of the Tokens into Expression objects and returns those */
 func (p *Parser) Parse() []Stmt {
+	//Eat the newlines at the very beginning of the file
+	p.IgnoreNewlines()
 	var statements []Stmt
 	for !p.AtEnd() {
 		//Eat newlines before statements
-		p.IgnoreNewlines()
 		statements = append(statements, p.Declaration())
+		//Eat new lines after statements
+		p.IgnoreNewlines()
 	}
 	return statements
 }
