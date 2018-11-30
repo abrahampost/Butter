@@ -191,6 +191,8 @@ func EvaluateFloat(left Float, right Float, operator Token) Object {
 		return Boolean{left.Value > right.Value}
 	case GREATEREQUAL:
 		return Boolean{left.Value >= right.Value}
+	case LESS:
+		return Boolean{left.Value < right.Value}
 	case LESSEQUAL:
 		return Boolean{left.Value <= right.Value}
 	default:
