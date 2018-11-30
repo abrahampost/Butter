@@ -27,6 +27,11 @@ type If struct {
 	ifFalse   Stmt
 }
 
+type While struct {
+	condition Expr
+	body      Stmt
+}
+
 type Block struct {
 	stmts []Stmt
 }
@@ -50,6 +55,10 @@ func (vd VarDeclaration) Accept(interpreter *Interpreter) {
 
 func (i If) Accept(interpreter *Interpreter) {
 	interpreter.visitIf(i)
+}
+
+func (w While) Accept(interpreter *Interpreter) {
+	interpreter.visitWhile(w)
 }
 
 func (b Block) Accept(interpreter *Interpreter) {

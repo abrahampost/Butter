@@ -37,6 +37,9 @@ func (p *Parser) Declaration() Stmt {
 	if p.Match(IF) {
 		return p.IfStmt()
 	}
+	if p.Match(WHILE) {
+		return p.WhileStmt()
+	}
 	return p.Statement()
 }
 
@@ -88,6 +91,12 @@ func (p *Parser) IfStmt() Stmt {
 		ifFalse = p.Declaration()
 	}
 	return If{condition, ifTrue, ifFalse}
+}
+
+func (p *Parser) WhileStmt() Stmt {
+	condition := p.Expression()
+	body := p.Declaration()
+	return While{condition, body}
 }
 
 /*Line Parses an expression, then eats any trailing whitespace */

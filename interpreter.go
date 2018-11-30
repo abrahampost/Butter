@@ -78,6 +78,22 @@ func (i *Interpreter) visitIf(ifStmt If) {
 	}
 }
 
+func (i *Interpreter) visitWhile(w While) {
+	condition := i.Evaluate(w.condition)
+	condBool, ok := condition.(Boolean)
+	if !ok {
+		RuntimeError("Cannot use non boolean value in while condition")
+	}
+	for condBool.Value {
+		i.Execute(w.body)
+		condition := i.Evaluate(w.condition)
+		condBool, ok = condition.(Boolean)
+		if !ok {
+			RuntimeError("Cannot use non boolean value in while condition")
+		}
+	}
+}
+
 func (i *Interpreter) visitBlock(b Block) {
 	prevEnv := i.env
 	i.env = NewEnvironment(&prevEnv)

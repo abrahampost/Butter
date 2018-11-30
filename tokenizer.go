@@ -25,6 +25,7 @@ const (
 	PRINT
 	IF
 	ELSE
+	WHILE
 	BANG
 	BANGEQUAL
 	EQUALEQUAL
@@ -79,6 +80,8 @@ func (t TokenType) String() string {
 		return "PRINT"
 	case IF:
 		return "IF"
+	case WHILE:
+		return "WHILE"
 	case ELSE:
 		return "ELSE"
 	case BANG:
@@ -167,6 +170,8 @@ func (t Token) String() string {
 		return "Token: IF; literal ->" + t.literal
 	case ELSE:
 		return "Token: ELSE; literal ->" + t.literal
+	case WHILE:
+		return "Token: WHILE; literal ->" + t.literal
 	case BANG:
 		return "Token: BANG; literal ->" + t.literal
 	case BANGEQUAL:
@@ -230,6 +235,7 @@ func NewTokenizer(inputString string) Tokenizer {
 	reserved["print"] = PRINT
 	reserved["if"] = IF
 	reserved["else"] = ELSE
+	reserved["while"] = WHILE
 	reserved["or"] = OR
 	reserved["and"] = AND
 	reserved["true"] = TRUE
