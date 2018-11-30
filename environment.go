@@ -19,6 +19,10 @@ func (e *Env) SetParent(parent *Env) {
 }
 
 func (e *Env) define(varName string, value Object) {
+	_, exists := e.values[varName]
+	if exists {
+		RuntimeError("Variable '" + varName + "' already initialized in this scope")
+	}
 	e.values[varName] = value
 }
 
