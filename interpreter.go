@@ -21,7 +21,7 @@ func NewInterpreter() Interpreter {
 
 /*Interpret takes a list of parsed AST expressions and evaluates them */
 func (i *Interpreter) Interpret(stmts []Stmt, repl bool) {
-	i.isRepl = true
+	i.isRepl = repl
 	for _, stmt := range stmts {
 		i.Execute(stmt)
 	}
