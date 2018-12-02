@@ -39,7 +39,7 @@ func (i *Interpreter) Evaluate(e Expr) Object {
 
 func (i *Interpreter) visitExprStmt(e ExprStmt) {
 	val := i.Evaluate(e.expr)
-	if i.isRepl {
+	if i.isRepl && val != NIL {
 		fmt.Println(Stringify(val))
 	}
 }
