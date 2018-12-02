@@ -50,10 +50,22 @@ func RunFile(s Settings) {
 func RunPrompt() {
 	fmt.Printf("Butterv%s (repl)\n", VERSION)
 	reader := bufio.NewReader(os.Stdin)
+	input := ""
 	for true {
-		fmt.Print("> ")
-		input, _ := reader.ReadString('\n')
-		Run(input, true)
+		if len(input) == 0 {
+			//if the input has been cleared since the last run
+			fmt.Print("> ")
+		} else {
+			//if we are in a block, match the indentation of above
+			fmt.Print("  ")
+		}
+		in, _ := reader.ReadString('\n')
+		input += in //concatenate the new input onto the previous input
+		if len(in)-2 == 0 || MatchingBraces(input) {
+			//if the newline is empty, or all the braces have been matched up run the input
+			Run(input, true)
+			input = "" //reset the input for the next run
+		}
 	}
 }
 
@@ -64,6 +76,31 @@ func Run(source string, repl bool) {
 	parser := NewParser(tokens)
 	stmts := parser.Parse()
 	interpreter.Interpret(stmts, repl)
+}
+
+func MatchingBraces(input string) bool {
+	left_brace := 0
+	right_brace := 0
+	inQuotes := false
+	for _, b := range input {
+		if b == '"' {
+			inQuotes = !inQuotes
+		}
+		if !inQuotes {
+			//if the brackets are in quotes, ignore them
+			if b == '{' {
+				left_brace++
+			}
+			if b == '}' {
+				right_brace++
+				if right_brace > left_brace {
+					//if a right brace has been seen without a left brace coming before it
+					ParseError(-1, "'}' found without matching '{'")
+				}
+			}
+		}
+	}
+	return left_brace == right_brace
 }
 
 /*CheckError checks to see if an error has been reported from a function */
