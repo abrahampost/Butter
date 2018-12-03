@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"reflect"
 )
 
 /*Env is an environment object where variables can be defined */
@@ -33,10 +32,8 @@ func (e *Env) define(varName string, value Object) {
 
 func (e *Env) assign(varName string, value Object) {
 	if found, ok := e.values[varName]; ok {
-		valType := reflect.TypeOf(value).Name()
-		envType := reflect.TypeOf(found).Name()
-		if valType != envType {
-			RuntimeError(fmt.Sprintf("Cannot assign %s to %s type", valType, envType))
+		if value.Type() != found.Type() {
+			RuntimeError(fmt.Sprintf("Cannot assign %s to %s type", string(value.Type()), string(found.Type())))
 		}
 		e.values[varName] = value
 	} else if e.parent != nil {

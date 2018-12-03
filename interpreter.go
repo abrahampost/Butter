@@ -120,17 +120,20 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 	rightObj := i.Evaluate(b.right)
 	isNum := CheckNumberOperands(leftObj, rightObj)
 	if isNum {
-		lFloat, lIsFloat := leftObj.(Float)
-		rFloat, rIsFloat := rightObj.(Float)
 		//if either is a float, figure out which is a float and then cast to floats
-		if lIsFloat || rIsFloat {
-			if !lIsFloat {
+		if leftObj.Type() == FLOATOBJ || rightObj.Type() == FLOATOBJ {
+			var lFloat, rFloat Float
+			if leftObj.Type() != FLOATOBJ {
 				leftInt := leftObj.(Integer)
 				lFloat = Float{float64(leftInt.Value)}
+			} else {
+				lFloat = leftObj.(Float)
 			}
-			if !rIsFloat {
+			if rightObj.Type() != FLOATOBJ {
 				rightInt := rightObj.(Integer)
 				rFloat = Float{float64(rightInt.Value)}
+			} else {
+				rFloat = rightObj.(Float)
 			}
 			return EvaluateFloat(lFloat, rFloat, b.operator)
 		} else {
@@ -140,9 +143,8 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 			return EvaluateInt(lInteger, rInteger, b.operator)
 		}
 	}
-	leftBool, rightBool, isBool := CheckBoolOperands(leftObj, rightObj)
-	if isBool {
-		return EvaluateBoolean(leftBool, rightBool, b.operator)
+	if leftObj.Type() == BOOLEANOBJ && rightObj.Type() == BOOLEANOBJ {
+		return EvaluateBoolean(leftObj.(Boolean), rightObj.(Boolean), b.operator)
 	}
 	if leftString, ok := leftObj.(String); ok {
 		switch b.operator.Type {
@@ -152,7 +154,7 @@ func (i *Interpreter) visitBinary(b Binary) Object {
 			RuntimeError("string does not support '" + b.operator.Type.String() + "' operator")
 		}
 	}
-	RuntimeError("Mismatched operands: '" + leftObj.Type() + "' and '" + rightObj.Type() + "'")
+	RuntimeError("Mismatched operands: '" + string(leftObj.Type()) + "' and '" + string(rightObj.Type()) + "'")
 	return NIL
 }
 
@@ -309,40 +311,31 @@ func Stringify(o Object) string {
 
 /*CheckNumberOperands returns a tuple with the values and a positive bool if the objects are both Integers */
 func CheckNumberOperands(left Object, right Object) bool {
-	_, lInt := left.(Integer)
-	_, rInt := right.(Integer)
-	_, lFloat := left.(Float)
-	_, rFloat := right.(Float)
-	return (lInt || lFloat) && (rInt || rFloat)
-}
-
-/*CheckBoolOperands returns a tuple with the values and a positive bool if the objects are both Booleans */
-func CheckBoolOperands(left Object, right Object) (Boolean, Boolean, bool) {
-	leftBool, lOK := left.(Boolean)
-	rightBool, rOK := right.(Boolean)
-	return leftBool, rightBool, lOK && rOK
+	leftNum := left.Type() == INTEGEROBJ || left.Type() == FLOATOBJ
+	rightNum := right.Type() == INTEGEROBJ || right.Type() == FLOATOBJ
+	return leftNum && rightNum
 }
 
 func CheckVarType(varType Token, val Object) bool {
 	switch varType.Type {
 	case INTTYPE:
-		if _, ok := val.(Integer); !ok {
-			RuntimeError("TypeError -> cannot assign value to int type")
+		if val.Type() != INTEGEROBJ {
+			RuntimeError("TypeError -> cannot assign " + string(val.Type()) + " to int type")
 		}
 		return true
 	case FLOATTYPE:
-		if _, ok := val.(Float); !ok {
-			RuntimeError("TypeError -> cannot assign value to float type")
+		if val.Type() != FLOATOBJ {
+			RuntimeError("TypeError -> cannot assign " + string(val.Type()) + " to float type")
 		}
 		return true
 	case BOOLTYPE:
-		if _, ok := val.(Boolean); !ok {
-			RuntimeError("TypeError -> cannot assign value to bool type")
+		if val.Type() != BOOLEANOBJ {
+			RuntimeError("TypeError -> cannot assign " + string(val.Type()) + " to bool type")
 		}
 		return true
 	case STRINGTYPE:
-		if _, ok := val.(String); !ok {
-			RuntimeError("TypeError -> cannot assign value to string type")
+		if val.Type() != STRINGOBJ {
+			RuntimeError("TypeError -> cannot assign " + string(val.Type()) + " to string type")
 		}
 		return true
 	default:
