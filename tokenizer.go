@@ -289,6 +289,7 @@ func (t *Tokenizer) Tokenize() []Token {
 				t.Advance()
 				if t.AtEnd() {
 					TokenError(t.lineNo, "Unclosed multiline comment")
+					break
 				}
 			} else {
 				t.AddToken(DIV, "")
@@ -338,6 +339,7 @@ func (t *Tokenizer) Tokenize() []Token {
 				t.Advance()
 				if t.AtEnd() {
 					TokenError(t.lineNo, "Unclosed string literal")
+					break
 				}
 			}
 			t.AddToken(STRING, t.inputString[t.begTok+1:t.cursorLoc-1])
