@@ -26,8 +26,9 @@ func (e *Env) define(varName string, value Object) {
 	_, exists := e.values[varName]
 	if exists {
 		RuntimeError("Variable '" + varName + "' already initialized in this scope")
+	} else {
+		e.values[varName] = value
 	}
-	e.values[varName] = value
 }
 
 func (e *Env) assign(varName string, value Object) {
@@ -50,6 +51,5 @@ func (e *Env) get(varName string) Object {
 		return e.parent.get(varName)
 	}
 
-	RuntimeError("Undefined variable: '" + varName + "'")
-	return NIL //unreachable code
+	return RuntimeError("Undefined variable: '" + varName + "'")
 }

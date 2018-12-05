@@ -115,11 +115,6 @@ func MatchingBraces(input string) bool {
 	return left_brace == right_brace
 }
 
-/*RuntimeError stops the execution of the program when it encounters invalid operations duringn the running of the program */
-func RuntimeError(message string) {
-	ReportError("RUNTIME_ERROR: " + message)
-}
-
 /*ReportError stops execution of the program with a panic-like error message */
 func ReportError(message string) {
 	fmt.Fprintf(os.Stderr, message+"\n")
