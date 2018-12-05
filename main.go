@@ -81,6 +81,10 @@ func RunPrompt() {
 func Run(source string, repl bool) {
 	tokenizer := NewTokenizer(source)
 	tokens := tokenizer.Tokenize()
+	if hadError {
+		return
+	}
+	PrintTokens(tokens)
 	parser := NewParser(tokens)
 	stmts := parser.Parse()
 
@@ -120,5 +124,5 @@ func RuntimeError(message string) {
 /*ReportError stops execution of the program with a panic-like error message */
 func ReportError(message string) {
 	fmt.Fprintf(os.Stderr, message+"\n")
-	hadError = false
+	hadError = true
 }
