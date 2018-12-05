@@ -84,7 +84,6 @@ func Run(source string, repl bool) {
 	if hadError {
 		return
 	}
-	PrintTokens(tokens)
 	parser := NewParser(tokens)
 	stmts := parser.Parse()
 

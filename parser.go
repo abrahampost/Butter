@@ -358,7 +358,7 @@ func (p *Parser) CheckEndline() bool {
 /*Synchronize returns the parser to the beginning of a statement, where it can hopefully continue parsing input */
 func (p *Parser) Synchronize() {
 	for !p.Match(NEWLINE) && !p.AtEnd() {
-
+		p.Advance()
 	}
 }
 
