@@ -50,7 +50,8 @@ func (i *Interpreter) visitExprStmt(e ExprStmt) {
 }
 func (i *Interpreter) visitVarDeclaration(vd VarDeclaration) {
 	val := i.Evaluate(vd.initializer)
-	if val.Type() != ERROROBJ && CheckVarType(vd.tokenType, val) {
+	if !IsButterError(val) && CheckVarType(vd.tokenType, val) {
+		fmt.Println(CheckVarType(vd.tokenType, val))
 		i.env.define(vd.identifier.literal, val)
 	}
 }
