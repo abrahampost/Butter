@@ -69,11 +69,7 @@ func RunPrompt() {
 		}
 		in, err := reader.ReadString('\n')
 		if err == io.EOF {
-			fmt.Printf("\n REPL detected EOF. exiting...")
-			os.Exit(1)
-		} else if err != nil {
-			fmt.Printf("\n Unable to read line. exiting...")
-			os.Exit(1)
+			os.Exit(0)
 		}
 		input += in //concatenate the new input onto the previous input
 		if len(in)-2 == 0 || MatchingBraces(input) {
