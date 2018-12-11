@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 )
@@ -66,7 +67,14 @@ func RunPrompt() {
 			//if we are in a block, match the indentation of above
 			fmt.Print("  ")
 		}
-		in, _ := reader.ReadString('\n')
+		in, err := reader.ReadString('\n')
+		if err == io.EOF {
+			fmt.Printf("\n REPL detected EOF. exiting...")
+			os.Exit(1)
+		} else if err != nil {
+			fmt.Printf("\n Unable to read line. exiting...")
+			os.Exit(1)
+		}
 		input += in //concatenate the new input onto the previous input
 		if len(in)-2 == 0 || MatchingBraces(input) {
 			//if the newline is empty, or all the braces have been matched up run the input
