@@ -35,6 +35,7 @@ func (e *Env) assign(varName string, value Object) {
 	if found, ok := e.values[varName]; ok {
 		if value.Type() != found.Type() {
 			RuntimeError(fmt.Sprintf("Cannot assign %s to %s type", string(value.Type()), string(found.Type())))
+			return
 		}
 		e.values[varName] = value
 	} else if e.parent != nil {
