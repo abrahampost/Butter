@@ -244,7 +244,7 @@ func NewTokenizer(inputString string) Tokenizer {
 	reserved["float"] = FLOATTYPE
 	reserved["bool"] = BOOLTYPE
 	reserved["string"] = STRINGTYPE
-	return Tokenizer{inputString, []Token{}, 0, 0, '0', 0}
+	return Tokenizer{inputString, []Token{}, 0, 0, '0', 1}
 }
 
 /*Tokenize takes in an entire program as a string argument and parses it into tokens
@@ -288,7 +288,8 @@ func (t *Tokenizer) Tokenize() []Token {
 				t.Advance()
 				t.Advance()
 				if t.AtEnd() {
-					ParseError(t.lineNo, "Unclosed multiline comment")
+					TokenError(t.lineNo, "Unclosed multiline comment")
+					break
 				}
 			} else {
 				t.AddToken(DIV, "")
@@ -313,7 +314,7 @@ func (t *Tokenizer) Tokenize() []Token {
 			if t.Match('=') {
 				t.AddToken(EQUALEQUAL, "")
 			} else {
-				ParseError(t.lineNo, "Expect '=' after '='")
+				TokenError(t.lineNo, "Expect '=' after '='")
 			}
 		case '>':
 			if t.Match('=') {
@@ -331,13 +332,14 @@ func (t *Tokenizer) Tokenize() []Token {
 			if t.Match('=') {
 				t.AddToken(ASSIGN, "")
 			} else {
-				ParseError(t.lineNo, "Expect '=' after ':'")
+				TokenError(t.lineNo, "Expect '=' after ':'")
 			}
 		case '"':
 			for !t.Match('"') {
 				t.Advance()
 				if t.AtEnd() {
-					ParseError(t.lineNo, "Unclosed string literal")
+					TokenError(t.lineNo, "Unclosed string literal")
+					break
 				}
 			}
 			t.AddToken(STRING, t.inputString[t.begTok+1:t.cursorLoc-1])
@@ -347,7 +349,7 @@ func (t *Tokenizer) Tokenize() []Token {
 			} else if IsAlpha(cursor) {
 				t.IdentifierOrReserved()
 			} else {
-				ParseError(t.lineNo+1, fmt.Sprintf("near -> '%c'", t.inputString[t.cursorLoc-1]))
+				TokenError(t.lineNo, fmt.Sprintf("near -> '%c'", t.inputString[t.cursorLoc-1]))
 			}
 		}
 	}
@@ -447,4 +449,8 @@ func (t *Tokenizer) AddToken(tokenType TokenType, literal string) {
 	token := Token{tokenType, literal, t.lineNo}
 	t.begTok = t.cursorLoc
 	t.tokens = append(t.tokens, token)
+}
+
+func TokenError(line int, message string) {
+	ReportError(fmt.Sprintf("TOKEN_ERROR [line %d]: %s", line, message))
 }

@@ -9,6 +9,7 @@ const (
 	BOOLEANOBJ ObjType = "bool"
 	STRINGOBJ  ObjType = "string"
 	NILOBJ     ObjType = "(nil)"
+	ERROROBJ   ObjType = "error"
 )
 
 /*Object defines a common object interface which all variable types will implement */
@@ -67,3 +68,10 @@ func (n Nil) Type() ObjType {
 
 /*NIL is a singleton which all nil objects will reference */
 var NIL Nil
+
+/*Error is a value that will be checked for in the parser to determine when to synchronize */
+type ButterError struct{}
+
+func (e ButterError) Type() ObjType {
+	return ERROROBJ
+}

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"strconv"
 )
 
+var hadParseError bool = false
+
 /*Parser struct contains helpful methods for recursive descvent parsing, as well as keeping track of the
-  token list, amnd token currently being processed */
+token list, amnd token currently being processed */
 type Parser struct {
 	tokens  []Token
 	current int
@@ -23,9 +26,15 @@ func (p *Parser) Parse() []Stmt {
 	var statements []Stmt
 	for !p.AtEnd() {
 		//Eat newlines before statements
-		statements = append(statements, p.Declaration())
-		//Eat new lines after statements
-		p.IgnoreNewlines()
+		decl := p.Declaration()
+		if hadParseError {
+			p.Synchronize()
+			hadParseError = false
+		} else {
+			statements = append(statements, decl)
+			//Eat new lines after statements
+			p.IgnoreNewlines()
+		}
 	}
 	return statements
 }
@@ -245,7 +254,9 @@ func (p *Parser) Literal() Expr {
 	if p.Match(INT) {
 		prev := p.Previous()
 		integer, err := strconv.Atoi(prev.literal)
-		CheckError(err)
+		if err != nil {
+			ParseError(p.Previous().line, "Unable to parse int")
+		}
 		return Literal{Integer{integer}}
 	}
 	if p.Match(FLOAT) {
@@ -342,4 +353,22 @@ func (p *Parser) CheckEndline() bool {
 	}
 	ParseError(p.Current().line, "Expected new line after statement")
 	return false
+}
+
+/*Synchronize returns the parser to the beginning of a statement, where it can hopefully continue parsing input */
+func (p *Parser) Synchronize() {
+	for !p.Match(NEWLINE) && !p.AtEnd() {
+		p.Advance()
+	}
+}
+
+/*ParseError Reports an error during the initial tokenization and parsing of the input */
+func ParseError(line int, message string) {
+	var lineMessage string
+	if line != -1 {
+		lineMessage = fmt.Sprintf(" [line %d]", line)
+	}
+	errorMessage := fmt.Sprintf("PARSE_ERROR%s: %s", lineMessage, message)
+	ReportError(errorMessage)
+	hadParseError = true
 }
