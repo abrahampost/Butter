@@ -7,8 +7,14 @@ Goal is to implement a toy programming language in Go
 * String literals, integers, floats, booleans
 * Boolean logic implemented
 * Print statements
-* Implicitly typed variables
- * can assign with `<var_name> := <expr>`
+* Assignment
+  * \<type> \<name> := \<value>
+ * functions
+  * ```  
+        fn <name>(<arg>(, <arg>)*): <ret type> => { 
+            stmt* 
+        }
+    ```
 
 
 Lots of features and improvements coming in the next few weeks.
