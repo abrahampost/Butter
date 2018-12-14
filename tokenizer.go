@@ -115,13 +115,13 @@ func (t TokenType) String() string {
 	case STRING:
 		return "STRING"
 	case INTTYPE:
-		return "INTTYPE"
+		return "int"
 	case FLOATTYPE:
-		return "FLOATTYPE"
+		return "float"
 	case BOOLTYPE:
-		return "BOOLTYPE"
+		return "bool"
 	case STRINGTYPE:
-		return "STRINGTYPE"
+		return "string"
 	case IDENTIFIER:
 		return "IDENTIFIER"
 	case FUNC:
