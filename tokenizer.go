@@ -44,6 +44,9 @@ const (
 	BOOLTYPE
 	STRINGTYPE
 	IDENTIFIER
+	FUNC
+	COMMA
+	ARROW
 	NEWLINE
 	EOF
 )
@@ -51,27 +54,27 @@ const (
 func (t TokenType) String() string {
 	switch t {
 	case PLUS:
-		return "+"
+		return "PLUS"
 	case MINUS:
-		return "-"
+		return "MINUS"
 	case MULT:
-		return "*"
+		return "MULT"
 	case EXP:
-		return "**"
+		return "EXP"
 	case DIV:
-		return "/"
+		return "DIV"
 	case MOD:
-		return "%%"
+		return "MOD"
 	case EQUAL:
-		return "="
+		return "EQUAL"
 	case LEFTGROUP:
-		return "("
+		return "LEFTGROUP"
 	case RIGHTGROUP:
-		return ")"
+		return "RIGHTGROUP"
 	case LEFTBRACE:
-		return "{"
+		return "LEFTBRACE"
 	case RIGHTBRACE:
-		return "}"
+		return "RIGHTBRACE"
 	case INT:
 		return "INT"
 	case FLOAT:
@@ -85,19 +88,19 @@ func (t TokenType) String() string {
 	case ELSE:
 		return "ELSE"
 	case BANG:
-		return "!"
+		return "BANG"
 	case BANGEQUAL:
-		return "!="
+		return "BANGEQUAL"
 	case EQUALEQUAL:
-		return "=="
+		return "EQUALEQUAL"
 	case LESS:
-		return "<"
+		return "LESS"
 	case LESSEQUAL:
-		return "<="
+		return "LESSEQUAL"
 	case GREATER:
-		return ">"
+		return "GREATER"
 	case GREATEREQUAL:
-		return ">="
+		return "GREATEREQUAL"
 	case OR:
 		return "OR"
 	case AND:
@@ -120,8 +123,14 @@ func (t TokenType) String() string {
 		return "STRINGTYPE"
 	case IDENTIFIER:
 		return "IDENTIFIER"
+	case FUNC:
+		return "FUNCTION"
+	case COMMA:
+		return "COMMA"
+	case ARROW:
+		return "ARROW"
 	case NEWLINE:
-		return "\\n"
+		return "NEWLINE"
 	case EOF:
 		return "EOF"
 	default:
@@ -134,87 +143,6 @@ type Token struct {
 	Type    TokenType
 	literal string
 	line    int
-}
-
-func (t Token) String() string {
-	switch t.Type {
-	case PLUS:
-		return "Token: PLUS; literal ->" + t.literal
-	case MINUS:
-		return "Token: MINUS; literal ->" + t.literal
-	case MULT:
-		return "Token: MULT; literal ->" + t.literal
-	case EXP:
-		return "Token: EXP; literal ->" + t.literal
-	case DIV:
-		return "Token: DIV; literal ->" + t.literal
-	case MOD:
-		return "Token: MOD; literal ->" + t.literal
-	case EQUAL:
-		return "Token: EQUAL; literal ->" + t.literal
-	case LEFTGROUP:
-		return "Token: LEFTGROUP; literal ->" + t.literal
-	case RIGHTGROUP:
-		return "Token: RIGHTGROUP; literal ->" + t.literal
-	case LEFTBRACE:
-		return "Token: LEFTBRACE; literal ->" + t.literal
-	case RIGHTBRACE:
-		return "Token: RIGHTBRACE; literal ->" + t.literal
-	case INT:
-		return "Token: INT; literal ->" + t.literal
-	case FLOAT:
-		return "Token: FLOAT; literal ->" + t.literal
-	case PRINT:
-		return "Token: PRINT; literal ->" + t.literal
-	case IF:
-		return "Token: IF; literal ->" + t.literal
-	case ELSE:
-		return "Token: ELSE; literal ->" + t.literal
-	case WHILE:
-		return "Token: WHILE; literal ->" + t.literal
-	case BANG:
-		return "Token: BANG; literal ->" + t.literal
-	case BANGEQUAL:
-		return "Token: BANGEQUAL; literal ->" + t.literal
-	case EQUALEQUAL:
-		return "Token: EQUALEQUAL; literal ->" + t.literal
-	case LESS:
-		return "Token: LESS; literal ->" + t.literal
-	case LESSEQUAL:
-		return "Token: LESSEQUAL; literal ->" + t.literal
-	case GREATER:
-		return "Token: GREATER; literal ->" + t.literal
-	case GREATEREQUAL:
-		return "Token: GREATEREQUAL; literal ->" + t.literal
-	case OR:
-		return "Token: OR; literal ->" + t.literal
-	case AND:
-		return "Token: AND; literal ->" + t.literal
-	case TRUE:
-		return "Token: TRUE; literal ->" + t.literal
-	case FALSE:
-		return "Token: FALSE; literal ->" + t.literal
-	case ASSIGN:
-		return "Token: ASSIGN; literal ->" + t.literal
-	case STRING:
-		return "Token: STRING; literal ->" + t.literal
-	case INTTYPE:
-		return "Token: INTTYPE; literal ->" + t.literal
-	case FLOATTYPE:
-		return "Token: FLOATTYPE; literal ->" + t.literal
-	case BOOLTYPE:
-		return "Token: BOOLTYPE; literal ->" + t.literal
-	case STRINGTYPE:
-		return "Token: STRINGTYPE; literal ->" + t.literal
-	case IDENTIFIER:
-		return "Token: IDENTIFIER; literal ->" + t.literal
-	case NEWLINE:
-		return "Token: NEWLINE; literal ->" + t.literal
-	case EOF:
-		return "Token: EOF; literal ->" + t.literal
-	default:
-		return "Unknown token"
-	}
 }
 
 /*Tokenizer contains a list of tokens and information about the line currently being parsed */
@@ -244,6 +172,7 @@ func NewTokenizer(inputString string) Tokenizer {
 	reserved["float"] = FLOATTYPE
 	reserved["bool"] = BOOLTYPE
 	reserved["string"] = STRINGTYPE
+	reserved["fn"] = FUNC
 	return Tokenizer{inputString, []Token{}, 0, 0, '0', 1}
 }
 
@@ -262,6 +191,8 @@ func (t *Tokenizer) Tokenize() []Token {
 		case '\n':
 			t.lineNo++
 			t.AddToken(NEWLINE, "")
+		case ',':
+			t.AddToken(COMMA, "")
 		case '+':
 			t.AddToken(PLUS, "")
 		case '-':
@@ -313,8 +244,10 @@ func (t *Tokenizer) Tokenize() []Token {
 		case '=':
 			if t.Match('=') {
 				t.AddToken(EQUALEQUAL, "")
+			} else if t.Match('>') {
+				t.AddToken(ARROW, "")
 			} else {
-				TokenError(t.lineNo, "Expect '=' after '='")
+				TokenError(t.lineNo, "Unknown symbol '='. Did you mean '==' or '=>'?")
 			}
 		case '>':
 			if t.Match('=') {
