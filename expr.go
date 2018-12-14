@@ -41,6 +41,11 @@ type Grouping struct {
 	expr Expr
 }
 
+type Call struct {
+	callee    Expr
+	arguments []Expr
+}
+
 /*Accept passes assign to the visitAssign method on the interpreter */
 func (a Assign) Accept(interpreter *Interpreter) Object {
 	return interpreter.visitAssign(a)
@@ -69,4 +74,8 @@ func (u Unary) Accept(interpreter *Interpreter) Object {
 /*Accept visits the visitGrouping method on the interpreter */
 func (g Grouping) Accept(interpreter *Interpreter) Object {
 	return interpreter.visitGrouping(g)
+}
+
+func (c Call) Accept(interpreter *Interpreter) Object {
+	return interpreter.visitCall(c)
 }

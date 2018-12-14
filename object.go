@@ -4,12 +4,13 @@ package main
 type ObjType string
 
 const (
-	INTEGEROBJ ObjType = "int"
-	FLOATOBJ   ObjType = "float"
-	BOOLEANOBJ ObjType = "bool"
-	STRINGOBJ  ObjType = "string"
-	NILOBJ     ObjType = "(nil)"
-	ERROROBJ   ObjType = "error"
+	INTEGEROBJ  ObjType = "int"
+	FLOATOBJ    ObjType = "float"
+	BOOLEANOBJ  ObjType = "bool"
+	STRINGOBJ   ObjType = "string"
+	NILOBJ      ObjType = "(nil)"
+	ERROROBJ    ObjType = "error"
+	FUNCTIONOBJ ObjType = "function"
 )
 
 /*Object defines a common object interface which all variable types will implement */

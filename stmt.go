@@ -35,9 +35,18 @@ type While struct {
 type Block struct {
 	stmts []Stmt
 }
+type FuncStmt struct {
+	name   Token
+	params []TypedArg
+	body   []Stmt
+}
 
 type ErrorStmt struct {
 	message string
+}
+
+func (f FuncStmt) Accept(interpeter *Interpreter) {
+	interpreter.visitFuncStmt(f)
 }
 
 /*Accept finds the visitPrint method on the interpreter */

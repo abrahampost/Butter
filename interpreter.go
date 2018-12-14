@@ -7,6 +7,7 @@ import (
 )
 
 var hadRuntimeError bool = false
+var returnedValue Object
 
 /*The Interpreter struct which merely holds a bunch of methods */
 type Interpreter struct {
@@ -48,6 +49,12 @@ func (i *Interpreter) visitExprStmt(e ExprStmt) {
 		fmt.Println(Stringify(val))
 	}
 }
+
+func (i *Interpreter) visitFuncStmt(f FuncStmt) {
+	function := ButterFunction{f, i.env}
+	i.env.define(f.name.literal, function)
+}
+
 func (i *Interpreter) visitVarDeclaration(vd VarDeclaration) {
 	val := i.Evaluate(vd.initializer)
 	if !IsButterError(val) && CheckVarType(vd.tokenType, val) {
@@ -96,6 +103,19 @@ func (i *Interpreter) visitIf(ifStmt If) {
 	}
 }
 
+func (i *Interpreter) visitCall(c Call) Object {
+	callee := i.Evaluate(c.callee)
+	evaluatedArgs := make([]Object, 0)
+	for _, arg := range c.arguments {
+		evaluatedArgs = append(evaluatedArgs, i.Evaluate(arg))
+	}
+	if function, ok := callee.(ButterFunction); ok {
+		return function.Call(interpreter, evaluatedArgs)
+	} else {
+		return RuntimeError("Can only call functions")
+	}
+}
+
 func (i *Interpreter) visitWhile(w While) {
 	condition := i.Evaluate(w.condition)
 
@@ -115,12 +135,16 @@ func (i *Interpreter) visitWhile(w While) {
 }
 
 func (i *Interpreter) visitBlock(b Block) {
+	i.executeBlock(b.stmts, NewEnvironment(&i.env))
+}
+
+func (i *Interpreter) executeBlock(stmts []Stmt, env Env) {
 	prevEnv := i.env
-	i.env = NewEnvironment(&prevEnv)
+	i.env = env
 	defer func() { i.env = prevEnv }()
-	for _, stmt := range b.stmts {
+	for _, stmt := range stmts {
 		i.Execute(stmt)
-		if hadRuntimeError {
+		if hadRuntimeError || returnedValue != nil {
 			break
 		}
 	}

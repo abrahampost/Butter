@@ -40,6 +40,9 @@ func (p *Parser) Parse() []Stmt {
 }
 
 func (p *Parser) Declaration() Stmt {
+	if p.Match(FUNC) {
+		return p.FuncDeclaration()
+	}
 	if p.Match(INTTYPE, FLOATTYPE, STRINGTYPE, BOOLTYPE) {
 		return p.VarDeclaration()
 	}
@@ -82,6 +85,42 @@ func (p *Parser) VarDeclaration() Stmt {
 	}
 	//as of now ErrorStmt will never be used, but will eventually catch error
 	return ErrorStmt{"Expect variable declaration"}
+}
+
+func (p *Parser) FuncDeclaration() Stmt {
+	p.Consume(IDENTIFIER, "Expect name after fn")
+	identifier := p.Previous()
+	p.Consume(ASSIGN, "Expect ':=' after function assignment")
+	p.Consume(LEFTGROUP, "Expect '(' after function declaration")
+	params := make([]TypedArg, 0)
+	if !p.Check(RIGHTGROUP) {
+		for {
+			var Type Token
+			var name Token
+			if p.Match(INTTYPE, FLOATTYPE, BOOLTYPE, STRINGTYPE) {
+				Type = p.Previous()
+			} else {
+				ParseError(p.Previous().line, "Expect type in parameter definition")
+			}
+
+			if p.Match(IDENTIFIER) {
+				name = p.Previous()
+			} else {
+				ParseError(p.Previous().line, "Expect param name after type in paramater definition")
+			}
+
+			params = append(params, TypedArg{Type, name})
+			if !p.Match(COMMA) {
+				//effectively a do while loop to parse the first argument which isn't preceeded by a comma
+				break
+			}
+		}
+	}
+	p.Consume(RIGHTGROUP, "Expect ')' after parameter list")
+	p.Consume(ARROW, "Expect '=>' after parameter list")
+	p.Consume(LEFTBRACE, "Expect '{' after '=>'")
+	body := p.Block()
+	return FuncStmt{identifier, params, body}
 }
 
 func (p *Parser) Block() []Stmt {
@@ -246,7 +285,35 @@ func (p *Parser) Unary() Expr {
 		return Unary{right, operator}
 	}
 
-	return p.Literal()
+	return p.Call()
+}
+
+func (p *Parser) Call() Expr {
+	expr := p.Literal()
+
+	for true {
+		if p.Match(LEFTGROUP) {
+			expr = p.FinishCall(expr)
+		} else {
+			break
+		}
+	}
+
+	return expr
+}
+
+func (p *Parser) FinishCall(expr Expr) Expr {
+	args := make([]Expr, 0)
+	if !p.Check(RIGHTGROUP) {
+		for true {
+			args = append(args, p.Expression())
+			if !p.Match(COMMA) {
+				break
+			}
+		}
+	}
+	p.Consume(RIGHTGROUP, "Expect ')' after function call")
+	return Call{expr, args}
 }
 
 /*Literal returns an object of the type of the token passes, with a value parsed from the Token literal */
