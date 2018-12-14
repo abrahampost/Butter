@@ -36,9 +36,10 @@ type Block struct {
 	stmts []Stmt
 }
 type FuncStmt struct {
-	name   Token
-	params []TypedArg
-	body   []Stmt
+	name       Token
+	params     []TypedArg
+	body       []Stmt
+	returnType Token
 }
 
 type ReturnStmt struct {

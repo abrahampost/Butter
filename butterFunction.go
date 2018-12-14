@@ -36,5 +36,13 @@ func (b ButterFunction) Call(i Interpreter, args []Object) Object {
 	interpreter.executeBlock(b.function.body, env)
 	temp := returnedValue
 	returnedValue = nil //reset this value for the next function to use
+	if b.function.returnType.Type == VOID {
+		if temp != nil {
+			return RuntimeError("Void function '" + b.function.name.literal + "'returns non-nil value")
+		}
+		return NIL
+	} else if string(temp.Type()) != b.function.returnType.Type.String() {
+		return RuntimeError(fmt.Sprintf("function returned type '%s', expected '%s'", string(temp.Type()), b.function.returnType.Type))
+	}
 	return temp
 }

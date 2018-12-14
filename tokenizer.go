@@ -49,6 +49,8 @@ const (
 	ARROW
 	NEWLINE
 	EOF
+	VOID
+	COLON
 	RETURN
 )
 
@@ -134,6 +136,10 @@ func (t TokenType) String() string {
 		return "NEWLINE"
 	case EOF:
 		return "EOF"
+	case VOID:
+		return "VOID"
+	case COLON:
+		return "COLON"
 	case RETURN:
 		return "RETURN"
 	default:
@@ -177,6 +183,7 @@ func NewTokenizer(inputString string) Tokenizer {
 	reserved["string"] = STRINGTYPE
 	reserved["fn"] = FUNC
 	reserved["return"] = RETURN
+	reserved["void"] = VOID
 	return Tokenizer{inputString, []Token{}, 0, 0, '0', 1}
 }
 
@@ -269,7 +276,7 @@ func (t *Tokenizer) Tokenize() []Token {
 			if t.Match('=') {
 				t.AddToken(ASSIGN, "")
 			} else {
-				TokenError(t.lineNo, "Expect '=' after ':'")
+				t.AddToken(COLON, "")
 			}
 		case '"':
 			for !t.Match('"') {

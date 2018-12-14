@@ -122,10 +122,18 @@ func (p *Parser) FuncDeclaration() Stmt {
 		}
 	}
 	p.Consume(RIGHTGROUP, "Expect ')' after parameter list")
+	p.Consume(COLON, "Expect ':<Return Type>' after function definition")
+	var returnType Token
+	if p.Match(INTTYPE, FLOATTYPE, BOOLTYPE, STRINGTYPE, VOID) {
+		returnType = p.Previous()
+	} else {
+		RuntimeError("Expect return type after function definition")
+		return ErrorStmt{"Expect return type after function definition"}
+	}
 	p.Consume(ARROW, "Expect '=>' after parameter list")
 	p.Consume(LEFTBRACE, "Expect '{' after '=>'")
 	body := p.Block()
-	return FuncStmt{identifier, params, body}
+	return FuncStmt{identifier, params, body, returnType}
 }
 
 func (p *Parser) Block() []Stmt {
