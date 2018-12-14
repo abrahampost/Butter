@@ -41,6 +41,10 @@ type FuncStmt struct {
 	body   []Stmt
 }
 
+type ReturnStmt struct {
+	expr Expr
+}
+
 type ErrorStmt struct {
 	message string
 }
@@ -72,6 +76,10 @@ func (w While) Accept(interpreter *Interpreter) {
 
 func (b Block) Accept(interpreter *Interpreter) {
 	interpreter.visitBlock(b)
+}
+
+func (r ReturnStmt) Accept(interpreter *Interpreter) {
+	interpreter.visitReturn(r)
 }
 
 func (e ErrorStmt) Accept(interpreter *Interpreter) {

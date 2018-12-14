@@ -49,6 +49,7 @@ const (
 	ARROW
 	NEWLINE
 	EOF
+	RETURN
 )
 
 func (t TokenType) String() string {
@@ -133,6 +134,8 @@ func (t TokenType) String() string {
 		return "NEWLINE"
 	case EOF:
 		return "EOF"
+	case RETURN:
+		return "RETURN"
 	default:
 		return "(nil)"
 	}
@@ -173,6 +176,7 @@ func NewTokenizer(inputString string) Tokenizer {
 	reserved["bool"] = BOOLTYPE
 	reserved["string"] = STRINGTYPE
 	reserved["fn"] = FUNC
+	reserved["return"] = RETURN
 	return Tokenizer{inputString, []Token{}, 0, 0, '0', 1}
 }
 

@@ -138,6 +138,11 @@ func (i *Interpreter) visitBlock(b Block) {
 	i.executeBlock(b.stmts, NewEnvironment(&i.env))
 }
 
+func (i *Interpreter) visitReturn(r ReturnStmt) {
+	val := i.Evaluate(r.expr)
+	returnedValue = val
+}
+
 func (i *Interpreter) executeBlock(stmts []Stmt, env Env) {
 	prevEnv := i.env
 	i.env = env

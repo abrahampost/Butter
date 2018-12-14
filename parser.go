@@ -21,19 +21,16 @@ func NewParser(tokens []Token) Parser {
 
 /*Parse parses all of the Tokens into Expression objects and returns those */
 func (p *Parser) Parse() []Stmt {
-	//Eat the newlines at the very beginning of the file
-	p.IgnoreNewlines()
 	var statements []Stmt
 	for !p.AtEnd() {
 		//Eat newlines before statements
+		p.IgnoreNewlines()
 		decl := p.Declaration()
 		if hadParseError {
 			p.Synchronize()
 			hadParseError = false
 		} else {
 			statements = append(statements, decl)
-			//Eat new lines after statements
-			p.IgnoreNewlines()
 		}
 	}
 	return statements
@@ -54,6 +51,9 @@ func (p *Parser) Declaration() Stmt {
 	}
 	if p.Match(WHILE) {
 		return p.WhileStmt()
+	}
+	if p.Match(RETURN) {
+		return p.ReturnStmt()
 	}
 	return p.Statement()
 }
@@ -87,10 +87,15 @@ func (p *Parser) VarDeclaration() Stmt {
 	return ErrorStmt{"Expect variable declaration"}
 }
 
+func (p *Parser) ReturnStmt() Stmt {
+	val := p.Expression()
+	p.Consume(NEWLINE, "Expect new line after return")
+	return ReturnStmt{val}
+}
+
 func (p *Parser) FuncDeclaration() Stmt {
 	p.Consume(IDENTIFIER, "Expect name after fn")
 	identifier := p.Previous()
-	p.Consume(ASSIGN, "Expect ':=' after function assignment")
 	p.Consume(LEFTGROUP, "Expect '(' after function declaration")
 	params := make([]TypedArg, 0)
 	if !p.Check(RIGHTGROUP) {
