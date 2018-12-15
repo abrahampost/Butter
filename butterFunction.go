@@ -11,6 +11,11 @@ type TypedArg struct {
 	name Token
 }
 
+type Callable interface {
+	Call(i Interpreter, args []Object) Object
+	Arity() int
+}
+
 type ButterFunction struct {
 	function FuncStmt
 	env      *Env
@@ -20,10 +25,11 @@ func (b ButterFunction) Type() ObjType {
 	return FUNCTIONOBJ
 }
 
+func (b ButterFunction) Arity() int {
+	return len(b.function.params)
+}
+
 func (b ButterFunction) Call(i Interpreter, args []Object) Object {
-	if len(args) != len(b.function.params) {
-		return RuntimeError(fmt.Sprintf("incorrect number of arguments to function '%s'. received %d, expected %d", b.function.name.literal, len(args), len(b.function.params)))
-	}
 	env := NewEnvironment(b.env)
 	for index, arg := range args {
 		name := b.function.params[index].name.literal

@@ -9,7 +9,8 @@ type TokenType int
 
 /*Enum for the potential token values */
 const (
-	PLUS TokenType = iota
+	DEFAULT TokenType = iota
+	PLUS
 	MINUS
 	MULT
 	EXP

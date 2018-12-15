@@ -11,6 +11,7 @@ const (
 	NILOBJ      ObjType = "(nil)"
 	ERROROBJ    ObjType = "error"
 	FUNCTIONOBJ ObjType = "function"
+	NATIVEFNOBJ ObjType = "<native fn>"
 )
 
 /*Object defines a common object interface which all variable types will implement */

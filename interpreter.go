@@ -18,7 +18,10 @@ type Interpreter struct {
 /*NewInterpreter returns a new Interpreter object with a properly initialized environment */
 func NewInterpreter() Interpreter {
 	i := Interpreter{}
-	i.env = NewEnvironment(nil)
+	globals := NewEnvironment(nil)
+	var clock Clock
+	globals.define("clock", clock)
+	i.env = NewEnvironment(globals)
 	return i
 }
 
@@ -109,7 +112,14 @@ func (i *Interpreter) visitCall(c Call) Object {
 	for _, arg := range c.arguments {
 		evaluatedArgs = append(evaluatedArgs, i.Evaluate(arg))
 	}
-	if function, ok := callee.(ButterFunction); ok {
+	if function, ok := callee.(Callable); ok {
+		if function.Arity() != len(evaluatedArgs) {
+			return RuntimeError(fmt.Sprintf("incorrect number of arguments. received %d, expected %d", len(evaluatedArgs), function.Arity()))
+		}
+		if testFunc, ok := callee.(ButterFunction); ok && testFunc.env == nil {
+			//only a NilFunction will not have its own closure
+			return RuntimeError("cannot run non-initialized lambda function")
+		}
 		return function.Call(interpreter, evaluatedArgs)
 	} else {
 		return RuntimeError("Can only call functions")
@@ -349,6 +359,9 @@ func Stringify(o Object) string {
 		return t.Value
 	case ButterFunction:
 		return "<fn " + t.function.name.literal + ">"
+	case Callable:
+		//something is only callable if it is a native function or ButterFunction, and a ButterFunction would already be caught
+		return "<native fn>"
 	default:
 		return "(nil)"
 	}

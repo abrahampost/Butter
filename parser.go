@@ -79,8 +79,7 @@ func (p *Parser) VarDeclaration() Stmt {
 			case STRINGTYPE:
 				return VarDeclaration{varType, identifier, Literal{String{""}}}
 			case LAMBDA:
-				ParseError(p.Previous().line, "Unititialized lambda's not supported")
-				return ErrorStmt{"unitialized lambdas not supported"}
+				return VarDeclaration{varType, identifier, Literal{NilFunction}}
 			}
 		}
 	} else {
