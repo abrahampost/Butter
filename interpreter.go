@@ -347,6 +347,8 @@ func Stringify(o Object) string {
 		return "FALSE"
 	case String:
 		return t.Value
+	case ButterFunction:
+		return "<fn " + t.function.name.literal + ">"
 	default:
 		return "(nil)"
 	}
