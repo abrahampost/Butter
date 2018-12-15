@@ -139,8 +139,10 @@ func (p *Parser) FuncDeclaration() Stmt {
 func (p *Parser) Block() []Stmt {
 	p.Consume(NEWLINE, "Expect newline after block")
 	var stmts []Stmt
+	p.IgnoreNewlines()
 	for !p.Check(RIGHTBRACE) && !p.AtEnd() {
 		stmts = append(stmts, p.Declaration())
+		p.IgnoreNewlines()
 	}
 	p.Consume(RIGHTBRACE, "Expect '}' after block.")
 	return stmts
