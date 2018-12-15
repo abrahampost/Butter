@@ -11,8 +11,8 @@ type Env struct {
 }
 
 /*NewEnvironment creates a new environment and initializes the array */
-func NewEnvironment(parent *Env) Env {
-	return Env{
+func NewEnvironment(parent *Env) *Env {
+	return &Env{
 		parent: parent,
 		values: make(map[string]Object),
 	}

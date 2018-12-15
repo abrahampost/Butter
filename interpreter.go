@@ -11,7 +11,7 @@ var returnedValue Object
 
 /*The Interpreter struct which merely holds a bunch of methods */
 type Interpreter struct {
-	env    Env
+	env    *Env
 	isRepl bool
 }
 
@@ -135,7 +135,7 @@ func (i *Interpreter) visitWhile(w While) {
 }
 
 func (i *Interpreter) visitBlock(b Block) {
-	i.executeBlock(b.stmts, NewEnvironment(&i.env))
+	i.executeBlock(b.stmts, NewEnvironment(i.env))
 }
 
 func (i *Interpreter) visitReturn(r ReturnStmt) {
@@ -143,7 +143,7 @@ func (i *Interpreter) visitReturn(r ReturnStmt) {
 	returnedValue = val
 }
 
-func (i *Interpreter) executeBlock(stmts []Stmt, env Env) {
+func (i *Interpreter) executeBlock(stmts []Stmt, env *Env) {
 	prevEnv := i.env
 	i.env = env
 	defer func() { i.env = prevEnv }()

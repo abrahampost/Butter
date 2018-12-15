@@ -13,7 +13,7 @@ type TypedArg struct {
 
 type ButterFunction struct {
 	function FuncStmt
-	env      Env
+	env      *Env
 }
 
 func (b ButterFunction) Type() ObjType {
@@ -24,7 +24,7 @@ func (b ButterFunction) Call(i Interpreter, args []Object) Object {
 	if len(args) != len(b.function.params) {
 		return RuntimeError(fmt.Sprintf("incorrect number of arguments to function '%s'. received %d, expected %d", b.function.name.literal, len(args), len(b.function.params)))
 	}
-	env := NewEnvironment(&b.env)
+	env := NewEnvironment(b.env)
 	for index, arg := range args {
 		name := b.function.params[index].name.literal
 		paramType := b.function.params[index].Type.Type.String()
