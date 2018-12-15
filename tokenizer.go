@@ -52,6 +52,7 @@ const (
 	VOID
 	COLON
 	RETURN
+	LAMBDA
 )
 
 func (t TokenType) String() string {
@@ -142,6 +143,8 @@ func (t TokenType) String() string {
 		return "COLON"
 	case RETURN:
 		return "RETURN"
+	case LAMBDA:
+		return "LAMBDA"
 	default:
 		return "(nil)"
 	}
@@ -184,6 +187,7 @@ func NewTokenizer(inputString string) Tokenizer {
 	reserved["fn"] = FUNC
 	reserved["return"] = RETURN
 	reserved["void"] = VOID
+	reserved["lambda"] = LAMBDA
 	return Tokenizer{inputString, []Token{}, 0, 0, '0', 1}
 }
 

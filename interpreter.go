@@ -387,6 +387,12 @@ func CheckVarType(varType Token, val Object) bool {
 			return false
 		}
 		return true
+	case LAMBDA:
+		if val.Type() != FUNCTIONOBJ {
+			RuntimeError("TypeError -> cannot assign " + string(val.Type()) + " to string type")
+			return false
+		}
+		return true
 	default:
 		RuntimeError("TypeError -> Unknown assignment type")
 	}

@@ -40,7 +40,7 @@ func (p *Parser) Declaration() Stmt {
 	if p.Match(FUNC) {
 		return p.FuncDeclaration()
 	}
-	if p.Match(INTTYPE, FLOATTYPE, STRINGTYPE, BOOLTYPE) {
+	if p.Match(INTTYPE, FLOATTYPE, STRINGTYPE, BOOLTYPE, LAMBDA) {
 		return p.VarDeclaration()
 	}
 	if p.Match(LEFTBRACE) {
@@ -78,6 +78,9 @@ func (p *Parser) VarDeclaration() Stmt {
 				return VarDeclaration{varType, identifier, Literal{Boolean{false}}}
 			case STRINGTYPE:
 				return VarDeclaration{varType, identifier, Literal{String{""}}}
+			case LAMBDA:
+				ParseError(p.Previous().line, "Unititialized lambda's not supported")
+				return ErrorStmt{"unitialized lambdas not supported"}
 			}
 		}
 	} else {
@@ -102,7 +105,7 @@ func (p *Parser) FuncDeclaration() Stmt {
 		for {
 			var Type Token
 			var name Token
-			if p.Match(INTTYPE, FLOATTYPE, BOOLTYPE, STRINGTYPE) {
+			if p.Match(INTTYPE, FLOATTYPE, BOOLTYPE, STRINGTYPE, LAMBDA) {
 				Type = p.Previous()
 			} else {
 				ParseError(p.Previous().line, "Expect type in parameter definition")
@@ -124,7 +127,7 @@ func (p *Parser) FuncDeclaration() Stmt {
 	p.Consume(RIGHTGROUP, "Expect ')' after parameter list")
 	p.Consume(COLON, "Expect ':<Return Type>' after function definition")
 	var returnType Token
-	if p.Match(INTTYPE, FLOATTYPE, BOOLTYPE, STRINGTYPE, VOID) {
+	if p.Match(INTTYPE, FLOATTYPE, BOOLTYPE, STRINGTYPE, LAMBDA, VOID) {
 		returnType = p.Previous()
 	} else {
 		RuntimeError("Expect return type after function definition")
