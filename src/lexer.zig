@@ -26,6 +26,8 @@ pub const TokenType = enum {
     kw_return,
     kw_for,
     kw_in,
+    kw_import,
+    kw_export,
 
     // Operators and punctuation
     plus,
@@ -73,6 +75,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "return", .kw_return },
     .{ "for", .kw_for },
     .{ "in", .kw_in },
+    .{ "import", .kw_import },
+    .{ "export", .kw_export },
 });
 
 pub const Token = struct {
@@ -357,6 +361,10 @@ test "a lone '.' is a lexer error" {
 
 test "'for' and 'in' are recognized as keywords" {
     try expectTokenTypes("for in forin", &.{ .kw_for, .kw_in, .identifier, .eof });
+}
+
+test "'import' and 'export' are recognized as keywords" {
+    try expectTokenTypes("import export importer", &.{ .kw_import, .kw_export, .identifier, .eof });
 }
 
 test "identifiers may contain digits but not start with one" {

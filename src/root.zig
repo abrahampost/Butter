@@ -10,6 +10,7 @@ pub const value = @import("value.zig");
 pub const chunk = @import("chunk.zig");
 pub const vm = @import("vm.zig");
 pub const compiler = @import("compiler.zig");
+pub const module = @import("module.zig");
 
 test {
     std.testing.refAllDecls(@This());

@@ -26,6 +26,7 @@ pub const SemanticError = error{
     ArrayLengthMismatch,
     InvalidArrayInitializer,
     UnexpectedArrayLiteral,
+    FunctionNotVisible,
 };
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
@@ -48,14 +49,38 @@ const Local = struct {
 };
 
 /// A function's compile-time signature, registered up front (before any
-/// function body is compiled — see `compileProgram`) so that calls resolve
+/// function body is compiled — see `compileModules`) so that calls resolve
 /// regardless of declaration order. `index` is the position its compiled
 /// `chunk_mod.Function` will occupy in the final `Program.functions`
 /// slice, which is also the operand CALL instructions use to name it.
+///
+/// `module`/`exported` exist purely for cross-file visibility (see
+/// `functionVisible`, GRAMMAR.bnf design note h) — the VM itself never
+/// sees either; CALL's operand is still just a flat index into one
+/// program-wide function table, same as before files could import each
+/// other (ISA.bnf section 6/8).
 const FunctionInfo = struct {
     name: []const u8,
     arity: u32,
     index: u32,
+    module: usize,
+    exported: bool,
+};
+
+/// One compilation unit passed to `compileModules`: a parsed file plus
+/// which other units (by index into the same slice) it's allowed to call
+/// `export`ed functions from — i.e. the modules it directly imports. There
+/// is no automatic re-export: importing B, which itself imports C, does
+/// not make C's exports visible here (GRAMMAR.bnf design note h).
+///
+/// `compileProgram` below treats a plain single-file `ast.Program` as one
+/// `ModuleUnit` with no imports, which is why every function in it stays
+/// visible to every other — exactly as it always has been, since a lone
+/// module's own functions are always visible to itself regardless of
+/// `exported` (see `functionVisible`).
+pub const ModuleUnit = struct {
+    program: ast.Program,
+    imports: []const usize = &.{},
 };
 
 /// Compiles one `ast.Program` into one `chunk_mod.Program`. Not reusable
@@ -75,6 +100,16 @@ pub const Compiler = struct {
     /// True while compiling a function body — the only context in which
     /// `return` is legal (see `SemanticError.ReturnOutsideFunction`).
     in_function: bool = false,
+    /// Which `ModuleUnit` (by index, into the slice passed to
+    /// `compileModules`) is currently being compiled — a call to one of
+    /// its own functions is always visible regardless of `exported`
+    /// (`functionVisible`'s same-module check).
+    current_module: usize = 0,
+    /// The modules `current_module` directly imports — a call to one of
+    /// *their* functions is only visible if that function is `exported`
+    /// (`functionVisible`). Borrowed from the `ModuleUnit` currently being
+    /// compiled; never owned by the compiler.
+    visible_imports: []const usize = &.{},
     diagnostic: ?Diagnostic = null,
 
     pub fn init(allocator: std.mem.Allocator) Compiler {
@@ -90,39 +125,66 @@ pub const Compiler = struct {
         self.functions.deinit(self.allocator);
     }
 
-    /// Three passes over `program`, in order:
-    ///
-    ///   1. Register every function's name/arity up front, so that calls
-    ///      — including a function calling itself, or two functions
-    ///      calling each other — resolve no matter which order the
-    ///      functions or their callers appear in the source.
-    ///   2. Compile top-level statements (everything except function
-    ///      declarations) into the main chunk, exactly as before functions
-    ///      existed.
-    ///   3. Compile each function's body into its own chunk.
+    /// Compiles a single, self-contained `ast.Program` with no imports —
+    /// the entry point every pre-import-feature test still uses. Wraps it
+    /// as one `ModuleUnit` with an empty import list, which (per
+    /// `functionVisible`) makes every function in it visible to every
+    /// other regardless of `exported`, exactly as before cross-file
+    /// `import` existed.
     pub fn compileProgram(self: *Compiler, program: ast.Program) CompileError!chunk_mod.Program {
-        for (program) |*stmt| {
-            if (stmt.* != .function_decl) continue;
-            const f = stmt.function_decl;
-            if (self.findFunction(f.name) != null) {
-                return self.fail(SemanticError.DuplicateFunction, f.name, "function already declared");
+        const units = [_]ModuleUnit{.{ .program = program }};
+        return self.compileModules(0, &units);
+    }
+
+    /// Three passes over `modules`, in order:
+    ///
+    ///   1. Register every function's name/arity/owning-module up front
+    ///      (across ALL modules, not just the entry one), so that calls —
+    ///      including a function calling itself, two functions calling
+    ///      each other, or a call across files — resolve no matter which
+    ///      order the functions, their callers, or the modules themselves
+    ///      are compiled in.
+    ///   2. Compile the entry module's top-level statements (everything
+    ///      except function/import declarations) into the main chunk,
+    ///      exactly as before functions or imports existed.
+    ///   3. Compile every module's functions into their own chunks.
+    ///
+    /// `modules` must list each module exactly once — deduplicating a
+    /// diamond-shaped import graph (the same file reached via more than
+    /// one import path) down to one entry is the module loader's job
+    /// (module.zig), not this function's; that's what makes a shared
+    /// dependency's functions get compiled exactly once here rather than
+    /// once per importer.
+    pub fn compileModules(self: *Compiler, entry: usize, modules: []const ModuleUnit) CompileError!chunk_mod.Program {
+        for (modules, 0..) |m, mi| {
+            for (m.program) |*stmt| {
+                if (stmt.* != .function_decl) continue;
+                const f = stmt.function_decl;
+                if (self.findFunction(f.name) != null) {
+                    return self.fail(SemanticError.DuplicateFunction, f.name, "function already declared");
+                }
+                try self.functions.append(self.allocator, .{
+                    .name = f.name,
+                    .arity = @intCast(f.params.len),
+                    .index = @intCast(self.functions.items.len),
+                    .module = mi,
+                    .exported = f.exported,
+                });
             }
-            try self.functions.append(self.allocator, .{
-                .name = f.name,
-                .arity = @intCast(f.params.len),
-                .index = @intCast(self.functions.items.len),
-            });
         }
 
+        self.current_module = entry;
+        self.visible_imports = modules[entry].imports;
+
         // `main_chunk` and `compiled` are only handed to the caller (who
-        // then owns them) once `compileProgram` returns successfully; a
+        // then owns them) once `compileModules` returns successfully; a
         // failure partway through pass 3 must free them here instead; each
         // `errdefer` below is scoped so it only fires for errors at or
         // after the point the resource it guards actually exists.
         var main_chunk: Chunk = blk: {
             errdefer self.chunk.deinit(self.allocator);
-            for (program) |*stmt| {
-                if (stmt.* == .function_decl) continue;
+            for (modules[entry].program) |*stmt| {
+                if (stmt.* == .function_decl or stmt.* == .import_stmt) continue;
                 try self.compileStmt(stmt);
             }
             _ = try self.chunk.emit(self.allocator, .halt);
@@ -138,15 +200,19 @@ pub const Compiler = struct {
             compiled.deinit(self.allocator);
         }
 
-        for (program) |*stmt| {
-            if (stmt.* != .function_decl) continue;
-            const f = stmt.function_decl;
-            const body_chunk = try self.compileFunctionBody(f);
-            try compiled.append(self.allocator, .{
-                .name = f.name,
-                .arity = @intCast(f.params.len),
-                .chunk = body_chunk,
-            });
+        for (modules, 0..) |m, mi| {
+            self.current_module = mi;
+            self.visible_imports = m.imports;
+            for (m.program) |*stmt| {
+                if (stmt.* != .function_decl) continue;
+                const f = stmt.function_decl;
+                const body_chunk = try self.compileFunctionBody(f);
+                try compiled.append(self.allocator, .{
+                    .name = f.name,
+                    .arity = @intCast(f.params.len),
+                    .chunk = body_chunk,
+                });
+            }
         }
 
         return .{ .main = main_chunk, .functions = try compiled.toOwnedSlice(self.allocator) };
@@ -212,8 +278,9 @@ pub const Compiler = struct {
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .ret);
             },
-            .function_decl => unreachable, // top-level only; compileProgram never calls compileStmt on this
+            .function_decl => unreachable, // top-level only; compileModules never calls compileStmt on this
             .for_stmt => |f| try self.compileFor(f),
+            .import_stmt => unreachable, // top-level only; compileModules never calls compileStmt on this
         }
     }
 
@@ -381,15 +448,31 @@ pub const Compiler = struct {
         }
     }
 
-    /// Calls resolve against the function table built in `compileProgram`'s
+    /// Calls resolve against the function table built in `compileModules`'s
     /// first pass, not `self.locals` — a completely separate namespace
     /// from variables, which is why `x()` and `x` (a local named x) never
     /// collide.
     fn compileCall(self: *Compiler, c: ast.Expr.Call) CompileError!void {
         const info = self.findFunction(c.name) orelse return self.fail(SemanticError.UndefinedFunction, c.name, "undefined function");
+        if (!self.functionVisible(info)) return self.fail(SemanticError.FunctionNotVisible, c.name, "function exists but isn't exported by a module this file imports");
         if (c.args.len != info.arity) return self.fail(SemanticError.ArityMismatch, c.name, "wrong number of arguments");
         for (c.args) |arg| try self.compileExpr(arg);
         _ = try self.chunk.emitWithOperand(self.allocator, .call, info.index);
+    }
+
+    /// A function is callable from wherever `self.current_module` is right
+    /// now if it belongs to that same module (regardless of `exported` —
+    /// a module's own private helpers are always usable by itself), or if
+    /// it's `exported` by one of that module's *direct* imports. There is
+    /// no automatic re-export: an import's own imports are not
+    /// transitively visible here (GRAMMAR.bnf design note h).
+    fn functionVisible(self: *const Compiler, info: FunctionInfo) bool {
+        if (info.module == self.current_module) return true;
+        if (!info.exported) return false;
+        for (self.visible_imports) |m| {
+            if (m == info.module) return true;
+        }
+        return false;
     }
 
     fn compileLiteral(self: *Compiler, lit: ast.Literal) CompileError!void {
@@ -524,6 +607,21 @@ fn runProgram(allocator: std.mem.Allocator, source: []const u8, buf: []u8) ![]co
     var writer = std.Io.Writer.fixed(buf);
     try vm.run(&compiled, &writer);
     return writer.buffered();
+}
+
+/// Lexes and parses `source` in isolation, for building up the
+/// `ModuleUnit` lists the `compileModules` tests below hand-assemble
+/// directly — these tests exercise cross-module visibility without going
+/// through the real file-based module loader (module.zig has its own
+/// tests for that).
+fn parseSource(allocator: std.mem.Allocator, source: []const u8) !struct { parser: parser_mod.Parser, program: ast.Program } {
+    var lex = lexer_mod.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    const program = try parser.parseProgram();
+    return .{ .parser = parser, .program = program };
 }
 
 test "compiles and runs a variable declaration and print" {
@@ -984,4 +1082,126 @@ test "a recursive function's local array is isolated per call frame" {
     , &buf);
     // n=2: pair=[2,4]=6 + n=1: pair=[1,2]=3 + n=0: pair=[0,0]=0  => 9
     try std.testing.expectEqualStrings("9\n", output);
+}
+
+test "compileModules: a module may call an exported function from a directly imported module" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+
+    var lib = try parseSource(allocator, "export func double(int n) -> int { return n * 2 }\n");
+    defer lib.parser.deinit();
+    var main = try parseSource(allocator, "print double(21)\n");
+    defer main.parser.deinit();
+
+    const units = [_]ModuleUnit{
+        .{ .program = main.program, .imports = &.{1} },
+        .{ .program = lib.program },
+    };
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(0, &units);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init();
+    var writer = std.Io.Writer.fixed(&buf);
+    try vm.run(&compiled, &writer);
+    try std.testing.expectEqualStrings("42\n", writer.buffered());
+}
+
+test "compileModules: calling a non-exported function from an imported module is a compile error" {
+    const allocator = std.testing.allocator;
+    var lib = try parseSource(allocator, "func helper() -> int { return 1 }\n");
+    defer lib.parser.deinit();
+    var main = try parseSource(allocator, "print helper()\n");
+    defer main.parser.deinit();
+
+    const units = [_]ModuleUnit{
+        .{ .program = main.program, .imports = &.{1} },
+        .{ .program = lib.program },
+    };
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.FunctionNotVisible, compiler.compileModules(0, &units));
+}
+
+test "compileModules: no automatic re-export — a transitive import's exports aren't visible" {
+    const allocator = std.testing.allocator;
+    var c_mod = try parseSource(allocator, "export func base() -> int { return 1 }\n");
+    defer c_mod.parser.deinit();
+    var b_mod = try parseSource(allocator, "export func mid() -> int { return base() }\n");
+    defer b_mod.parser.deinit();
+    var a_mod = try parseSource(allocator, "print base()\n");
+    defer a_mod.parser.deinit();
+
+    // a imports b, b imports c; a does NOT import c directly, so a can't
+    // call c's `base` even though b can (and even though base IS exported).
+    const units = [_]ModuleUnit{
+        .{ .program = a_mod.program, .imports = &.{1} },
+        .{ .program = b_mod.program, .imports = &.{2} },
+        .{ .program = c_mod.program },
+    };
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.FunctionNotVisible, compiler.compileModules(0, &units));
+}
+
+test "compileModules: a duplicate function name across two different modules is a compile error" {
+    const allocator = std.testing.allocator;
+    var a_mod = try parseSource(allocator, "func f() -> int { return 1 }\n");
+    defer a_mod.parser.deinit();
+    var b_mod = try parseSource(allocator, "func f() -> int { return 2 }\n");
+    defer b_mod.parser.deinit();
+
+    const units = [_]ModuleUnit{
+        .{ .program = a_mod.program },
+        .{ .program = b_mod.program },
+    };
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.DuplicateFunction, compiler.compileModules(0, &units));
+}
+
+test "compileModules: two modules importing the same module both see one compiled copy of it" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+
+    var d_mod = try parseSource(allocator, "export func ten() -> int { return 10 }\n");
+    defer d_mod.parser.deinit();
+    var b_mod = try parseSource(allocator, "export func fromB() -> int { return ten() }\n");
+    defer b_mod.parser.deinit();
+    var c_mod = try parseSource(allocator, "export func fromC() -> int { return ten() }\n");
+    defer c_mod.parser.deinit();
+    var main = try parseSource(allocator, "print fromB() + fromC()\n");
+    defer main.parser.deinit();
+
+    // main(0) imports b(1) and c(2); b and c both import d(3) — in the
+    // real pipeline the module loader (module.zig) is what guarantees d
+    // appears only once here despite being reachable via two import
+    // paths; compileModules just trusts that its input is already deduped.
+    const units = [_]ModuleUnit{
+        .{ .program = main.program, .imports = &.{ 1, 2 } },
+        .{ .program = b_mod.program, .imports = &.{3} },
+        .{ .program = c_mod.program, .imports = &.{3} },
+        .{ .program = d_mod.program },
+    };
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(0, &units);
+    defer compiled.deinit(allocator);
+
+    // Exactly one compiled Function per declared function across the whole
+    // graph — `ten` is not duplicated despite being reachable via two
+    // different import paths, which is the dedup guarantee this feature
+    // is for.
+    try std.testing.expectEqual(@as(usize, 3), compiled.functions.len);
+
+    var vm = vm_mod.Vm.init();
+    var writer = std.Io.Writer.fixed(&buf);
+    try vm.run(&compiled, &writer);
+    try std.testing.expectEqualStrings("20\n", writer.buffered());
 }

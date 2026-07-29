@@ -103,6 +103,7 @@ pub const Stmt = union(enum) {
     function_decl: FunctionDecl,
     return_stmt: *Expr,
     for_stmt: For,
+    import_stmt: Import,
 
     pub const VarDecl = struct {
         type: ValueType,
@@ -134,6 +135,10 @@ pub const Stmt = union(enum) {
         params: []Param,
         return_type: ValueType,
         body: []Stmt,
+        /// Whether this function is callable from a file that imports this
+        /// one (see GRAMMAR.bnf design note h). Irrelevant for calls from
+        /// within the same file, which are always allowed regardless.
+        exported: bool = false,
     };
 
     /// `for var_name in start..end body` — always ascending, always step 1,
@@ -145,6 +150,15 @@ pub const Stmt = union(enum) {
         start: *Expr,
         end: *Expr,
         body: *Stmt,
+    };
+
+    /// `import "path/to/file.butter"` — only ever produced at the top level
+    /// (see parser.zig's `topLevelDeclaration`), matching `function_decl`.
+    /// `path` is exactly the string literal's contents, unresolved — the
+    /// module loader (module.zig) is what turns it into an actual file to
+    /// read, relative to the importing file's own directory.
+    pub const Import = struct {
+        path: []const u8,
     };
 };
 
@@ -296,7 +310,8 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
         },
         .expr_stmt => |e| try printExpr(writer, e),
         .function_decl => |f| {
-            try writer.print("(func {s} ({s})\n", .{ f.name, valueTypeName(f.return_type) });
+            const prefix = if (f.exported) "export " else "";
+            try writer.print("({s}func {s} ({s})\n", .{ prefix, f.name, valueTypeName(f.return_type) });
             for (f.body) |*s| {
                 try printStmt(writer, s, depth + 1);
                 try writer.writeAll("\n");
@@ -318,6 +333,7 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
             try printStmt(writer, f.body, depth + 1);
             try writer.writeAll(")");
         },
+        .import_stmt => |i| try writer.print("(import \"{s}\")", .{i.path}),
     }
 }
 

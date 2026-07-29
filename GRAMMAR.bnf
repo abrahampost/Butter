@@ -39,7 +39,7 @@ EOF          ::= (* end of input *)
    scanned identifier text matches exactly: *)
 KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'true' | 'false' | 'int' | 'float' | 'bool' | 'string'
-               | 'func' | 'return' | 'for' | 'in'
+               | 'func' | 'return' | 'for' | 'in' | 'import' | 'export'
 
 (* Operators and punctuation *)
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
@@ -63,11 +63,14 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <program>          ::= { NEWLINE } { <top-level-decl> { NEWLINE } }
 
-(* <function-decl> is only reachable from here, never from <declaration> —
-   that's the entire mechanism keeping functions non-nestable: a function
+(* <function-decl> and <import-decl> are only reachable from here, never
+   from <declaration> — that's the entire mechanism keeping functions
+   non-nestable and imports out of block/if/while bodies: a function
    body's own statements only ever recurse through <declaration>, which
-   has no path back to <function-decl>. See design note 3b. *)
-<top-level-decl>    ::= <function-decl> | <declaration>
+   has no path back to either. See design notes 3b and 3h. *)
+<top-level-decl>    ::= <import-decl>
+                      | [ 'export' ] <function-decl>
+                      | <declaration>
 
 <declaration>       ::= <var-declaration>
                       | <block>
@@ -76,10 +79,17 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <for-stmt>
                       | <statement>
 
+(* 'export' is only ever legal directly before 'func' — 'export int x' is
+   a parse error, not a quietly-ignored no-op (design note 3h). *)
 <function-decl>     ::= 'func' IDENTIFIER '(' [ <param-list> ] ')'
                          '->' <type> <block>
 
 <param-list>        ::= <type> IDENTIFIER { ',' <type> IDENTIFIER }
+
+(* `path` is an arbitrary STRING, resolved relative to the *importing*
+   file's own directory (design note 3h) — never relative to the entry
+   program, and never a language-level module name/namespace. *)
+<import-decl>       ::= 'import' STRING <end>
 
 (* The optional '[' INT ']' is what makes this an array declaration
    instead of a plain scalar one — see design note 3e. INT here must be a
@@ -254,4 +264,57 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
       how it desugars. A foreach-style "for element in array" is a
       plausible future extension but isn't attempted here; write
       `for i in 0..n { ... arr[i] ... }` instead.
+   -------------------------------------------------------------------- *)
+
+(* --- import/export (language-growth addition, not a "fix") --------------
+
+   h) FUNCTIONS ONLY, AND ONLY AT THE TOP LEVEL OF AN ENTRY PROGRAM'S OWN
+      GRAPH. `import "path.butter"` pulls in another file's `export`ed
+      functions; only a function-decl can be prefixed with 'export' — a
+      top-level var-declaration can't be exported or imported. This
+      sidesteps a much harder question this language doesn't attempt to
+      answer: what would it even mean to "run" an imported file's own
+      top-level statements (print, while, a var-decl's initializer), and
+      in what order relative to the program that imported it? Rather than
+      inventing module-initialization-order semantics, an imported file is
+      simply not allowed to contain anything at its top level other than
+      more `import`s and function declarations (whether exported or not);
+      a bare statement or var-declaration there is a load error, not a
+      silently-skipped no-op. Only the entry program (the file/stdin
+      program actually passed to the CLI) may have "real" top-level code.
+
+   NO AUTOMATIC RE-EXPORT — VISIBILITY IS DIRECT-IMPORT-ONLY. If A imports
+      B, and B imports C, A cannot call one of C's `export`ed functions
+      just because B can — A would need to `import "c.butter"` itself.
+      Every function everywhere is still compiled exactly once into the
+      program regardless of visibility (ISA.bnf section 8); what
+      `export`/`import` gate is only which *names* a given file is allowed
+      to reference by call, not whether the callee exists.
+
+   A PATH IS RESOLVED RELATIVE TO THE FILE CONTAINING THE 'import', NOT
+      THE ENTRY PROGRAM. `import "../lib/util.butter"` inside some
+      subdirectory's file resolves from that file's own directory, exactly
+      like a typical filesystem-based module system (and unlike a
+      resolved-from-one-fixed-root scheme). The entry program's own
+      directory is used as this base only for its own `import` lines; for
+      `--stdin`, which has no file/directory of its own, the current
+      working directory is used instead.
+
+   FUNCTION NAMES ARE UNIQUE ACROSS THE WHOLE COMPILED PROGRAM, NOT JUST
+      WITHIN ONE FILE. Two different files may not both declare a function
+      named `helper`, even if neither exports it and neither ever imports
+      the other. This is a deliberate simplification, not a fundamental
+      limit of the design: call resolution has always been a single flat
+      name-indexed table (ISA.bnf section 6), and rather than inventing
+      per-file namespacing/mangling to let same-named private helpers
+      coexist, a same-named clash anywhere in the whole loaded graph is
+      simply a compile error (the same DuplicateFunction error a single
+      file's own two `func f()`s already were).
+
+   A SHARED DEPENDENCY IS COMPILED EXACTLY ONCE, NOT ONCE PER IMPORTER. If
+      two different files both `import "util.butter"` (directly, or via
+      a longer diamond-shaped chain), `util.butter` is read, parsed, and
+      compiled exactly one time — see ISA.bnf section 8 for the mechanism
+      (a canonical-path cache in the module loader) that guarantees this
+      rather than it being a best-effort optimization.
    ========================================================================== *)

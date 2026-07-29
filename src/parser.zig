@@ -110,15 +110,34 @@ pub const Parser = struct {
         return stmts.toOwnedSlice(self.allocator());
     }
 
-    /// <top-level-decl> ::= <function-decl> | <declaration>
+    /// <top-level-decl> ::= <import-decl> | [ 'export' ] <function-decl> | <declaration>
     ///
-    /// Function declarations are only recognized here, never from inside
-    /// `declaration` — that's what keeps them out of block/if/while bodies
-    /// without needing a separate check anywhere else (Butter has no
-    /// nested functions or closures).
+    /// Function declarations (and now `import`/`export`) are only
+    /// recognized here, never from inside `declaration` — that's what keeps
+    /// them out of block/if/while bodies without needing a separate check
+    /// anywhere else (Butter has no nested functions or closures, and no
+    /// mechanism for importing partway through another declaration).
     fn topLevelDeclaration(self: *Parser) Error!ast.Stmt {
-        if (self.check(.kw_func)) return self.functionDeclaration();
+        if (self.check(.kw_import)) return self.importDeclaration();
+        if (self.match(.kw_export)) {
+            if (!self.check(.kw_func)) return self.fail("expected 'func' after 'export' — only functions can be exported");
+            return self.functionDeclaration(true);
+        }
+        if (self.check(.kw_func)) return self.functionDeclaration(false);
         return self.declaration();
+    }
+
+    /// <import-decl> ::= 'import' STRING <end>
+    ///
+    /// `path` is left exactly as written (quotes stripped, same as a string
+    /// literal in `primary`) — resolving it to an actual file is the
+    /// module loader's job (module.zig), not the parser's.
+    fn importDeclaration(self: *Parser) Error!ast.Stmt {
+        _ = self.advance(); // 'import'
+        const path_tok = try self.expect(.string, "expected a file path string after 'import'");
+        const path = path_tok.lexeme[1 .. path_tok.lexeme.len - 1];
+        try self.consumeEnd();
+        return ast.Stmt{ .import_stmt = .{ .path = path } };
     }
 
     // ---- <declaration> -------------------------------------------------
@@ -151,7 +170,11 @@ pub const Parser = struct {
     /// <function-decl> ::= 'func' IDENTIFIER '(' [ <param-list> ] ')'
     ///                     '->' <type> <block>
     /// <param-list>    ::= <type> IDENTIFIER { ',' <type> IDENTIFIER }
-    fn functionDeclaration(self: *Parser) Error!ast.Stmt {
+    ///
+    /// `exported` is whatever `topLevelDeclaration` determined from an
+    /// optional leading 'export' keyword, which this function itself never
+    /// looks at (the 'func' token must already be the current token).
+    fn functionDeclaration(self: *Parser, exported: bool) Error!ast.Stmt {
         _ = self.advance(); // 'func'
         const name_tok = try self.expect(.identifier, "expected a function name");
 
@@ -176,6 +199,7 @@ pub const Parser = struct {
             .params = try params.toOwnedSlice(self.allocator()),
             .return_type = return_type,
             .body = body_stmt.block,
+            .exported = exported,
         } };
     }
 
@@ -859,6 +883,59 @@ test "parses a for loop over a range" {
     try std.testing.expectEqual(@as(i64, 0), f.start.literal.int);
     try std.testing.expectEqual(@as(i64, 3), f.end.literal.int);
     try std.testing.expectEqual(@as(usize, 1), f.body.block.len);
+}
+
+test "parses an import declaration" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "import \"util.butter\"\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.program.len);
+    try std.testing.expectEqualStrings("util.butter", result.program[0].import_stmt.path);
+}
+
+test "a plain function declaration is not exported" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "func f() -> int { return 1 }\n");
+    defer result.parser.deinit();
+
+    try std.testing.expect(!result.program[0].function_decl.exported);
+}
+
+test "'export' before 'func' marks the function exported" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "export func f() -> int { return 1 }\n");
+    defer result.parser.deinit();
+
+    try std.testing.expect(result.program[0].function_decl.exported);
+}
+
+test "'export' before anything other than 'func' is a parse error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init("export int x\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
+}
+
+test "import is only recognized at the top level" {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init(
+        \\if true {
+        \\    import "nope.butter"
+        \\}
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
 }
 
 test "a for loop's range bounds may be arbitrary expressions" {

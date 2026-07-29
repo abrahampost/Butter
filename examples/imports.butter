@@ -1,0 +1,5 @@
+import "numeric.butter"
+import "stats.butter"
+
+print square(3)
+print sumOfSquares(3, 4)

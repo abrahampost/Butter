@@ -62,28 +62,32 @@ pub fn main(init: std.process.Init) !void {
         printUsageAndExit("error: failed to read '{s}': {s}", .{ file_path.?, @errorName(err) });
     };
 
-    var lexer = butter.lexer.Lexer.init(source);
-    const tokens = lexer.tokenizeAll(gpa) catch |err| switch (err) {
+    // Relative `import`s resolve against the entry file's own directory
+    // (or the current directory, for --stdin, which has no file of its
+    // own to be relative to) — see GRAMMAR.bnf design note h.
+    var entry_key: []const u8 = "<stdin>";
+    var entry_dir: []const u8 = ".";
+    if (!use_stdin) {
+        entry_key = try std.fs.path.resolve(gpa, &.{file_path.?});
+        entry_dir = std.fs.path.dirname(file_path.?) orelse ".";
+    }
+
+    var loader = butter.module.Loader.init(gpa, init.io, std.Io.Dir.cwd());
+    defer loader.deinit();
+
+    const entry_module = loader.loadEntry(source, entry_key, entry_dir) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            const diag = lexer.diagnostic.?;
-            std.debug.print("lex error at {d}:{d}: {s}\n", .{ diag.line, diag.column, diag.message });
+            const diag = loader.diagnostic.?;
+            std.debug.print("import error in '{s}': {s}\n", .{ diag.path, diag.message });
             std.process.exit(1);
         },
     };
 
-    var parser = butter.parser.Parser.init(gpa, tokens);
-    const program = parser.parseProgram() catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => {
-            const diag = parser.diagnostic.?;
-            std.debug.print("parse error at {d}:{d}: {s}\n", .{ diag.line, diag.column, diag.message });
-            std.process.exit(1);
-        },
-    };
+    const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry_module);
 
     var compiler = butter.compiler.Compiler.init(gpa);
-    var chunk = compiler.compileProgram(program) catch |err| switch (err) {
+    var chunk = compiler.compileModules(modules.entry_index, modules.units) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             const diag = compiler.diagnostic.?;

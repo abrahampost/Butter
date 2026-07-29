@@ -434,4 +434,70 @@
    its name — never a legal IDENTIFIER lexeme (GRAMMAR.bnf section 1), so
    it can never collide with, shadow, or be resolved by any name a user
    actually writes.
+
+
+(* --------------------------------------------------------------------------
+   8. IMPORT/EXPORT (compile-time only - no new opcodes, no runtime
+      concept of a "module")
+   -------------------------------------------------------------------------- *)
+
+   import/export (GRAMMAR.bnf design note 3h) add precisely one new
+   compile-time concern - which names a given file may call - and touch
+   nothing at runtime: the VM has no notion of files or modules, CALL's
+   operand is still a single flat index into one program-wide function
+   table, exactly as it was before a program could span more than one
+   file (section 6). Everything described here lives in src/module.zig and
+   the multi-module entry point compiler.Compiler.compileModules
+   (compileProgram is now a thin wrapper that hands compileModules a
+   single module with an empty import list, so a plain one-file program's
+   behavior - every function visible to every other, export irrelevant -
+   is unchanged).
+
+   THE MODULE LOADER RUNS BEFORE COMPILATION, NOT DURING IT. Given an
+   entry program, module.Loader recursively lexes and parses every file
+   it transitively imports, depth-first, BEFORE any compilation begins.
+   Each file is keyed by a lexically normalized path (resolved relative to
+   the *importing* file's own directory, GRAMMAR.bnf design note 3h) and
+   memoized in a hash map: the second time any import path resolves to a
+   key already in that map, the loader returns the already-parsed Module
+   immediately instead of re-reading/re-lexing/re-parsing the file. This
+   memoization is the entire mechanism behind "a shared dependency is
+   compiled exactly once" - by the time compileModules ever sees the
+   module list, a diamond-shaped import graph has already been collapsed
+   down to one entry per distinct file, appearing exactly once in
+   Loader.order. compileModules does not itself deduplicate anything; it
+   simply never gets asked to compile the same module twice.
+
+   A cycle (file A importing file B importing file A, however indirectly)
+   is caught during this same loading pass - the loader keeps a stack of
+   paths currently mid-load, and a path re-encountered while still on that
+   stack (not yet fully loaded, so not yet in the memoization map either)
+   is LoadError.CircularImport rather than infinite recursion.
+
+   FUNCTION REGISTRATION IS GLOBAL, VISIBILITY IS PER-MODULE.
+   compileModules's first pass walks every module's function declarations
+   (in whatever order `modules` lists them - order doesn't matter here
+   since this pass only builds a name table, the same as single-file
+   compileProgram always has) and registers each one with its owning
+   module's index and `exported` flag alongside the name/arity/call-index
+   every function has always had. A name collision anywhere in this whole
+   table - even between two files that don't import each other at all -
+   is SemanticError.DuplicateFunction, the same error a single file's own
+   two `func f()`s already were (GRAMMAR.bnf design note 3h: this is what
+   keeps CALL's resolution a flat table rather than needing per-module
+   namespacing).
+
+   Compiling each module's function *bodies* (and the entry module's
+   top-level statements) tracks which module is "current" and which other
+   modules' indices are directly reachable from it (that module's own
+   `imports` list). A call to name `f` resolves in two steps: first find
+   `f` in the global table (as always - SemanticError.UndefinedFunction if
+   no such name exists anywhere), then check it's *visible* from here -
+   either it belongs to the current module (always allowed, exported or
+   not: a module's own private helpers are always usable by itself), or
+   it belongs to a module in the current module's direct-import list AND
+   is exported (SemanticError.FunctionNotVisible otherwise). This is
+   deliberately NOT transitive: importing B does not make B's own
+   imports' exports visible here (GRAMMAR.bnf design note 3h) - there is
+   no automatic re-export.
    ========================================================================== *)

@@ -1,0 +1,5 @@
+import "numeric.butter"
+
+export func sumOfSquares(int a, int b) -> int {
+    return square(a) + square(b)
+}
