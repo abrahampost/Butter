@@ -50,7 +50,11 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 (* Notes on lexing:
    - Whitespace (space, tab, '\r') is discarded; '\n' is significant (NEWLINE).
-   - There is no comment syntax in the language.
+   - '#' starts a comment that runs through (but does not include) the next
+     '\n' (or EOF, if there is no further '\n'); the comment's own text is
+     discarded exactly like other insignificant whitespace, but the '\n'
+     terminating it is still scanned as its own NEWLINE token immediately
+     after. A comment does not nest and is not recognized inside a STRING.
    - '=' must always be followed by '=' (producing '=='); a lone '=' is a
      lexer error. Likewise ':' must always be followed by '=' (producing the
      assignment operator ':='). A lone '.' is a lexer error too — the only

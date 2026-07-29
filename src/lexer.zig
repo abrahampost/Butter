@@ -166,10 +166,15 @@ pub const Lexer = struct {
 
     fn skipInsignificantWhitespace(self: *Lexer) void {
         // Space, tab, and carriage return are discarded; '\n' is significant
-        // (it becomes a NEWLINE token) and is handled by `next`.
+        // (it becomes a NEWLINE token) and is handled by `next`. A '#'
+        // starts a comment that runs through (but does not include) the
+        // next '\n', so the newline afterward is still tokenized normally.
         while (!self.isAtEnd()) {
             switch (self.peek()) {
                 ' ', '\t', '\r' => _ = self.advance(),
+                '#' => while (!self.isAtEnd() and self.peek() != '\n') {
+                    _ = self.advance();
+                },
                 else => return,
             }
         }
@@ -420,4 +425,20 @@ test "tokenizeAll includes a trailing eof token" {
 
 test "empty source produces only eof" {
     try expectTokenTypes("", &.{.eof});
+}
+
+test "'#' starts a comment that runs to end of line" {
+    try expectTokenTypes("1 # this is ignored\n2", &.{ .int, .newline, .int, .eof });
+}
+
+test "a comment-only line still produces its newline" {
+    try expectTokenTypes("# just a comment\n1", &.{ .newline, .int, .eof });
+}
+
+test "a comment with no trailing newline runs to eof" {
+    try expectTokenTypes("1 # comment at eof", &.{ .int, .eof });
+}
+
+test "'#' immediately followed by newline is an empty comment" {
+    try expectTokenTypes("1 #\n2", &.{ .int, .newline, .int, .eof });
 }
