@@ -663,4 +663,21 @@
    deliberately NOT transitive: importing B does not make B's own
    imports' exports visible here (GRAMMAR.bnf design note 3h) - there is
    no automatic re-export.
+
+   A BUNDLED STANDARD LIBRARY IS RESOLVED BY NAME, NOT BY PATH. Before an
+   `import` path is resolved against the importing file's directory
+   (section 8's opening paragraph, GRAMMAR.bnf design note 3h), it's
+   checked against a small table of reserved `.std.butter` names -
+   currently just `"math.std.butter"` (src/stdlib.zig) - whose Butter
+   source is embedded into the `butter` binary itself at build time via
+   `@embedFile`. A hit resolves to that embedded source directly, keyed by
+   the bare reserved name rather than a filesystem path, so it imports
+   identically regardless of which directory or how many different files
+   import it (still collapsed to one loaded/compiled copy either way, by
+   the same memoization this section already describes) - and with no
+   file named `math.std.butter` needing to exist anywhere on disk. Past
+   that one lookup, a bundled module is loaded and compiled exactly like
+   any other: its functions still need `export` to be visible outside it,
+   it's still one graph node in `Loader.order`, and its own `import`s (if
+   it had any) would go through this same by-name-first check.
    ========================================================================== *)

@@ -1,0 +1,109 @@
+export func abs(float x) -> float {
+    if x < 0 {
+        return -x
+    }
+    return x
+}
+
+export func min(float a, float b) -> float {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+export func max(float a, float b) -> float {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+export func clamp(float x, float lo, float hi) -> float {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+export func sign(float x) -> float {
+    if x > 0 {
+        return 1
+    }
+    if x < 0 {
+        return -1
+    }
+    return 0
+}
+
+export func floor(float x) -> float {
+    float magic := 6755399441055744.0
+    float nearest := (x + magic) - magic
+    if nearest > x {
+        return nearest - 1
+    }
+    return nearest
+}
+
+export func ceil(float x) -> float {
+    return -floor(-x)
+}
+
+export func trunc(float x) -> float {
+    if x < 0 {
+        return ceil(x)
+    }
+    return floor(x)
+}
+
+export func round(float x) -> float {
+    if x < 0 {
+        return -floor(-x + 0.5)
+    }
+    return floor(x + 0.5)
+}
+
+export func sqrt(float x) -> float {
+    if x < 0 {
+        return 0.0 / 0.0
+    }
+    if x == 0 {
+        return 0.0
+    }
+    float xf := x + 0.0
+    float guess := xf
+    float prev := 0.0
+    int iterations := 0
+    while guess != prev and iterations < 200 {
+        prev := guess
+        guess := (guess + xf / guess) / 2
+        iterations := iterations + 1
+    }
+    return guess
+}
+
+export func pow(float base, float exponent) -> float {
+    return base ** exponent
+}
+
+export func gcd(int a, int b) -> int {
+    int x := abs(a)
+    int y := abs(b)
+    while y != 0 {
+        int temp := y
+        y := x % y
+        x := temp
+    }
+    return x
+}
+
+export func factorial(int n) -> int {
+    int result := 1
+    for i in 1..(n + 1) {
+        result := result * i
+    }
+    return result
+}

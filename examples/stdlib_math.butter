@@ -1,0 +1,13 @@
+import "math.std.butter"
+
+print abs(-7)
+print min(3, 9)
+print max(3, 9)
+print clamp(15, 0, 10)
+print floor(3.7)
+print ceil(3.2)
+print round(2.5)
+print sqrt(2)
+print pow(2, 10)
+print gcd(12, 18)
+print factorial(5)

@@ -6,12 +6,20 @@
 //! memoization is also what the compiler relies on for deduping generated
 //! code: `compiler.compileModules` compiles whatever `Loader.order` hands
 //! it, and a module never appears in `order` more than once.
+//!
+//! An import path is checked against `stdlib.lookup` before it is ever
+//! resolved against the filesystem — a reserved `.std.butter` name (e.g.
+//! `"math.std.butter"`) resolves to Butter source bundled into the
+//! `butter` binary itself (see stdlib.zig), keyed by that bare name rather
+//! than a path resolved against the importing file's directory, so it
+//! imports the same way from anywhere.
 
 const std = @import("std");
 const lexer_mod = @import("lexer.zig");
 const parser_mod = @import("parser.zig");
 const ast = @import("ast.zig");
 const compiler_mod = @import("compiler.zig");
+const stdlib = @import("stdlib.zig");
 
 pub const Diagnostic = struct {
     /// The canonical path of the file the error occurred in (or while
@@ -149,6 +157,17 @@ pub const Loader = struct {
         var import_list: std.ArrayList(*Module) = .empty;
         for (program) |*stmt| {
             if (stmt.* != .import_stmt) continue;
+            // A bundled standard-library module (reserved `.std.butter`
+            // name) is matched before ever touching the filesystem, and by
+            // its bare name rather than a path resolved against `dir` — it
+            // has no real file/directory of its own, so it resolves the
+            // same way regardless of which directory imports it.
+            if (stdlib.lookup(stmt.import_stmt.path)) |std_source| {
+                const child_key = try self.allocator().dupe(u8, stmt.import_stmt.path);
+                const child = try self.loadModule(std_source, child_key, ".", false);
+                try import_list.append(self.allocator(), child);
+                continue;
+            }
             const child_key = try std.fs.path.resolve(self.allocator(), &.{ dir, stmt.import_stmt.path });
             const child_dir = std.fs.path.dirname(child_key) orelse ".";
             const child_source = self.readFile(child_key) catch |err| {
@@ -193,6 +212,8 @@ pub fn toCompilerUnits(allocator: std.mem.Allocator, order: []const *Module, ent
 }
 
 // ---- Tests ---------------------------------------------------------------
+
+const vm_mod = @import("vm.zig");
 
 fn writeFile(dir: std.Io.Dir, io: std.Io, path: []const u8, contents: []const u8) !void {
     try dir.writeFile(io, .{ .sub_path = path, .data = contents });
@@ -364,4 +385,97 @@ test "toCompilerUnits translates a diamond import graph into index-based ModuleU
     var compiled = try compiler.compileModules(result.entry_index, result.units);
     defer compiled.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 3), compiled.functions.len);
+}
+
+test "the bundled math stdlib imports by name with no matching file on disk" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var loader = Loader.init(allocator, std.testing.io, tmp.dir);
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry("import \"math.std.butter\"\nprint abs(-3)\n", "main.butter", ".");
+    try std.testing.expectEqual(@as(usize, 1), entry.imports.len);
+    try std.testing.expectEqualStrings("math.std.butter", entry.imports[0].path);
+}
+
+test "the bundled math stdlib imports the same way from any directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "sub");
+
+    var loader = Loader.init(allocator, std.testing.io, tmp.dir);
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry("import \"math.std.butter\"\nprint abs(-3)\n", "sub/main.butter", "sub");
+    try std.testing.expectEqualStrings("math.std.butter", entry.imports[0].path);
+}
+
+test "two modules importing the bundled math stdlib both see one compiled copy of it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, std.testing.io, "b.butter", "import \"math.std.butter\"\nexport func fromB() -> int { return abs(-1) }\n");
+    try writeFile(tmp.dir, std.testing.io, "c.butter", "import \"math.std.butter\"\nexport func fromC() -> int { return abs(-2) }\n");
+
+    var loader = Loader.init(allocator, std.testing.io, tmp.dir);
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(
+        "import \"b.butter\"\nimport \"c.butter\"\nprint fromB() + fromC()\n",
+        "main.butter",
+        ".",
+    );
+    // main, b, c, math.std.butter — the stdlib module appears once despite
+    // being imported from two different files.
+    try std.testing.expectEqual(@as(usize, 4), loader.order.items.len);
+    try std.testing.expect(entry.imports[0].imports[0] == entry.imports[1].imports[0]);
+}
+
+test "the bundled math stdlib's functions run correctly end to end" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var loader = Loader.init(allocator, std.testing.io, tmp.dir);
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(
+        \\import "math.std.butter"
+        \\print abs(-5)
+        \\print min(3, 7)
+        \\print max(3, 7)
+        \\print clamp(15, 0, 10)
+        \\print floor(3.7)
+        \\print ceil(3.2)
+        \\print round(2.5)
+        \\print sqrt(144)
+        \\print pow(2, 10)
+        \\print gcd(12, 18)
+        \\print factorial(5)
+        \\
+    ,
+        "main.butter",
+        ".",
+    );
+
+    const modules = try toCompilerUnits(loader.allocator(), loader.order.items, entry);
+    var compiler = compiler_mod.Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(modules.entry_index, modules.units);
+    defer compiled.deinit(allocator);
+
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var vm = vm_mod.Vm.init();
+    try vm.run(&compiled, &writer);
+
+    try std.testing.expectEqualStrings(
+        "5\n3\n7\n10\n3\n4\n3\n12\n1024\n6\n120\n",
+        writer.buffered(),
+    );
 }
