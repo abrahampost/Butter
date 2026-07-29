@@ -28,6 +28,7 @@ pub const TokenType = enum {
     kw_in,
     kw_import,
     kw_export,
+    kw_len,
 
     // Operators and punctuation
     plus,
@@ -77,6 +78,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "in", .kw_in },
     .{ "import", .kw_import },
     .{ "export", .kw_export },
+    .{ "len", .kw_len },
 });
 
 pub const Token = struct {
@@ -365,6 +367,10 @@ test "'for' and 'in' are recognized as keywords" {
 
 test "'import' and 'export' are recognized as keywords" {
     try expectTokenTypes("import export importer", &.{ .kw_import, .kw_export, .identifier, .eof });
+}
+
+test "'len' is recognized as a keyword" {
+    try expectTokenTypes("len length", &.{ .kw_len, .identifier, .eof });
 }
 
 test "identifiers may contain digits but not start with one" {

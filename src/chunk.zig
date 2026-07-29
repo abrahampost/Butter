@@ -18,6 +18,19 @@ pub const OpCode = enum(u8) {
     load_index,
     store_index,
 
+    // Generic (unsized) array support — a single-slot runtime reference
+    // value rather than raw consecutive slots (ISA.bnf section 6's
+    // generic-array addendum). `make_array_ref`'s operand packs
+    // (slot, length) exactly like LOAD_INDEX/STORE_INDEX, since both are
+    // compile-time constants at the point a reference is synthesized from
+    // a concrete local array. The other three address a slot holding an
+    // already-synthesized `Value.array_ref` — no length to pack, since the
+    // whole point is that it's read from the reference at runtime instead.
+    make_array_ref,
+    load_index_ref,
+    store_index_ref,
+    load_ref_len,
+
     add,
     sub,
     mul,
@@ -115,8 +128,8 @@ pub const Chunk = struct {
                     try self.constants.items[instr.operand].print(writer);
                     try writer.writeAll(")\n");
                 },
-                .load_local, .store_local => try writer.print(" slot={d}\n", .{instr.operand}),
-                .load_index, .store_index => {
+                .load_local, .store_local, .load_index_ref, .store_index_ref, .load_ref_len => try writer.print(" slot={d}\n", .{instr.operand}),
+                .load_index, .store_index, .make_array_ref => {
                     const idx = unpackIndexOperand(instr.operand);
                     try writer.print(" slot={d} len={d}\n", .{ idx.slot, idx.length });
                 },
@@ -131,12 +144,17 @@ pub const Chunk = struct {
 /// One compiled function: its own self-contained `Chunk` (own instructions,
 /// own constant pool — no access to any other function's or the top
 /// level's, since Butter functions are not closures) plus the metadata the
-/// VM needs to call it (see ISA.bnf section 6). `arity` is how many
-/// arguments CALL expects on the stack, which also determines the callee's
-/// frame base pointer (`sp - arity`) at call time.
+/// VM needs to call it (see ISA.bnf section 6). `arity` is how many stack
+/// slots CALL expects its arguments to occupy in total — not the parameter
+/// count, since an array-typed parameter occupies `array_len` slots rather
+/// than one — which also determines the callee's frame base pointer
+/// (`sp - arity`) at call time. `return_width` is likewise how many slots
+/// RET copies back to the caller (1 for a scalar return, `array_len` for an
+/// array return).
 pub const Function = struct {
     name: []const u8,
     arity: u32,
+    return_width: u32 = 1,
     chunk: Chunk,
 
     pub fn deinit(self: *Function, allocator: std.mem.Allocator) void {

@@ -63,16 +63,32 @@
    2. VALUE REPRESENTATION
    -------------------------------------------------------------------------- *)
 
-<value>    ::= INT | FLOAT | BOOL | STRING
+<value>    ::= INT | FLOAT | BOOL | STRING | ARRAY_REF
 
 (* INT and FLOAT are i64 / f64. STRING values are borrowed slices into a
    Chunk's constant pool (which in turn borrows from the original source
    text) — never separately allocated, copied, or freed at run time.
    Because GRAMMAR.bnf defines no string-concatenation operator and no
-   arrays/collections (section 3a), every string a running program can ever
-   produce already exists as a literal fixed at compile time. That means
-   the VM needs no heap and no garbage collector: every `Value` is either
-   a plain scalar or a slice it never owns. *)
+   growable/heap-allocated collections, every string a running program can
+   ever produce already exists as a literal fixed at compile time. That
+   means the VM needs no heap and no garbage collector: every `Value` is
+   either a plain scalar, a slice it never owns, or (ARRAY_REF) a
+   reference to storage that lives elsewhere on this same value stack —
+   see the addendum below and section 6's generic-array addendum. *)
+
+(* ARRAY_REF (GRAMMAR.bnf design note 3j) is `{ base: u32, len: u32 }` —
+   `base` an ABSOLUTE index into the VM's `stack` array (not frame-relative:
+   it's computed once, at MAKE_ARRAY_REF time, from whichever frame's `bp`
+   the referenced array actually lives in — section 6), `len` its length.
+   It is the runtime representation of a GENERIC (unsized, `int[]`-style)
+   array parameter or return value ONLY; a fixed-size array (design note
+   3e) never produces one — see the addendum right below this one for why
+   those two remain deliberately different runtime representations. There
+   is no way to construct an ARRAY_REF from Butter source directly (no
+   syntax makes one appear as a literal); the only way one comes into
+   being is MAKE_ARRAY_REF, always compiler-generated at a call site
+   passing a fixed-size local into a generic parameter (`compiler.zig`'s
+   `compileGenericArrayArgument`). *)
 
 (* A compiled program is one main Chunk (the top-level code, run as an
    implicit frame 0 — see section 6) plus one Chunk per declared function,
@@ -90,6 +106,17 @@
    into a VM with no heap and no garbage collector: the array itself isn't
    a new kind of runtime object, just a compile-time-known grouping of the
    same slots locals always lived in. *)
+
+(* `len(arr)` (GRAMMAR.bnf design note 3i) on a FIXED-size local compiles
+   straight to PUSH_CONST of the array's declared size — the compiler
+   already has that number in hand (it's `Local.array`'s `.fixed` payload
+   — section 5), so `len` needs no dedicated opcode there and does nothing
+   at runtime beyond what any other INT literal does; the constant folding
+   happens entirely at compile time. On a GENERIC local (design note 3j),
+   there IS no compile-time number to fold to — the actual length depends
+   on whatever array the caller passed — so `len(arr)` instead compiles to
+   LOAD_REF_LEN, a genuine runtime read of the reference's own `len` field
+   (section 3). *)
 
 
 (* --------------------------------------------------------------------------
@@ -135,6 +162,48 @@
                                                why the stack effect reads
                                                index-then-v rather than
                                                v-then-index.
+
+   MAKE_ARRAY_REF #packed(slot,length)  ( -- ref )
+                                               pushes a fresh
+                                               ARRAY_REF{ base = bp + slot,
+                                               len = length } (slot/length
+                                               both compile-time constants,
+                                               unpacked the same way
+                                               LOAD_INDEX/STORE_INDEX's
+                                               operand is). Synthesizes a
+                                               reference to a FIXED-size
+                                               local at `slot` — GRAMMAR.bnf
+                                               design note 3j — only ever
+                                               emitted when passing such a
+                                               local into a generic (`[]`)
+                                               parameter.
+   LOAD_INDEX_REF #slot   ( index -- v )      pops index (must be INT);
+                                               reads ref = stack[bp+slot]
+                                               (must be ARRAY_REF —
+                                               TypeMismatch otherwise);
+                                               IndexOutOfBounds unless
+                                               0 <= index < ref.len; else
+                                               pushes stack[ref.base+index].
+                                               The generic-array counterpart
+                                               to LOAD_INDEX: `slot` names
+                                               where the REFERENCE lives,
+                                               not the array itself — its
+                                               base/length come from the
+                                               reference at runtime instead
+                                               of the operand.
+   STORE_INDEX_REF #slot  ( index v -- v )    generic-array counterpart to
+                                               STORE_INDEX, same reference
+                                               indirection and peek-not-
+                                               consume shape as
+                                               LOAD_INDEX_REF/STORE_INDEX.
+   LOAD_REF_LEN  #slot    ( -- int )          reads ref = stack[bp+slot]
+                                               (must be ARRAY_REF); pushes
+                                               ref.len as an INT. What
+                                               `len(arr)` compiles to for a
+                                               GENERIC array, since (unlike
+                                               a fixed-size one) its length
+                                               isn't a compile-time constant
+                                               to fold to.
 
    ADD, SUB, MUL, DIV, MOD, POW
                           ( a b -- r )        both operands must be numeric
@@ -310,20 +379,39 @@
 
    An array-typed local's bare name resolves for LOAD_LOCAL/STORE_LOCAL
    purposes exactly like a scalar's (same lookup, same list) but using it
-   that way is a compile error (`CompileError.ArrayUsedAsScalar`) — arrays
-   are only ever accessed through LOAD_INDEX/STORE_INDEX (section 3),
-   which pack that same `slot` together with `width` (there called
-   `length`, for the bounds check) into one instruction operand.
+   that way is a compile error (`CompileError.ArrayUsedAsScalar`) — a
+   FIXED-size array is only ever accessed through LOAD_INDEX/STORE_INDEX
+   (section 3), which pack that same `slot` together with `width` (there
+   called `length`, for the bounds check) into one instruction operand.
 
-   A function's parameters are simply its first `arity` locals (slots
-   0..arity-1), added to that function's locals list before its body is
+   `Local.array` (compiler.zig) distinguishes which of two array kinds a
+   local is, or `null` for a plain scalar: `.fixed(n)` (width `n`,
+   accessed via LOAD_INDEX/STORE_INDEX as above — GRAMMAR.bnf design note
+   3e) or `.generic` (width exactly 1 — it's a single ARRAY_REF value, not
+   raw slots — accessed via LOAD_INDEX_REF/STORE_INDEX_REF/LOAD_REF_LEN
+   instead, design note 3j). The bare-name-as-scalar restriction above
+   applies to BOTH kinds identically; a generic local's reference value
+   still can't be loaded/stored as a plain expression outside the narrow
+   contexts section 6's generic-array addendum describes (forwarding it as
+   a call argument or a return).
+
+   A function's parameters are simply its first locals, occupying slots
+   0..arity-1, added to that function's locals list before its body is
    compiled at all — from the compiler's perspective a parameter is just a
    local that already has a value by the time the body starts, the same
    way a var-declaration's initializer already has a value on the stack
-   before the declaration finishes (section 2). Locals lists are entirely
-   separate per chunk: a function's locals list starts fresh (containing
-   only its own parameters) and is discarded once that function's chunk is
-   done compiling, which is what makes it structurally impossible for a
+   before the declaration finishes (section 2). A scalar parameter costs
+   one slot; a `.fixed(n)` array-typed parameter costs `n` consecutive
+   slots, exactly like a fixed-size array-typed local anywhere else (see
+   the array-typed-local paragraph just above); a `.generic` array-typed
+   parameter costs exactly one slot too (it's a single ARRAY_REF value,
+   design note 3j) — which is precisely why `arity` (the total slot width
+   CALL reserves, section 6) and the parameter *count* (what the
+   arity-mismatch check in GRAMMAR.bnf design note 3d actually compares)
+   are two different numbers once any parameter is fixed-size-array-typed. Locals lists are entirely separate per chunk: a
+   function's locals list starts fresh (containing only its own
+   parameters) and is discarded once that function's chunk is done
+   compiling, which is what makes it structurally impossible for a
    function body to resolve a top-level variable's name — the compiler
    never even has that name in scope while compiling the function (per
    GRAMMAR.bnf design note 3b).
@@ -334,19 +422,35 @@
    -------------------------------------------------------------------------- *)
 
    Each declared function compiles to its own `chunk_mod.Function` — a
-   name, an arity, and a self-contained Chunk (own instructions, own
-   constant pool). A compiled `Program` is one main Chunk (top-level code)
-   plus a slice of these, indexed by the operand CALL instructions use to
-   name their target (resolved by name to that index at compile time —
-   see compiler.zig's function table, built before any function body is
-   compiled so that calls resolve regardless of declaration order,
-   including a function calling itself or two functions calling each
-   other).
+   name, an arity, a return_width, and a self-contained Chunk (own
+   instructions, own constant pool). A compiled `Program` is one main
+   Chunk (top-level code) plus a slice of these, indexed by the operand
+   CALL instructions use to name their target (resolved by name to that
+   index at compile time — see compiler.zig's function table, built before
+   any function body is compiled so that calls resolve regardless of
+   declaration order, including a function calling itself or two functions
+   calling each other).
 
-   CALLING CONVENTION. A call expression's arguments compile as ordinary
-   expressions, left to right, exactly like any other operator's operands
-   — by the time CALL executes, they are simply sitting on top of the
-   stack in order. CALL then:
+   ARITY AND RETURN_WIDTH ARE STACK-SLOT COUNTS, NOT VALUE COUNTS. `arity`
+   is the total number of stack slots every argument together occupies —
+   a scalar argument is 1 slot, an array argument is `<declared size>`
+   slots (GRAMMAR.bnf design note 3e) — and `return_width` is likewise how
+   many slots the return value occupies (1 for a scalar return, the
+   declared size for an array return). Neither is the same as counting
+   *values*: a call with one array-typed and one scalar parameter has an
+   arity of `<array size> + 1`, not 2.
+
+   CALLING CONVENTION. A call expression's arguments compile left to
+   right onto the stack, in whatever shape each one needs: a scalar
+   argument is one ordinary expression (one value pushed), while an
+   array-typed argument (matched against the parameter it fills) is a
+   sequence of `<declared size>` LOAD_LOCALs copying that argument array's
+   slots on top of the stack, one by one, in order (GRAMMAR.bnf design
+   note 3e) — passing is always by VALUE, a fresh copy, never a reference
+   to the caller's own slots. Either way, by the time CALL executes, the
+   callee's entire argument list — `arity` slots' worth, whatever mix of
+   scalars and array copies produced them — is simply sitting on top of
+   the stack in order. CALL then:
 
      1. Checks the frame stack isn't already at capacity
         (CallStackOverflow if it is — this is what turns unbounded
@@ -354,22 +458,40 @@
         stack overflow/crash).
      2. Pushes a frame recording the CALLER's chunk, ip (already advanced
         past the CALL instruction, so execution resumes right after it),
-        and base pointer — everything needed to resume the caller once
-        the callee returns.
-     3. Sets the new base pointer to `sp - arity`: since the N arguments
-        are already the top N values on the stack, this makes them
-        exactly the callee's LOAD_LOCAL/STORE_LOCAL slots 0..arity-1
-        without copying them anywhere.
-     4. Switches to the callee's chunk and jumps to instruction 0.
+        base pointer, and return_width — everything needed to resume the
+        caller once the callee returns, including how many slots the
+        CALLER's own eventual RET will need to copy (so a nested call's
+        RET can't clobber that number for the outer call still waiting on
+        the stack, e.g. `sum(doubleAll(nums))`).
+     3. Sets the new base pointer to `sp - arity`: since the callee's
+        arguments already occupy the top `arity` slots of the stack, this
+        makes them exactly the callee's LOAD_LOCAL/STORE_LOCAL slots
+        0..arity-1 without copying them anywhere else — an array-typed
+        parameter's slots are simply a contiguous sub-range of that same
+        span, addressed via LOAD_INDEX/STORE_INDEX like any other
+        array-typed local (section 5).
+     4. Switches to the callee's chunk, jumps to instruction 0, and sets
+        the active return_width to the callee's own (used by the RET that
+        eventually returns from THIS call, not the caller's).
 
-   RET does the reverse: pop the returning function's result, pop the
-   current frame, reset the stack pointer to that frame's base pointer
-   (discarding every argument, parameter-slot, and local the callee ever
-   pushed, in one step — whether or not the compiler's own block-scope POP
-   bookkeeping ran, since a `return` can fire from arbitrarily deep inside
-   nested if/while/block bodies and always unwinds the whole frame
-   directly), push the result back, and restore the chunk/ip/base pointer
-   from the popped frame.
+   RET generalizes "pop the result, restore the frame, push the result
+   back" from exactly one value to `return_width` of them: a `return`
+   statement's expression already leaves exactly `return_width` values
+   sitting on top of the callee's stack region by the time RET executes
+   (one PUSH_CONST/expression for a scalar return, `<declared size>`
+   LOAD_LOCALs for an array return, mirroring how array arguments are
+   copied at the call site). RET then copies those top `return_width`
+   slots down onto the frame's own base pointer IN PLACE (slot-by-slot,
+   `stack[bp+i] = stack[bp_relative_top+i]`) rather than through a pop/push
+   pair, sets the stack pointer to `bp + return_width` (discarding every
+   argument, parameter-slot, and local the callee ever pushed in one step —
+   whether or not the compiler's own block-scope POP bookkeeping ran,
+   since a `return` can fire from arbitrarily deep inside nested
+   if/while/block bodies and always unwinds the whole frame directly),
+   pops the current frame, and restores the chunk/ip/base pointer/
+   return_width from it. For a scalar return (`return_width = 1`) this is
+   exactly the old pop-then-push behavior, just written as a single-slot
+   copy instead.
 
    RECURSION FALLS OUT FOR FREE. Nothing about CALL or RET is aware of
    whether the callee is the same function as the caller. Each call gets
@@ -390,6 +512,47 @@
    supported way to end the program early: RET always pops a frame that a
    CALL pushed, and no CALL ever runs before the main chunk starts, so
    there is no frame to pop at the top level.
+
+   GENERIC ARRAYS (GRAMMAR.bnf design note 3j) DON'T CHANGE ANY OF THE
+   ABOVE — they just change what a "value" is at one particular slot. A
+   generic (`int[]`) parameter costs exactly 1 slot for arity purposes,
+   same as a scalar, because at runtime it holds exactly one `Value`: an
+   ARRAY_REF (section 2). Where that reference comes FROM depends on what
+   the caller passed:
+     - a FIXED-size local (an array or a fixed-size parameter): the
+       compiler emits MAKE_ARRAY_REF at the call site, computing
+       `base = bp + <that local's slot>` using the CALLER's own bp (still
+       in scope — this runs before CALL switches frames) and pushing the
+       resulting reference as this one argument slot.
+     - a GENERIC local (already holding a reference): LOAD_LOCAL simply
+       copies the existing `ArrayRef` value onward, unchanged — its `base`
+       still points wherever it always did, since a reference's target
+       never moves.
+   Either way, by the time CALL executes, that argument is just one more
+   ordinary slot among the callee's `arity` — CALL/RET (above) don't know
+   or care that a slot holds a reference rather than an INT.
+
+   WHY A REFERENCE IS SAFE AS AN ARGUMENT BUT NOT ALWAYS SAFE AS A RETURN.
+   An argument's reference is only ever *read* during the callee's own
+   call, which is always fully nested inside (and therefore shorter-lived
+   than) whichever frame the reference points into — so it can never go
+   stale before the callee is done with it. A RETURN is different: the
+   reference has to remain valid AFTER this function's own frame is
+   discarded. A reference synthesized by THIS call's own MAKE_ARRAY_REF
+   points into THIS frame, which RET is about to pop — returning one would
+   hand the caller a reference to slots that are about to be reused by
+   whatever gets called next. Only a reference this function received
+   as-is (a generic parameter, or a nested call's own generic return,
+   forwarded transitively) is safe to return, because by induction it was
+   always ultimately synthesized as some ANCESTOR frame's call argument —
+   and an ancestor frame, by definition, outlives every frame nested
+   inside it. The compiler enforces this statically
+   (`compiler.zig`'s `compileGenericArrayReturn`,
+   `CompileError.EscapingArrayReference`) rather than leaving it as a
+   runtime footgun — no ARRAY_REF a running program ever holds can be
+   dangling, by construction, the same "checked at compile time, not
+   trusted at runtime" spirit as bounds-checking (section 3's
+   LOAD_INDEX/LOAD_INDEX_REF).
 
 
 (* --------------------------------------------------------------------------

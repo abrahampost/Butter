@@ -27,6 +27,9 @@ pub const SemanticError = error{
     InvalidArrayInitializer,
     UnexpectedArrayLiteral,
     FunctionNotVisible,
+    InvalidArrayArgument,
+    InvalidArrayReturn,
+    EscapingArrayReference,
 };
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
@@ -36,23 +39,50 @@ pub const Diagnostic = struct {
 };
 
 /// `slot` is explicit (not implied by position in the locals list) because
-/// an array-typed local occupies `array_len` consecutive slots rather than
-/// exactly one, so slot numbers and list position diverge once any array
-/// is in scope (see ISA.bnf section 5).
+/// an array-typed local occupies more than one slot rather than exactly
+/// one, so slot numbers and list position diverge once any array is in
+/// scope (see ISA.bnf section 5).
 const Local = struct {
     name: []const u8,
     depth: usize,
     slot: u32,
-    /// null for a plain scalar (1 slot); `Some(n)` means this local is a
-    /// fixed-size array occupying `n` consecutive slots starting at `slot`.
-    array_len: ?u32 = null,
+    /// null for a plain scalar (1 slot). `Some(.fixed(n))` means this
+    /// local is a fixed-size array occupying `n` consecutive raw slots
+    /// starting at `slot`, addressed via LOAD_INDEX/STORE_INDEX.
+    /// `Some(.generic)` means this local holds a single-slot runtime
+    /// `Value.array_ref` (always exactly 1 slot, whatever the referenced
+    /// array's actual length turns out to be at runtime), addressed via
+    /// LOAD_INDEX_REF/STORE_INDEX_REF/LOAD_REF_LEN instead (ISA.bnf
+    /// section 6's generic-array addendum).
+    array: ?ast.ArraySpec = null,
 };
+
+/// A local/parameter's width in stack slots: 1 for a plain scalar OR a
+/// generic array reference (both are exactly one `Value`), `n` for a
+/// fixed-size array of `n` elements.
+fn arraySpecWidth(spec: ?ast.ArraySpec) u32 {
+    return switch (spec orelse return 1) {
+        .fixed => |n| n,
+        .generic => 1,
+    };
+}
 
 /// A function's compile-time signature, registered up front (before any
 /// function body is compiled — see `compileModules`) so that calls resolve
 /// regardless of declaration order. `index` is the position its compiled
 /// `chunk_mod.Function` will occupy in the final `Program.functions`
 /// slice, which is also the operand CALL instructions use to name it.
+///
+/// `params` is borrowed directly from the declaring `ast.Stmt.FunctionDecl`
+/// (valid for as long as the parsed program it came from outlives
+/// compilation, which it always does) so that a call site can see each
+/// parameter's `array_size` — needed to compile an array argument
+/// differently from a scalar one (see `compileCall`). `arity` is the total
+/// stack-slot width all parameters occupy together (a fixed-size array
+/// parameter costs its declared size in slots, a generic array parameter
+/// costs exactly 1 — it's a single reference value — same as a scalar),
+/// which is what the VM's CALL actually needs; it is deliberately NOT
+/// `params.len` once any parameter is array-typed.
 ///
 /// `module`/`exported` exist purely for cross-file visibility (see
 /// `functionVisible`, GRAMMAR.bnf design note h) — the VM itself never
@@ -61,11 +91,19 @@ const Local = struct {
 /// other (ISA.bnf section 6/8).
 const FunctionInfo = struct {
     name: []const u8,
+    params: []const ast.Param,
+    return_array_size: ?ast.ArraySpec,
     arity: u32,
     index: u32,
     module: usize,
     exported: bool,
 };
+
+fn totalParamWidth(params: []const ast.Param) u32 {
+    var width: u32 = 0;
+    for (params) |p| width += arraySpecWidth(p.array_size);
+    return width;
+}
 
 /// One compilation unit passed to `compileModules`: a parsed file plus
 /// which other units (by index into the same slice) it's allowed to call
@@ -110,6 +148,12 @@ pub const Compiler = struct {
     /// (`functionVisible`). Borrowed from the `ModuleUnit` currently being
     /// compiled; never owned by the compiler.
     visible_imports: []const usize = &.{},
+    /// Set for the duration of `compileFunctionBody` to the function
+    /// currently being compiled's declared return array size (null for a
+    /// plain scalar return) — `compileStmt`'s `.return_stmt` case consults
+    /// this to decide whether a `return` needs `compileArrayReturn` instead
+    /// of a plain `compileExpr`.
+    current_return_array_size: ?ast.ArraySpec = null,
     diagnostic: ?Diagnostic = null,
 
     pub fn init(allocator: std.mem.Allocator) Compiler {
@@ -165,7 +209,9 @@ pub const Compiler = struct {
                 }
                 try self.functions.append(self.allocator, .{
                     .name = f.name,
-                    .arity = @intCast(f.params.len),
+                    .params = f.params,
+                    .return_array_size = f.return_array_size,
+                    .arity = totalParamWidth(f.params),
                     .index = @intCast(self.functions.items.len),
                     .module = mi,
                     .exported = f.exported,
@@ -206,10 +252,12 @@ pub const Compiler = struct {
             for (m.program) |*stmt| {
                 if (stmt.* != .function_decl) continue;
                 const f = stmt.function_decl;
+                const info = self.findFunction(f.name).?; // registered in pass 1, above
                 const body_chunk = try self.compileFunctionBody(f);
                 try compiled.append(self.allocator, .{
                     .name = f.name,
-                    .arity = @intCast(f.params.len),
+                    .arity = info.arity,
+                    .return_width = arraySpecWidth(f.return_array_size),
                     .chunk = body_chunk,
                 });
             }
@@ -232,16 +280,36 @@ pub const Compiler = struct {
         self.scope_depth = 0;
         self.next_slot = 0;
         self.in_function = true;
+        self.current_return_array_size = f.return_array_size;
         defer self.in_function = false;
+        defer self.current_return_array_size = null;
 
         for (f.params) |p| {
-            try self.locals.append(self.allocator, .{ .name = p.name, .depth = 0, .slot = self.next_slot });
-            self.next_slot += 1;
+            try self.locals.append(self.allocator, .{ .name = p.name, .depth = 0, .slot = self.next_slot, .array = p.array_size });
+            self.next_slot += arraySpecWidth(p.array_size);
         }
         for (f.body) |*s| try self.compileStmt(s);
 
-        const idx = try self.chunk.addConstant(self.allocator, defaultValue(f.return_type));
-        _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+        // Falling off the end without an explicit `return`: the zero value
+        // of the return type, repeated for a fixed-size array return
+        // (matching how an uninitialized array var-decl gets zero-filled
+        // in `compileVarDecl`), or an empty (base=0, len=0) reference for
+        // a generic array return — a valid, safe "nothing here" reference
+        // since any index into it immediately bounds-checks out.
+        if (self.current_return_array_size) |spec| switch (spec) {
+            .fixed => |n| {
+                const idx = try self.chunk.addConstant(self.allocator, defaultValue(f.return_type));
+                var i: u32 = 0;
+                while (i < n) : (i += 1) _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+            },
+            .generic => {
+                const idx = try self.chunk.addConstant(self.allocator, .{ .array_ref = .{ .base = 0, .len = 0 } });
+                _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+            },
+        } else {
+            const idx = try self.chunk.addConstant(self.allocator, defaultValue(f.return_type));
+            _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+        }
         _ = try self.chunk.emit(self.allocator, .ret);
 
         return self.chunk;
@@ -275,7 +343,14 @@ pub const Compiler = struct {
             },
             .return_stmt => |e| {
                 if (!self.in_function) return self.fail(SemanticError.ReturnOutsideFunction, "return", "'return' used outside a function body");
-                try self.compileExpr(e);
+                if (self.current_return_array_size) |spec| {
+                    switch (spec) {
+                        .fixed => |len| try self.compileArrayReturn(e, len),
+                        .generic => try self.compileGenericArrayReturn(e),
+                    }
+                } else {
+                    try self.compileExpr(e);
+                }
                 _ = try self.chunk.emit(self.allocator, .ret);
             },
             .function_decl => unreachable, // top-level only; compileModules never calls compileStmt on this
@@ -300,20 +375,30 @@ pub const Compiler = struct {
         const slot = self.next_slot;
         if (d.array_len) |len| {
             if (d.initializer) |init_expr| {
-                if (init_expr.* != .array_literal) {
-                    return self.fail(SemanticError.InvalidArrayInitializer, d.name, "an array declaration's initializer must be an array literal");
+                switch (init_expr.*) {
+                    .array_literal => |elems| {
+                        if (elems.len != len) {
+                            return self.fail(SemanticError.ArrayLengthMismatch, d.name, "array literal length does not match the declared size");
+                        }
+                        for (elems) |elem| try self.compileExpr(elem);
+                    },
+                    .call => |c| {
+                        const info = try self.compileCallCommon(c);
+                        const ret_spec = info.return_array_size orelse return self.fail(SemanticError.InvalidArrayInitializer, d.name, "function call does not return an array");
+                        const ret_len = switch (ret_spec) {
+                            .fixed => |n| n,
+                            .generic => return self.fail(SemanticError.InvalidArrayInitializer, d.name, "a local array declaration needs a fixed size, but this function call returns a generic (unsized) array"),
+                        };
+                        if (ret_len != len) return self.fail(SemanticError.ArrayLengthMismatch, d.name, "the called function's returned array length does not match the declared size");
+                    },
+                    else => return self.fail(SemanticError.InvalidArrayInitializer, d.name, "an array declaration's initializer must be an array literal or a call to an array-returning function"),
                 }
-                const elems = init_expr.array_literal;
-                if (elems.len != len) {
-                    return self.fail(SemanticError.ArrayLengthMismatch, d.name, "array literal length does not match the declared size");
-                }
-                for (elems) |elem| try self.compileExpr(elem);
             } else {
                 const idx = try self.chunk.addConstant(self.allocator, defaultValue(d.type));
                 var i: u32 = 0;
                 while (i < len) : (i += 1) _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             }
-            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .array_len = len });
+            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .array = .{ .fixed = len } });
             self.next_slot += len;
         } else {
             if (d.initializer) |init_expr| {
@@ -329,13 +414,13 @@ pub const Compiler = struct {
 
     /// Pops every local declared at a depth deeper than `depth` off both
     /// the compiler's bookkeeping list and the runtime stack (one POP per
-    /// slot the local occupies — `array_len orelse 1`), and reclaims their
-    /// slot numbers so a sibling scope that follows starts from the same
-    /// `next_slot` rather than growing the frame unboundedly.
+    /// slot the local occupies — `arraySpecWidth(removed.array)`), and
+    /// reclaims their slot numbers so a sibling scope that follows starts
+    /// from the same `next_slot` rather than growing the frame unboundedly.
     fn popLocalsAbove(self: *Compiler, depth: usize) CompileError!void {
         while (self.locals.items.len > 0 and self.locals.items[self.locals.items.len - 1].depth > depth) {
             const removed = self.locals.pop().?;
-            const width = removed.array_len orelse 1;
+            const width = arraySpecWidth(removed.array);
             self.next_slot -= width;
             var i: u32 = 0;
             while (i < width) : (i += 1) _ = try self.chunk.emit(self.allocator, .pop);
@@ -445,19 +530,172 @@ pub const Compiler = struct {
             .array_literal => return self.fail(SemanticError.UnexpectedArrayLiteral, "", "an array literal may only initialize a matching array declaration"),
             .index => |ix| try self.compileIndex(ix),
             .index_assign => |ia| try self.compileIndexAssign(ia),
+            .len_of => |name| try self.compileLenOf(name),
         }
     }
 
     /// Calls resolve against the function table built in `compileModules`'s
     /// first pass, not `self.locals` — a completely separate namespace
     /// from variables, which is why `x()` and `x` (a local named x) never
-    /// collide.
+    /// collide. The arity check compares against `info.params.len` (the
+    /// declared parameter COUNT), not `info.arity` (the total stack-slot
+    /// WIDTH those parameters occupy) — the two diverge as soon as any
+    /// parameter is array-typed.
+    ///
+    /// A call used as a plain expression (here) must return a scalar — an
+    /// array-returning function's result has nowhere legal to go in a
+    /// general expression context, since a `<value>` is always exactly one
+    /// stack slot (ISA.bnf section 2). The three contexts that DO have
+    /// somewhere for an array result to go — a matching array var-decl's
+    /// initializer, a matching array-typed call argument, and a matching
+    /// array return — each call `compileCallCommon` directly instead of
+    /// going through this function.
     fn compileCall(self: *Compiler, c: ast.Expr.Call) CompileError!void {
+        const info = try self.compileCallCommon(c);
+        if (info.return_array_size != null) return self.fail(SemanticError.ArrayUsedAsScalar, c.name, "a function returning an array can't be used as a plain value here");
+    }
+
+    /// Resolves, checks visibility/arity, compiles every argument (using
+    /// `compileArrayArgument`/`compileGenericArrayArgument` for array-typed
+    /// parameters), and emits CALL. Shared by every call site regardless of
+    /// what the call's own result is used for — plain-expression calls,
+    /// array var-decl initializers, array call arguments, and array
+    /// returns alike.
+    fn compileCallCommon(self: *Compiler, c: ast.Expr.Call) CompileError!FunctionInfo {
         const info = self.findFunction(c.name) orelse return self.fail(SemanticError.UndefinedFunction, c.name, "undefined function");
         if (!self.functionVisible(info)) return self.fail(SemanticError.FunctionNotVisible, c.name, "function exists but isn't exported by a module this file imports");
-        if (c.args.len != info.arity) return self.fail(SemanticError.ArityMismatch, c.name, "wrong number of arguments");
-        for (c.args) |arg| try self.compileExpr(arg);
+        if (c.args.len != info.params.len) return self.fail(SemanticError.ArityMismatch, c.name, "wrong number of arguments");
+        for (c.args, info.params) |arg, param| {
+            if (param.array_size) |spec| {
+                switch (spec) {
+                    .fixed => |len| try self.compileArrayArgument(arg, len),
+                    .generic => try self.compileGenericArrayArgument(arg),
+                }
+            } else {
+                try self.compileExpr(arg);
+            }
+        }
         _ = try self.chunk.emitWithOperand(self.allocator, .call, info.index);
+        return info;
+    }
+
+    /// A fixed-size array-valued expression — used for a fixed-size
+    /// call argument, a fixed-size returned array, or a matching fixed-size
+    /// array var-decl's initializer — may only ever be a bare array name
+    /// (of a matching FIXED local; a generic local can't be used here,
+    /// since its length isn't known at compile time) or a call to a
+    /// function that itself returns a matching fixed-size array (arrays
+    /// aren't first-class expressions, GRAMMAR.bnf design note 3e, so
+    /// there's no other array-valued expression form to compile).
+    /// `invalid_err` names the error to raise for anything else, since that
+    /// reads differently for an argument vs. a return vs. a var-decl
+    /// initializer.
+    fn compileArrayValue(self: *Compiler, expr: *const ast.Expr, expected_len: u32, comptime invalid_err: SemanticError, invalid_msg: []const u8) CompileError!void {
+        switch (expr.*) {
+            .variable => |name| {
+                const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
+                const spec = local.array orelse return self.fail(SemanticError.NotAnArray, name, "not an array");
+                const len = switch (spec) {
+                    .fixed => |n| n,
+                    .generic => return self.fail(invalid_err, name, "a generic (unsized) array can't be used where a fixed-size array is required"),
+                };
+                if (len != expected_len) return self.fail(SemanticError.ArrayLengthMismatch, name, "array length does not match what was expected here");
+                var i: u32 = 0;
+                while (i < len) : (i += 1) _ = try self.chunk.emitWithOperand(self.allocator, .load_local, local.slot + i);
+            },
+            .call => |c| {
+                const info = try self.compileCallCommon(c);
+                const ret_spec = info.return_array_size orelse return self.fail(invalid_err, c.name, "function call does not return an array");
+                const ret_len = switch (ret_spec) {
+                    .fixed => |n| n,
+                    .generic => return self.fail(invalid_err, c.name, "a generic (unsized) array can't be used where a fixed-size array is required"),
+                };
+                if (ret_len != expected_len) return self.fail(SemanticError.ArrayLengthMismatch, c.name, "the called function's returned array length does not match what was expected here");
+            },
+            else => return self.fail(invalid_err, "", invalid_msg),
+        }
+    }
+
+    fn compileArrayArgument(self: *Compiler, arg: *const ast.Expr, expected_len: u32) CompileError!void {
+        try self.compileArrayValue(arg, expected_len, SemanticError.InvalidArrayArgument, "an array argument must be a bare array name or a call to an array-returning function");
+    }
+
+    fn compileArrayReturn(self: *Compiler, expr: *const ast.Expr, expected_len: u32) CompileError!void {
+        try self.compileArrayValue(expr, expected_len, SemanticError.InvalidArrayReturn, "a returned array must be a bare array name or a call to an array-returning function");
+    }
+
+    /// A generic array argument — passed BY REFERENCE, never copied. This
+    /// is always safe regardless of where the reference points, because
+    /// the callee only ever uses it for the duration of this (nested,
+    /// shorter-lived) call: the frame owning the referenced slots — whether
+    /// that's a fixed local right here, or some ancestor frame further up
+    /// the call stack that an already-generic local's reference points
+    /// into — is guaranteed to still be alive for as long as this call runs
+    /// (ISA.bnf section 6's generic-array addendum). Two forms:
+    ///   - a bare FIXED array name: synthesizes a fresh reference via
+    ///     MAKE_ARRAY_REF, pointing at this frame's own slots.
+    ///   - a bare GENERIC array name, or a call to a generic-returning
+    ///     function: the reference already exists as a single value —
+    ///     forward it as-is (LOAD_LOCAL, or just leave the call's own
+    ///     result sitting there).
+    /// Passing a call's FIXED-size result directly isn't supported (its
+    /// values land in a transient stack position with no local slot to
+    /// anchor a reference to) — assign it to a local array first.
+    fn compileGenericArrayArgument(self: *Compiler, arg: *const ast.Expr) CompileError!void {
+        switch (arg.*) {
+            .variable => |name| {
+                const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
+                const spec = local.array orelse return self.fail(SemanticError.InvalidArrayArgument, name, "not an array");
+                switch (spec) {
+                    .fixed => |len| _ = try self.chunk.emitWithOperand(self.allocator, .make_array_ref, chunk_mod.packIndexOperand(local.slot, len)),
+                    .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_local, local.slot),
+                }
+            },
+            .call => |c| {
+                const info = try self.compileCallCommon(c);
+                const ret_spec = info.return_array_size orelse return self.fail(SemanticError.InvalidArrayArgument, c.name, "function call does not return an array");
+                switch (ret_spec) {
+                    .generic => {}, // already exactly one reference value on the stack
+                    .fixed => return self.fail(SemanticError.InvalidArrayArgument, c.name, "a fixed-size array result can't be forwarded directly into a generic array argument — assign it to a local array first"),
+                }
+            },
+            else => return self.fail(SemanticError.InvalidArrayArgument, "", "an array argument must be a bare array name or a call to an array-returning function"),
+        }
+    }
+
+    /// A generic array return — the one place references need a real
+    /// soundness rule, since RET hands the reference to a caller who will
+    /// keep using it after THIS frame is gone. Unlike an argument (used
+    /// only during the callee's own, strictly shorter-lived call), a
+    /// freshly-synthesized reference into this function's own frame —
+    /// whether from a body-local or from one of its own FIXED array
+    /// parameters, no difference — would dangle the instant this function
+    /// returns and its frame's slots are reused. The only sound thing to
+    /// return is a reference this function did NOT create: one it already
+    /// received as a GENERIC parameter (or forwarded from a nested call
+    /// that itself only ever forwards, by the same rule, all the way back
+    /// to wherever it was first synthesized as some ancestor's call
+    /// argument — see `compileGenericArrayArgument`).
+    fn compileGenericArrayReturn(self: *Compiler, expr: *const ast.Expr) CompileError!void {
+        switch (expr.*) {
+            .variable => |name| {
+                const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
+                const spec = local.array orelse return self.fail(SemanticError.InvalidArrayReturn, name, "a returned array must be a bare array name or a call to a generic-array-returning function");
+                switch (spec) {
+                    .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_local, local.slot),
+                    .fixed => return self.fail(SemanticError.EscapingArrayReference, name, "cannot return a reference to this function's own array — its storage doesn't outlive the call; only a generic array received as a parameter (or forwarded from one) can be returned"),
+                }
+            },
+            .call => |c| {
+                const info = try self.compileCallCommon(c);
+                const ret_spec = info.return_array_size orelse return self.fail(SemanticError.InvalidArrayReturn, c.name, "function call does not return an array");
+                switch (ret_spec) {
+                    .generic => {}, // already exactly one reference value on the stack
+                    .fixed => return self.fail(SemanticError.EscapingArrayReference, c.name, "a fixed-size array result can't be forwarded as a generic return — its storage doesn't outlive this call either"),
+                }
+            },
+            else => return self.fail(SemanticError.InvalidArrayReturn, "", "a returned array must be a bare array name or a call to a generic-array-returning function"),
+        }
     }
 
     /// A function is callable from wherever `self.current_module` is right
@@ -504,29 +742,60 @@ pub const Compiler = struct {
 
     fn emitLocalOp(self: *Compiler, name: []const u8, op: OpCode) CompileError!usize {
         const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
-        if (local.array_len != null) return self.fail(SemanticError.ArrayUsedAsScalar, name, "an array must be indexed, not used as a plain value");
+        if (local.array != null) return self.fail(SemanticError.ArrayUsedAsScalar, name, "an array must be indexed, not used as a plain value");
         return self.chunk.emitWithOperand(self.allocator, op, local.slot);
     }
 
-    /// `arr[i]` reads: compiles the index expression, then LOAD_INDEX with
-    /// the array's compile-time-known base slot and length packed into the
-    /// operand (ISA.bnf section 3) so the VM can bounds-check at runtime.
+    /// `arr[i]` reads. For a FIXED-size local: LOAD_INDEX with the array's
+    /// compile-time-known base slot and length packed into the operand
+    /// (ISA.bnf section 3) so the VM can bounds-check at runtime. For a
+    /// GENERIC local: LOAD_INDEX_REF instead, whose operand is just the
+    /// slot holding the reference itself — the base and length aren't
+    /// known until runtime, read out of the reference value there (ISA.bnf
+    /// section 6's generic-array addendum).
     fn compileIndex(self: *Compiler, ix: ast.Expr.Index) CompileError!void {
         const local = self.resolveLocal(ix.name) orelse return self.fail(SemanticError.UndefinedVariable, ix.name, "undefined variable");
-        const len = local.array_len orelse return self.fail(SemanticError.NotAnArray, ix.name, "not an array");
+        const spec = local.array orelse return self.fail(SemanticError.NotAnArray, ix.name, "not an array");
         try self.compileExpr(ix.index);
-        _ = try self.chunk.emitWithOperand(self.allocator, .load_index, chunk_mod.packIndexOperand(local.slot, len));
+        switch (spec) {
+            .fixed => |len| _ = try self.chunk.emitWithOperand(self.allocator, .load_index, chunk_mod.packIndexOperand(local.slot, len)),
+            .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_index_ref, local.slot),
+        }
     }
 
     /// `arr[i] := value`: the index must be compiled before the value so
-    /// the runtime stack order matches STORE_INDEX's stack effect
-    /// `( index v -- v )` (ISA.bnf section 3).
+    /// the runtime stack order matches STORE_INDEX/STORE_INDEX_REF's stack
+    /// effect `( index v -- v )` (ISA.bnf section 3). Fixed vs. generic
+    /// dispatch mirrors `compileIndex`.
     fn compileIndexAssign(self: *Compiler, ia: ast.Expr.IndexAssign) CompileError!void {
         const local = self.resolveLocal(ia.name) orelse return self.fail(SemanticError.UndefinedVariable, ia.name, "undefined variable");
-        const len = local.array_len orelse return self.fail(SemanticError.NotAnArray, ia.name, "not an array");
+        const spec = local.array orelse return self.fail(SemanticError.NotAnArray, ia.name, "not an array");
         try self.compileExpr(ia.index);
         try self.compileExpr(ia.value);
-        _ = try self.chunk.emitWithOperand(self.allocator, .store_index, chunk_mod.packIndexOperand(local.slot, len));
+        switch (spec) {
+            .fixed => |len| _ = try self.chunk.emitWithOperand(self.allocator, .store_index, chunk_mod.packIndexOperand(local.slot, len)),
+            .generic => _ = try self.chunk.emitWithOperand(self.allocator, .store_index_ref, local.slot),
+        }
+    }
+
+    /// `len(arr)` on a FIXED-size local compiles to a plain PUSH_CONST of
+    /// its declared size — no runtime check at all, since that length is
+    /// fixed at compile time and never changes (GRAMMAR.bnf design note
+    /// 3e). On a GENERIC local, the length genuinely isn't known until
+    /// runtime (it depends on whatever array the caller actually passed),
+    /// so this instead emits LOAD_REF_LEN, which reads it out of the
+    /// reference value at runtime (ISA.bnf section 6's generic-array
+    /// addendum).
+    fn compileLenOf(self: *Compiler, name: []const u8) CompileError!void {
+        const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
+        const spec = local.array orelse return self.fail(SemanticError.NotAnArray, name, "not an array");
+        switch (spec) {
+            .fixed => |len| {
+                const idx = try self.chunk.addConstant(self.allocator, .{ .int = @intCast(len) });
+                _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+            },
+            .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_ref_len, local.slot),
+        }
     }
 
     fn compileBinary(self: *Compiler, b: ast.Expr.Binary) CompileError!void {
@@ -967,6 +1236,60 @@ test "using an array's bare name as a scalar value is a compile error" {
     try std.testing.expectError(CompileError.ArrayUsedAsScalar, compiler.compileProgram(program));
 }
 
+test "len(arr) compiles to the array's declared size" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int[5] arr
+        \\print len(arr)
+    , &buf);
+    try std.testing.expectEqualStrings("5\n", output);
+}
+
+test "len(arr) can drive a for-loop's bound instead of a hardcoded size" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int[4] arr := [1, 2, 3, 4]
+        \\int total := 0
+        \\for i in 0..len(arr) {
+        \\    total := total + arr[i]
+        \\}
+        \\print total
+    , &buf);
+    try std.testing.expectEqualStrings("10\n", output);
+}
+
+test "len() on a non-array local is a compile error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init("int x := 1\nprint len(x)\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.NotAnArray, compiler.compileProgram(program));
+}
+
+test "len() on an undeclared name is a compile error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init("print len(nope)\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.UndefinedVariable, compiler.compileProgram(program));
+}
+
 test "an array literal outside a matching array declaration is a compile error" {
     const allocator = std.testing.allocator;
     var lex = lexer_mod.Lexer.init("print [1, 2, 3]\n");
@@ -1082,6 +1405,362 @@ test "a recursive function's local array is isolated per call frame" {
     , &buf);
     // n=2: pair=[2,4]=6 + n=1: pair=[1,2]=3 + n=0: pair=[0,0]=0  => 9
     try std.testing.expectEqualStrings("9\n", output);
+}
+
+test "a function can take an array parameter and sum its elements" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func sum(int[4] arr) -> int {
+        \\    int total := 0
+        \\    for i in 0..len(arr) {
+        \\        total := total + arr[i]
+        \\    }
+        \\    return total
+        \\}
+        \\int[4] nums := [1, 2, 3, 4]
+        \\print sum(nums)
+    , &buf);
+    try std.testing.expectEqualStrings("10\n", output);
+}
+
+test "an array parameter is passed by value: mutating it inside the function doesn't affect the caller's array" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func zeroOut(int[3] arr) -> int {
+        \\    arr[0] := 0
+        \\    return arr[0]
+        \\}
+        \\int[3] nums := [1, 2, 3]
+        \\print zeroOut(nums)
+        \\print nums[0]
+    , &buf);
+    try std.testing.expectEqualStrings("0\n1\n", output);
+}
+
+test "a function can return an array, assigned directly into a matching array declaration" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func makePair(int a, int b) -> int[2] {
+        \\    int[2] result := [a, b]
+        \\    return result
+        \\}
+        \\int[2] p := makePair(3, 4)
+        \\print p[0]
+        \\print p[1]
+    , &buf);
+    try std.testing.expectEqualStrings("3\n4\n", output);
+}
+
+test "an array-returning function may take an array parameter too (transform-and-return)" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func doubleAll(int[3] arr) -> int[3] {
+        \\    int[3] result
+        \\    for i in 0..3 {
+        \\        result[i] := arr[i] * 2
+        \\    }
+        \\    return result
+        \\}
+        \\int[3] nums := [1, 2, 3]
+        \\int[3] doubled := doubleAll(nums)
+        \\print doubled[0]
+        \\print doubled[1]
+        \\print doubled[2]
+    , &buf);
+    try std.testing.expectEqualStrings("2\n4\n6\n", output);
+}
+
+test "an array-returning call can compose directly as another array-returning function's argument" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func doubleAll(int[2] arr) -> int[2] {
+        \\    int[2] result := [arr[0] * 2, arr[1] * 2]
+        \\    return result
+        \\}
+        \\func sum(int[2] arr) -> int {
+        \\    return arr[0] + arr[1]
+        \\}
+        \\int[2] nums := [3, 4]
+        \\print sum(doubleAll(nums))
+    , &buf);
+    try std.testing.expectEqualStrings("14\n", output);
+}
+
+test "a recursive function may take and return arrays, each call frame isolated" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func addN(int[2] arr, int n) -> int[2] {
+        \\    if n == 0 {
+        \\        return arr
+        \\    }
+        \\    int[2] bumped := [arr[0] + 1, arr[1] + 1]
+        \\    return addN(bumped, n - 1)
+        \\}
+        \\int[2] start := [0, 0]
+        \\int[2] result := addN(start, 3)
+        \\print result[0]
+        \\print result[1]
+        \\print start[0]
+    , &buf);
+    try std.testing.expectEqualStrings("3\n3\n0\n", output);
+}
+
+test "falling off the end of an array-returning function yields a zero-filled array" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func noop() -> int[2] {
+        \\    int x := 1
+        \\}
+        \\int[2] r := noop()
+        \\print r[0]
+        \\print r[1]
+    , &buf);
+    try std.testing.expectEqualStrings("0\n0\n", output);
+}
+
+test "an array argument's length must match the parameter's declared size" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\func sum(int[4] arr) -> int {
+        \\    return arr[0]
+        \\}
+        \\int[3] nums := [1, 2, 3]
+        \\print sum(nums)
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.ArrayLengthMismatch, compiler.compileProgram(program));
+}
+
+test "passing a non-array-name expression as an array argument is a compile error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\func sum(int[3] arr) -> int {
+        \\    return arr[0]
+        \\}
+        \\print sum(1 + 2)
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.InvalidArrayArgument, compiler.compileProgram(program));
+}
+
+test "returning a non-array-name expression from an array-returning function is a compile error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\func f() -> int[2] {
+        \\    return 1 + 2
+        \\}
+        \\int[2] r := f()
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.InvalidArrayReturn, compiler.compileProgram(program));
+}
+
+test "using an array-returning call as a plain scalar value is a compile error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\func pair() -> int[2] {
+        \\    int[2] r := [1, 2]
+        \\    return r
+        \\}
+        \\print pair()
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.ArrayUsedAsScalar, compiler.compileProgram(program));
+}
+
+test "a generic array parameter accepts fixed-size arrays of different lengths" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func sum(int[] arr) -> int {
+        \\    int total := 0
+        \\    for i in 0..len(arr) {
+        \\        total := total + arr[i]
+        \\    }
+        \\    return total
+        \\}
+        \\int[4] a := [1, 2, 3, 4]
+        \\int[3] b := [10, 20, 30]
+        \\print sum(a)
+        \\print sum(b)
+    , &buf);
+    try std.testing.expectEqualStrings("10\n60\n", output);
+}
+
+test "len() on a generic array parameter is a runtime read, reflecting the actual argument's length" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func report(int[] arr) -> int {
+        \\    return len(arr)
+        \\}
+        \\int[2] a := [1, 2]
+        \\int[5] b := [1, 2, 3, 4, 5]
+        \\print report(a)
+        \\print report(b)
+    , &buf);
+    try std.testing.expectEqualStrings("2\n5\n", output);
+}
+
+test "a generic array parameter is passed by reference: mutations are visible to the caller" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func zeroOut(int[] arr) -> int {
+        \\    arr[0] := 0
+        \\    return arr[0]
+        \\}
+        \\int[3] nums := [1, 2, 3]
+        \\print zeroOut(nums)
+        \\print nums[0]
+    , &buf);
+    try std.testing.expectEqualStrings("0\n0\n", output);
+}
+
+test "a generic array return forwards the caller's own array by reference" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func identity(int[] arr) -> int[] {
+        \\    return arr
+        \\}
+        \\func sum(int[] arr) -> int {
+        \\    int total := 0
+        \\    for i in 0..len(arr) {
+        \\        total := total + arr[i]
+        \\    }
+        \\    return total
+        \\}
+        \\int[3] nums := [1, 2, 3]
+        \\print sum(identity(nums))
+    , &buf);
+    try std.testing.expectEqualStrings("6\n", output);
+}
+
+test "a generic function may call another generic function recursively over the same array" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func sumFrom(int[] arr, int i) -> int {
+        \\    if i == len(arr) {
+        \\        return 0
+        \\    }
+        \\    return arr[i] + sumFrom(arr, i + 1)
+        \\}
+        \\int[4] nums := [1, 2, 3, 4]
+        \\print sumFrom(nums, 0)
+    , &buf);
+    try std.testing.expectEqualStrings("10\n", output);
+}
+
+test "returning a reference to this function's own fixed-size local array is a compile error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\func makeDangling() -> int[] {
+        \\    int[3] local := [1, 2, 3]
+        \\    return local
+        \\}
+        \\func wrapper() -> int[] {
+        \\    return makeDangling()
+        \\}
+        \\print 1
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.EscapingArrayReference, compiler.compileProgram(program));
+}
+
+test "forwarding a fixed-size array result as a generic return is a compile error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\func makeFixed() -> int[3] {
+        \\    int[3] local := [1, 2, 3]
+        \\    return local
+        \\}
+        \\func wrapper() -> int[] {
+        \\    return makeFixed()
+        \\}
+        \\print 1
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.EscapingArrayReference, compiler.compileProgram(program));
+}
+
+test "passing a generic array where a fixed size is required is a compile error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\func needsFixed(int[3] arr) -> int {
+        \\    return arr[0]
+        \\}
+        \\func wrapper(int[] arr) -> int {
+        \\    return needsFixed(arr)
+        \\}
+        \\print 1
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.InvalidArrayArgument, compiler.compileProgram(program));
 }
 
 test "compileModules: a module may call an exported function from a directly imported module" {

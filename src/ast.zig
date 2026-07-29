@@ -41,9 +41,25 @@ pub const Literal = union(enum) {
     boolean: bool,
 };
 
+/// A parameter's or a function's return type's optional array-ness: either
+/// a fixed compile-time size (passed/returned by VALUE, a copy — see
+/// GRAMMAR.bnf design note 3e) or `generic` (no declared size — passed by
+/// REFERENCE instead, a single runtime `Value.array_ref` pointing at
+/// whatever array the caller actually supplies, of whatever length it
+/// happens to have — see design note 3e's generic-array addendum). Local
+/// var-declarations don't get this: `ast.Stmt.VarDecl.array_len` stays a
+/// plain `?u32`, since a local's own storage is always something concrete
+/// this compiler allocated slots for, never a reference to someone else's.
+pub const ArraySpec = union(enum) {
+    fixed: u32,
+    generic,
+};
+
 pub const Param = struct {
     type: ValueType,
     name: []const u8,
+    /// null for a plain scalar parameter; see `ArraySpec` otherwise.
+    array_size: ?ArraySpec = null,
 };
 
 pub const Expr = union(enum) {
@@ -57,6 +73,9 @@ pub const Expr = union(enum) {
     array_literal: []*Expr,
     index: Index,
     index_assign: IndexAssign,
+    /// `len(IDENTIFIER)` — only ever a bare array name, matching `Index`'s
+    /// restriction to bare identifiers (no chained/computed targets).
+    len_of: []const u8,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -134,6 +153,8 @@ pub const Stmt = union(enum) {
         name: []const u8,
         params: []Param,
         return_type: ValueType,
+        /// null for a plain scalar return type; see `ArraySpec` otherwise.
+        return_array_size: ?ArraySpec = null,
         body: []Stmt,
         /// Whether this function is callable from a file that imports this
         /// one (see GRAMMAR.bnf design note h). Irrelevant for calls from
@@ -229,6 +250,7 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try printExpr(writer, ia.value);
             try writer.writeAll(")");
         },
+        .len_of => |name| try writer.print("(len {s})", .{name}),
     }
 }
 
@@ -249,6 +271,13 @@ fn binaryOpLexeme(op: BinaryOp) []const u8 {
         .logic_or => "or",
         .logic_and => "and",
     };
+}
+
+fn printArraySpecSuffix(writer: *std.Io.Writer, spec: ArraySpec) std.Io.Writer.Error!void {
+    switch (spec) {
+        .fixed => |n| try writer.print("[{d}]", .{n}),
+        .generic => try writer.writeAll("[]"),
+    }
 }
 
 fn valueTypeName(t: ValueType) []const u8 {
@@ -311,7 +340,15 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
         .expr_stmt => |e| try printExpr(writer, e),
         .function_decl => |f| {
             const prefix = if (f.exported) "export " else "";
-            try writer.print("({s}func {s} ({s})\n", .{ prefix, f.name, valueTypeName(f.return_type) });
+            try writer.print("({s}func {s} (", .{ prefix, f.name });
+            for (f.params, 0..) |p, i| {
+                if (i > 0) try writer.writeAll(" ");
+                try writer.writeAll(valueTypeName(p.type));
+                if (p.array_size) |spec| try printArraySpecSuffix(writer, spec);
+            }
+            try writer.print(") {s}", .{valueTypeName(f.return_type)});
+            if (f.return_array_size) |spec| try printArraySpecSuffix(writer, spec);
+            try writer.writeAll(")\n");
             for (f.body) |*s| {
                 try printStmt(writer, s, depth + 1);
                 try writer.writeAll("\n");

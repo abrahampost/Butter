@@ -168,8 +168,17 @@ pub const Parser = struct {
     }
 
     /// <function-decl> ::= 'func' IDENTIFIER '(' [ <param-list> ] ')'
-    ///                     '->' <type> <block>
-    /// <param-list>    ::= <type> IDENTIFIER { ',' <type> IDENTIFIER }
+    ///                     '->' <type> [ '[' [ INT ] ']' ] <block>
+    /// <param-list>    ::= <param> { ',' <param> }
+    /// <param>         ::= <type> [ '[' [ INT ] ']' ] IDENTIFIER
+    ///
+    /// A parameter's or the return type's optional array suffix comes in
+    /// two forms: `'[' INT ']'` (a fixed size, passed/returned by value —
+    /// same syntax `varDeclaration` uses) or bare `'[' ']'` (no declared
+    /// size — passed/returned by reference instead, see GRAMMAR.bnf design
+    /// note 3e's generic-array addendum). Local var-declarations don't get
+    /// the bare-`[]` form; `varDeclaration` still only ever calls
+    /// `parseOptionalArraySize`, not this.
     ///
     /// `exported` is whatever `topLevelDeclaration` determined from an
     /// optional leading 'export' keyword, which this function itself never
@@ -183,14 +192,16 @@ pub const Parser = struct {
         if (!self.check(.rparen)) {
             while (true) {
                 const param_type = try self.parseType();
+                const param_array_size = try self.parseArraySpec();
                 const param_name = try self.expect(.identifier, "expected a parameter name");
-                try params.append(self.allocator(), .{ .type = param_type, .name = param_name.lexeme });
+                try params.append(self.allocator(), .{ .type = param_type, .name = param_name.lexeme, .array_size = param_array_size });
                 if (!self.match(.comma)) break;
             }
         }
         _ = try self.expect(.rparen, "expected ')' after parameters");
         _ = try self.expect(.arrow, "expected '->' before return type");
         const return_type = try self.parseType();
+        const return_array_size = try self.parseArraySpec();
 
         const body_stmt = try self.block();
 
@@ -198,23 +209,39 @@ pub const Parser = struct {
             .name = name_tok.lexeme,
             .params = try params.toOwnedSlice(self.allocator()),
             .return_type = return_type,
+            .return_array_size = return_array_size,
             .body = body_stmt.block,
             .exported = exported,
         } };
+    }
+
+    /// `[ '[' INT ']' ]` — used by `varDeclaration`, which only ever
+    /// allows a fixed size (local arrays are never generic).
+    fn parseOptionalArraySize(self: *Parser) Error!?u32 {
+        if (!self.match(.lbracket)) return null;
+        const size_tok = try self.expect(.int, "expected an array size");
+        const size = std.fmt.parseInt(u32, size_tok.lexeme, 10) catch return self.fail("array size is too large");
+        _ = try self.expect(.rbracket, "expected ']' after array size");
+        return size;
+    }
+
+    /// `[ '[' [ INT ] ']' ]` — used by a parameter's type and a function's
+    /// return type, where a bare `[]` (no INT) is also legal and means
+    /// "generic, no fixed size" (`ast.ArraySpec.generic`).
+    fn parseArraySpec(self: *Parser) Error!?ast.ArraySpec {
+        if (!self.match(.lbracket)) return null;
+        if (self.match(.rbracket)) return .generic;
+        const size_tok = try self.expect(.int, "expected an array size or ']' for a generic array");
+        const size = std.fmt.parseInt(u32, size_tok.lexeme, 10) catch return self.fail("array size is too large");
+        _ = try self.expect(.rbracket, "expected ']' after array size");
+        return ast.ArraySpec{ .fixed = size };
     }
 
     /// <var-declaration> ::= <type> [ '[' INT ']' ] IDENTIFIER
     ///                       [ ':=' <expression> ] <end>
     fn varDeclaration(self: *Parser) Error!ast.Stmt {
         const value_type = try self.parseType();
-
-        var array_len: ?u32 = null;
-        if (self.match(.lbracket)) {
-            const size_tok = try self.expect(.int, "expected an array size");
-            array_len = std.fmt.parseInt(u32, size_tok.lexeme, 10) catch return self.fail("array size is too large");
-            _ = try self.expect(.rbracket, "expected ']' after array size");
-        }
-
+        const array_len = try self.parseOptionalArraySize();
         const name_tok = try self.expect(.identifier, "expected a variable name");
 
         var initializer: ?*ast.Expr = null;
@@ -433,7 +460,7 @@ pub const Parser = struct {
 
     /// <primary> ::= INT | FLOAT | STRING | 'true' | 'false'
     ///            | '(' <expression> ')' | <call-expr> | <array-literal>
-    ///            | IDENTIFIER
+    ///            | <len-expr> | IDENTIFIER
     fn primary(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
         switch (tok.type) {
@@ -474,6 +501,7 @@ pub const Parser = struct {
                 return self.createExpr(.{ .grouping = inner });
             },
             .lbracket => return self.arrayLiteral(),
+            .kw_len => return self.lenExpr(),
             else => return self.fail("expected an expression"),
         }
     }
@@ -509,6 +537,21 @@ pub const Parser = struct {
         const index_expr = try self.expression();
         _ = try self.expect(.rbracket, "expected ']' after array index");
         return self.createExpr(.{ .index = .{ .name = name, .index = index_expr } });
+    }
+
+    /// <len-expr> ::= 'len' '(' IDENTIFIER ')'
+    ///
+    /// Only a bare identifier is accepted — arrays aren't first-class
+    /// expressions (GRAMMAR.bnf design note 3e), so `len(...)`'s argument
+    /// can only ever be an array's own name, never an arbitrary
+    /// expression, the same restriction `finishIndex` already places on
+    /// `arr[...]`'s target.
+    fn lenExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'len'
+        _ = try self.expect(.lparen, "expected '(' after 'len'");
+        const name_tok = try self.expect(.identifier, "expected an array name");
+        _ = try self.expect(.rparen, "expected ')' after array name");
+        return self.createExpr(.{ .len_of = name_tok.lexeme });
     }
 
     /// <array-literal> ::= '[' [ <expression> { ',' <expression> } ] ']'
@@ -768,6 +811,50 @@ test "parses a function declaration with parameters and a return type" {
     try std.testing.expectEqualStrings("a", f.body[0].return_stmt.binary.left.variable);
 }
 
+test "parses a function with an array parameter and an array return type" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\func first(int[3] arr) -> int {
+        \\    return arr[0]
+        \\}
+        \\func pair() -> int[2] {
+        \\    return arr
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const first = result.program[0].function_decl;
+    try std.testing.expectEqual(@as(usize, 1), first.params.len);
+    try std.testing.expectEqual(@as(u32, 3), first.params[0].array_size.?.fixed);
+    try std.testing.expectEqual(@as(?ast.ArraySpec, null), first.return_array_size);
+
+    const pair = result.program[1].function_decl;
+    try std.testing.expectEqual(@as(usize, 0), pair.params.len);
+    try std.testing.expectEqual(@as(u32, 2), pair.return_array_size.?.fixed);
+    try std.testing.expectEqual(ast.ValueType.int, pair.return_type);
+}
+
+test "parses a generic array parameter and a generic array return type" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\func sum(int[] arr) -> int {
+        \\    return len(arr)
+        \\}
+        \\func identity(int[] arr) -> int[] {
+        \\    return arr
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const sum_fn = result.program[0].function_decl;
+    try std.testing.expectEqual(ast.ArraySpec.generic, sum_fn.params[0].array_size.?);
+    try std.testing.expectEqual(@as(?ast.ArraySpec, null), sum_fn.return_array_size);
+
+    const identity_fn = result.program[1].function_decl;
+    try std.testing.expectEqual(ast.ArraySpec.generic, identity_fn.params[0].array_size.?);
+    try std.testing.expectEqual(ast.ArraySpec.generic, identity_fn.return_array_size.?);
+}
+
 test "a function with no parameters parses an empty param list" {
     const allocator = std.testing.allocator;
     var result = try parseProgramSource(allocator,
@@ -883,6 +970,22 @@ test "parses a for loop over a range" {
     try std.testing.expectEqual(@as(i64, 0), f.start.literal.int);
     try std.testing.expectEqual(@as(i64, 3), f.end.literal.int);
     try std.testing.expectEqual(@as(usize, 1), f.body.block.len);
+}
+
+test "parses len(...) with a bare array name" {
+    try expectExprSexpr("len(arr)", "(len arr)");
+}
+
+test "len(...) requires a bare identifier, not an arbitrary expression" {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init("len(1 + 2)");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.expression());
 }
 
 test "parses an import declaration" {

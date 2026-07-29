@@ -1,10 +1,10 @@
 int[5] squares
-for i in 0..5 {
+for i in 0..len(squares) {
     squares[i] := i * i
 }
 
 int total := 0
-for i in 0..5 {
+for i in 0..len(squares) {
     print squares[i]
     total := total + squares[i]
 }

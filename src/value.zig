@@ -1,18 +1,33 @@
 //! Runtime value representation for the Butter VM (ISA.bnf, section 2).
 //!
-//! Every value is either a plain scalar or a string slice borrowed from a
-//! Chunk's constant pool. Butter has no string concatenation and no
-//! arrays/collections (GRAMMAR.bnf section 3f), so no `Value` a running
-//! program can produce is ever heap-allocated at run time: there is
-//! nothing here for a garbage collector to do.
+//! Every value is either a plain scalar, a string slice borrowed from a
+//! Chunk's constant pool, or an `array_ref` — a reference to a generic
+//! (unsized) array parameter's underlying slots, still living somewhere
+//! else on the VM's own value stack (ISA.bnf section 6's generic-array
+//! addendum), never on a heap. Butter has no string concatenation and no
+//! growable/heap-allocated collections, so no `Value` a running program
+//! can produce is ever heap-allocated at run time: there is nothing here
+//! for a garbage collector to do.
 
 const std = @import("std");
+
+/// A generic array parameter's runtime representation: `base` is an
+/// absolute index into the VM's `stack` array (not frame-relative — it's
+/// computed once, at the point the reference is created, from whichever
+/// frame's `bp` the referenced array actually lives in) where the
+/// referenced array's first element lives, and `len` is its length. This
+/// is the only reference-like value in the language; it is never
+/// null/dangling by construction — see the compiler's escape rule
+/// (`compiler.zig`'s generic-array-return handling) for why a reference
+/// can never outlive the frame it points into.
+pub const ArrayRef = struct { base: u32, len: u32 };
 
 pub const Value = union(enum) {
     int: i64,
     float: f64,
     boolean: bool,
     string: []const u8,
+    array_ref: ArrayRef,
 
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
@@ -20,6 +35,7 @@ pub const Value = union(enum) {
             .float => "float",
             .boolean => "bool",
             .string => "string",
+            .array_ref => "array",
         };
     }
 
@@ -49,6 +65,11 @@ pub const Value = union(enum) {
             .int, .float => false, // one operand numeric, the other not
             .boolean => |av| b == .boolean and av == b.boolean,
             .string => |av| b == .string and std.mem.eql(u8, av, b.string),
+            // Never reachable from surfaceable Butter syntax (a generic
+            // array reference can only ever be indexed, measured with
+            // `len`, or forwarded — never compared) but Value must still
+            // define eql for every pair to keep this switch exhaustive.
+            .array_ref => |av| b == .array_ref and av.base == b.array_ref.base and av.len == b.array_ref.len,
         };
     }
 
@@ -58,6 +79,9 @@ pub const Value = union(enum) {
             .float => |v| try writer.print("{d}", .{v}),
             .boolean => |v| try writer.print("{}", .{v}),
             .string => |v| try writer.writeAll(v),
+            // Not reachable from surfaceable Butter syntax either (see the
+            // `eql` note above) — kept only so this switch stays exhaustive.
+            .array_ref => try writer.writeAll("<array>"),
         }
     }
 };

@@ -22,11 +22,14 @@ const frames_max = 256;
 
 /// One suspended caller: everything needed to resume it after the callee
 /// returns (ISA.bnf section 6). `bp` here is the CALLER's own base
-/// pointer, restored on return — not the callee's.
+/// pointer, restored on return — not the callee's. `return_width` is
+/// likewise the CALLER's own return width, restored so a nested call's RET
+/// doesn't clobber how many slots the outer call's eventual RET will copy.
 const Frame = struct {
     chunk: *const Chunk,
     ip: usize,
     bp: usize,
+    return_width: usize,
 };
 
 /// No allocator is needed at run time (section 2 of ISA.bnf): the stack is
@@ -172,6 +175,7 @@ pub const Vm = struct {
         var chunk: *const Chunk = &program.main;
         var ip: usize = 0;
         var bp: usize = 0;
+        var return_width: usize = 1;
 
         while (true) {
             const instr = chunk.code.items[ip];
@@ -200,6 +204,34 @@ pub const Vm = struct {
                     if (idx_val.int < 0 or idx_val.int >= idx.length) return RuntimeError.IndexOutOfBounds;
                     self.stack[bp + idx.slot + @as(usize, @intCast(idx_val.int))] = v;
                     try self.push(v);
+                },
+
+                .make_array_ref => {
+                    const idx = chunk_mod.unpackIndexOperand(instr.operand);
+                    try self.push(.{ .array_ref = .{ .base = @intCast(bp + idx.slot), .len = idx.length } });
+                },
+                .load_index_ref => {
+                    const idx_val = try self.pop();
+                    if (idx_val != .int) return RuntimeError.TypeMismatch;
+                    const ref = self.stack[bp + instr.operand];
+                    if (ref != .array_ref) return RuntimeError.TypeMismatch;
+                    if (idx_val.int < 0 or idx_val.int >= ref.array_ref.len) return RuntimeError.IndexOutOfBounds;
+                    try self.push(self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))]);
+                },
+                .store_index_ref => {
+                    const v = try self.pop();
+                    const idx_val = try self.pop();
+                    if (idx_val != .int) return RuntimeError.TypeMismatch;
+                    const ref = self.stack[bp + instr.operand];
+                    if (ref != .array_ref) return RuntimeError.TypeMismatch;
+                    if (idx_val.int < 0 or idx_val.int >= ref.array_ref.len) return RuntimeError.IndexOutOfBounds;
+                    self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))] = v;
+                    try self.push(v);
+                },
+                .load_ref_len => {
+                    const ref = self.stack[bp + instr.operand];
+                    if (ref != .array_ref) return RuntimeError.TypeMismatch;
+                    try self.push(.{ .int = ref.array_ref.len });
                 },
 
                 .add => try self.add(),
@@ -248,21 +280,31 @@ pub const Vm = struct {
                 .call => {
                     if (frame_count >= frames_max) return RuntimeError.CallStackOverflow;
                     const func = &program.functions[instr.operand];
-                    frames[frame_count] = .{ .chunk = chunk, .ip = ip, .bp = bp };
+                    frames[frame_count] = .{ .chunk = chunk, .ip = ip, .bp = bp, .return_width = return_width };
                     frame_count += 1;
                     bp = self.sp - func.arity;
                     chunk = &func.chunk;
                     ip = 0;
+                    return_width = func.return_width;
                 },
                 .ret => {
-                    const result = try self.pop();
+                    // Generalizes pop-then-push of a single scalar to `return_width`
+                    // slots: the return value already sits at the top of the
+                    // callee's own stack region (pushed by the return
+                    // expression), so it's copied down onto the frame's base
+                    // in place rather than popped into a temporary — this is
+                    // the same move for width 1 as the old pop/push was.
+                    const src_start = self.sp - return_width;
+                    var i: usize = 0;
+                    while (i < return_width) : (i += 1) self.stack[bp + i] = self.stack[src_start + i];
+                    self.sp = bp + return_width;
+
                     frame_count -= 1;
                     const frame = frames[frame_count];
-                    self.sp = bp;
-                    try self.push(result);
                     chunk = frame.chunk;
                     ip = frame.ip;
                     bp = frame.bp;
+                    return_width = frame.return_width;
                 },
 
                 .print => {

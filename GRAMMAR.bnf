@@ -40,6 +40,7 @@ EOF          ::= (* end of input *)
 KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'true' | 'false' | 'int' | 'float' | 'bool' | 'string'
                | 'func' | 'return' | 'for' | 'in' | 'import' | 'export'
+               | 'len'
 
 (* Operators and punctuation *)
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
@@ -80,11 +81,20 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <statement>
 
 (* 'export' is only ever legal directly before 'func' — 'export int x' is
-   a parse error, not a quietly-ignored no-op (design note 3h). *)
+   a parse error, not a quietly-ignored no-op (design note 3h). A
+   parameter's or the return type's optional array suffix opts it into an
+   array instead of a plain scalar — '[' INT ']' for a fixed size (passed
+   by VALUE, a copy) or bare '[' ']' for a generic/unsized array (passed by
+   REFERENCE instead) — see design note 3e, updated twice now: arrays cross
+   a call boundary at all, and (note 3e's "j" addendum) a size-less `[]`
+   form exists specifically so a function doesn't have to be written once
+   per array length. *)
 <function-decl>     ::= 'func' IDENTIFIER '(' [ <param-list> ] ')'
-                         '->' <type> <block>
+                         '->' <type> [ '[' [ INT ] ']' ] <block>
 
-<param-list>        ::= <type> IDENTIFIER { ',' <type> IDENTIFIER }
+<param-list>        ::= <param> { ',' <param> }
+
+<param>             ::= <type> [ '[' [ INT ] ']' ] IDENTIFIER
 
 (* `path` is an arbitrary STRING, resolved relative to the *importing*
    file's own directory (design note 3h) — never relative to the entry
@@ -168,6 +178,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <call-expr>
                       | <array-literal>
                       | <index-expr>
+                      | <len-expr>
                       | IDENTIFIER
 
 <call-expr>         ::= IDENTIFIER '(' [ <arg-list> ] ')'
@@ -179,6 +190,11 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <array-literal>     ::= '[' [ <expression> { ',' <expression> } ] ']'
 
 <index-expr>        ::= IDENTIFIER '[' <expression> ']'
+
+(* Only ever a bare IDENTIFIER, not an arbitrary expression — same
+   restriction as <index-expr>'s target, and for the same reason: arrays
+   aren't first-class values to compute one from (design note 3e). *)
+<len-expr>          ::= 'len' '(' IDENTIFIER ')'
 
 
 (* --------------------------------------------------------------------------
@@ -227,20 +243,42 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 (* --- Arrays (language-growth addition, not a "fix") ---------------------
 
-   e) FIXED SIZE, NO NESTING, CAN'T CROSS A CALL BOUNDARY. An array's size
-      is a compile-time-known INT literal, not an arbitrary expression —
-      arrays never grow, shrink, or get reallocated at runtime (ISA.bnf
-      section 2 explains why: they're just consecutive stack slots, and
-      there is still no heap or garbage collector anywhere in this VM).
-      There is no array-of-arrays (an array's element type is always a
-      plain scalar type), and — matching how a function body can't see a
-      top-level variable (note b above) — an array cannot be passed as a
-      function argument or returned from one; only scalars cross a call
-      boundary today. An array literal (`[e1, e2, ...]`) is only valid as
-      the initializer of an array declaration whose declared size matches
-      the literal's element count exactly; using one anywhere else (as a
-      bare expression, a call argument, and so on) is a compile error, the
-      same category of error as an arity mismatch.
+   e) FIXED SIZE, NO NESTING, PASSED BY VALUE ACROSS A CALL BOUNDARY. An
+      array's size is a compile-time-known INT literal, not an arbitrary
+      expression — arrays never grow, shrink, or get reallocated at runtime
+      (ISA.bnf section 2 explains why: they're just consecutive stack
+      slots, and there is still no heap or garbage collector anywhere in
+      this VM). There is no array-of-arrays (an array's element type is
+      always a plain scalar type). An array literal (`[e1, e2, ...]`) is
+      only valid as the initializer of an array declaration whose declared
+      size matches the literal's element count exactly; using one anywhere
+      else (as a bare expression, a call argument, and so on) is a compile
+      error, the same category of error as an arity mismatch.
+
+      A function parameter or return type may likewise opt into a
+      fixed-size array via the same `'[' INT ']'` syntax (<param>,
+      <function-decl>), and arrays DO cross a call boundary — by value,
+      as a copy, never by reference: the callee gets its own independent
+      slots, so mutating a parameter array inside the callee never affects
+      the caller's array (ISA.bnf section 6 covers the calling-convention
+      mechanics). Because arrays still aren't first-class expressions,
+      wherever an array VALUE is needed — a call argument matching an
+      array-typed parameter, a `return` inside a function with an array
+      return type, or the initializer of an array var-declaration — the
+      expression there is restricted to exactly two forms: a bare
+      IDENTIFIER naming an array of matching length (the same restriction
+      <index-expr> and <len-expr> already place on their own target), or a
+      <call-expr> to a function whose own return type is an array of
+      matching length. This is what lets array-processing functions
+      compose (`sum(doubleAll(nums))`) without arrays ever needing to be a
+      general expression form.
+
+   e2) ARITY COUNTS PARAMETERS, NOT STACK SLOTS. Design note d's "supply
+      exactly as many arguments as the callee declares parameters" still
+      counts declared parameters one-for-one with arguments — an
+      array-typed parameter is still exactly one parameter for arity
+      purposes, even though it occupies more than one stack slot at
+      runtime (ISA.bnf section 6 draws that distinction explicitly).
 
    f) ARRAY INDEXING IS BOUNDS-CHECKED, NOT TRUSTED. Reading or writing
       `arr[i]` checks `i` is an INT and that `0 <= i < <declared size>` at
@@ -250,6 +288,70 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
       access here would otherwise corrupt an arbitrary neighboring local
       (possibly belonging to a different call frame entirely), so this
       check is load-bearing for memory safety, not a nicety.
+
+   i) `len(arr)` IS A COMPILE-TIME CONSTANT, NOT A RUNTIME QUERY. Because
+      an array's size can never change after its declaration (note e
+      above), `len(arr)` needs no runtime representation at all — it
+      resolves at compile time to the same INT literal the declaration
+      itself used, exactly as if you'd written that literal by hand (see
+      ISA.bnf section 2's array-length addendum). Like <index-expr>,
+      `len`'s argument is only ever a bare IDENTIFIER, never an arbitrary
+      expression — there is no array-valued expression to call `len` on
+      in the first place, since arrays aren't first-class values (note e).
+      This is the building block a hand-written standard-library function
+      needs to loop over an array it's handed the size of without a
+      caller having to pass the size separately — e.g.
+      `for i in 0..len(arr) { ... }` — and combined with note e's
+      by-value call-boundary passing, this is enough to write and compose
+      real array-processing functions, e.g. `sum(doubleAll(nums))` — as
+      long as every such function is written once per fixed size it
+      accepts. Note j lifts that last restriction.
+
+   j) A BARE '[]' PARAMETER OR RETURN TYPE IS GENERIC (NO FIXED SIZE) AND
+      PASSED BY REFERENCE, NOT BY VALUE. `func sum(int[] arr) -> int` binds
+      `arr` to WHATEVER array the caller actually passes, of whatever
+      length it happens to have — unlike note e's fixed-size arrays, a
+      generic array parameter is not a copy: it's a single runtime
+      reference (`ArrayRef{base, len}`, ISA.bnf section 6's generic-array
+      addendum) pointing at the caller's own slots, so `len(arr)` becomes a
+      genuine runtime read for a generic array (not the compile-time
+      constant note i describes for a fixed-size one) and mutating
+      `arr[i]` IS visible to the caller — the one place in this language
+      two names can alias the same storage. This is what makes a single
+      `sum`/`doubleAll`/etc. usable across arrays of different sizes
+      without note e's one-specialization-per-size limitation, and it does
+      so without ever introducing a heap: a reference only ever points
+      into the same fixed VM value-stack every other local already lives
+      on.
+
+      References compose but are NOT interchangeable with fixed-size
+      arrays: a call argument or `return` that needs a fixed size (note e)
+      cannot be satisfied by a generic array — its length isn't known at
+      compile time, so there is nothing to check the required size
+      against — but any array, fixed or generic, CAN be handed to a
+      generic parameter (a fixed one is automatically turned into a fresh
+      reference at the call site; a generic one is simply forwarded).
+
+      RETURNING A GENERIC ARRAY IS RESTRICTED TO WHAT'S PROVABLY SAFE. A
+      function may only `return` a generic array it did not itself
+      manufacture: a bare reference to one of its own GENERIC parameters
+      (or a nested call's own generic return, transitively), never a fresh
+      reference synthesized from one of its own fixed-size locals — even
+      one of its own fixed-size PARAMETERS. The reason is aliasing plus
+      this VM's frame-reuse: a freshly-made reference always points into
+      the CURRENT frame, which is exactly the frame about to be discarded
+      (its slots reused by whoever the caller calls next) the instant this
+      function returns — so returning one would hand the caller a
+      reference that goes stale the moment they receive it. A reference
+      that was already handed to this function as a generic parameter,
+      by contrast, points into some ANCESTOR frame further up the call
+      stack that is still alive and will remain alive for as long as this
+      function's own caller is (calls only ever nest, never overlap), so
+      forwarding it back out is always sound. Violating this — e.g.
+      `func bad() -> int[] { int[3] x := [1,2,3]  return x }` — is a
+      compile error (`CompileError.EscapingArrayReference`), not a runtime
+      one: the whole point is to catch it before it could ever produce a
+      dangling reference, the same "checked, not trusted" spirit as note f.
    -------------------------------------------------------------------- *)
 
 (* --- The for-loop (language-growth addition, not a "fix") ---------------

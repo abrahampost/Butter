@@ -1,0 +1,29 @@
+func sum(int[] arr) -> int {
+    int total := 0
+    for i in 0..len(arr) {
+        total := total + arr[i]
+    }
+    return total
+}
+
+func doubleAll(int[4] arr) -> int[4] {
+    int[4] result
+    for i in 0..len(arr) {
+        result[i] := arr[i] * 2
+    }
+    return result
+}
+
+func identity(int[] arr) -> int[] {
+    return arr
+}
+
+int[4] nums := [1, 2, 3, 4]
+int[3] fewer := [10, 20, 30]
+int[4] doubled := doubleAll(nums)
+
+print sum(nums)
+print sum(fewer)
+print sum(doubled)
+print sum(identity(nums))
+print nums[0]
