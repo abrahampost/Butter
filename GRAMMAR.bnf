@@ -1,0 +1,181 @@
+(* ==========================================================================
+   Butter — Context-Free Grammar (BNF/EBNF)
+   Originally derived from the recursive-descent parser in parser.go, the
+   lexer in tokenizer.go, and the AST node definitions in stmt.go / expr.go
+   at https://github.com/abrahampost/butter — since revised to smooth over
+   a handful of parser quirks in favor of more conventional language design
+   (see section 3). The reference implementation does not yet match this
+   version in every respect; section 3 spells out exactly where it diverges.
+
+   Notation:
+     ::=        "is defined as"
+     |          alternation
+     ( ... )    grouping
+     [ ... ]    optional (zero or one)
+     { ... }    repetition (zero or more)
+     'x'        literal terminal text
+     UPPERCASE  lexical/token terminal (produced by the tokenizer)
+     <lower>    non-terminal
+     ε          empty string
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   1. LEXICAL GRAMMAR (tokens)
+   -------------------------------------------------------------------------- *)
+
+<digit>      ::= '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'
+<alpha>      ::= 'a' | ... | 'z' | 'A' | ... | 'Z'
+<alphanum>   ::= <alpha> | <digit>
+
+IDENTIFIER   ::= <alpha> { <alphanum> }
+INT          ::= <digit> { <digit> }
+FLOAT        ::= <digit> { <digit> } '.' <digit> { <digit> }
+STRING       ::= '"' { any character except '"' } '"'
+NEWLINE      ::= '\n'
+EOF          ::= (* end of input *)
+
+(* Reserved words — matched as keywords instead of IDENTIFIER when the
+   scanned identifier text matches exactly: *)
+KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
+               | 'true' | 'false' | 'int' | 'float' | 'bool' | 'string'
+
+(* Operators and punctuation *)
+OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
+               | '(' | ')' | '{' | '}'
+               | '!' | '!=' | '==' | '<' | '<=' | '>' | '>=' | ':='
+
+(* Notes on lexing:
+   - Whitespace (space, tab, '\r') is discarded; '\n' is significant (NEWLINE).
+   - There is no comment syntax in the language.
+   - '=' must always be followed by '=' (producing '=='); a lone '=' is a
+     lexer error. Likewise ':' must always be followed by '=' (producing the
+     assignment operator ':=').
+*)
+
+
+(* --------------------------------------------------------------------------
+   2. SYNTAX GRAMMAR
+   -------------------------------------------------------------------------- *)
+
+<program>          ::= { NEWLINE } { <declaration> { NEWLINE } }
+
+<declaration>       ::= <var-declaration>
+                      | <block>
+                      | <if-stmt>
+                      | <while-stmt>
+                      | <statement>
+
+<var-declaration>   ::= <type> IDENTIFIER [ ':=' <expression> ] <end>
+
+<type>              ::= 'int' | 'float' | 'bool' | 'string'
+
+<block>             ::= '{' { NEWLINE } { <declaration> { NEWLINE } } '}'
+
+<if-stmt>           ::= 'if' <expression> <declaration> { NEWLINE } [ 'else' <declaration> ]
+
+<while-stmt>         ::= 'while' <expression> <declaration>
+
+<statement>         ::= <print-stmt>
+                      | <expr-stmt>
+
+<print-stmt>        ::= 'print' <expression> <end>
+
+<expr-stmt>         ::= <expression> <end>
+
+<end>               ::= NEWLINE | EOF
+                      | ε   (* only when the next token is '}' — lets a
+                               block's final statement omit its terminator,
+                               e.g. '{ print 1 }' on one line *)
+
+
+(* ---- Expressions, lowest to highest precedence ------------------------- *)
+
+<expression>        ::= <assignment>
+
+<assignment>        ::= IDENTIFIER ':=' <assignment>
+                      | <logic-or>
+
+<logic-or>          ::= <logic-and> { 'or' <logic-and> }
+
+<logic-and>         ::= <equality> { 'and' <equality> }
+
+<equality>          ::= <comparison> { ( '==' | '!=' ) <comparison> }
+
+<comparison>        ::= <exponent> { ( '>' | '>=' | '<' | '<=' ) <exponent> }
+
+<exponent>          ::= <addition> { '**' <addition> }
+
+<addition>          ::= <multiplication> { ( '+' | '-' ) <multiplication> }
+
+<multiplication>    ::= <unary> { ( '*' | '/' | '%' ) <unary> }
+
+<unary>             ::= ( '!' | '-' ) <unary>
+                      | <primary>
+
+<primary>           ::= INT
+                      | FLOAT
+                      | STRING
+                      | 'true'
+                      | 'false'
+                      | '(' <expression> ')'
+                      | IDENTIFIER
+
+
+(* --------------------------------------------------------------------------
+   3. DESIGN NOTES
+   -------------------------------------------------------------------------- *)
+
+(* --- Quirks fixed relative to the original reference implementation ----
+
+   a) UNARY NOW CHAINS. Previously <unary>'s operand was <primary>, because
+      parser.go's Unary() called p.Literal() directly instead of recursing
+      into itself — so '!!true' or '--5' had to be written with explicit
+      grouping ('!(!true)'). The grammar now defines
+      <unary> ::= ( '!' | '-' ) <unary> | <primary>
+      so prefix operators nest arbitrarily, matching how '!'/'-' behave in
+      virtually every other language with them. (Implementation fix needed:
+      Unary() should call p.Unary() instead of p.Literal().)
+
+   d) BLOCKS NO LONGER REQUIRE A HARD LINE BREAK AFTER '{'. Previously
+      Block() unconditionally consumed a NEWLINE right after '{', so
+      '{ print 1 }' on one line was a parse error — only multi-line blocks
+      worked. <block> now allows zero or more leading newlines, and <end>
+      may resolve to ε when the next token is '}', so a block's lone/final
+      statement can share a line with the braces:
+        { print 1 }                  -- now valid
+        if x { print 1 } else { print 2 }   -- now valid
+      Two statements still can't share a line — there's no statement
+      separator token (e.g. ';') in Butter, so a real NEWLINE is still
+      required between them. (Implementation fix needed: make the newline
+      after '{' optional via IgnoreNewlines(), and have CheckEndline() treat
+      a lookahead '}' as satisfying the terminator without consuming it.)
+
+   e) BLANK LINES ARE NOW ALLOWED ANYWHERE, including before the very first
+      top-level declaration. Previously the top-level parse loop only
+      skipped newlines *between* declarations (via IgnoreNewlines() called
+      after each one), not before the first — so a file starting with a
+      blank line failed to parse. <program> now opens with { NEWLINE } too.
+      (Implementation fix needed: call IgnoreNewlines() once before Parse()'s
+      main loop starts.)
+
+   --- Intentional design choices (not bugs — left as-is) ----------------
+
+   b) <assignment> requires an IDENTIFIER on the left; the parser actually
+      parses a full <logic-or> first and raises a parse error if the result
+      isn't a bare identifier when ':=' follows. The grammar encodes the
+      *effective* language (only identifiers are valid assignment targets),
+      the same convention used by comparable recursive-descent grammars
+      (e.g. Lox). This restriction is standard and not something to change.
+
+   c) 'if'/'else'/'while' bodies are a single <declaration>, which may
+      itself be a <block> or another <if-stmt>/<while-stmt>. This is what
+      gives 'else if' chaining for free — 'else' is simply followed by
+      another <if-stmt> production, with no separate 'elif' keyword needed.
+
+   --- Known gaps (not "quirks" — just unbuilt features, per the README) --
+
+   f) No function/procedure declarations, no arrays/collections, no
+      'switch' construct, and no unary '+'. These are simply absent from
+      the grammar today; adding them is a language-growth task, not a fix.
+   ========================================================================== *)
