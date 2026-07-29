@@ -1,0 +1,11 @@
+int[5] squares
+for i in 0..5 {
+    squares[i] := i * i
+}
+
+int total := 0
+for i in 0..5 {
+    print squares[i]
+    total := total + squares[i]
+}
+print total

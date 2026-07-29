@@ -39,18 +39,21 @@ EOF          ::= (* end of input *)
    scanned identifier text matches exactly: *)
 KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'true' | 'false' | 'int' | 'float' | 'bool' | 'string'
+               | 'func' | 'return' | 'for' | 'in'
 
 (* Operators and punctuation *)
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
-               | '(' | ')' | '{' | '}'
+               | '(' | ')' | '{' | '}' | '[' | ']'
                | '!' | '!=' | '==' | '<' | '<=' | '>' | '>=' | ':='
+               | '->' | ',' | '..'
 
 (* Notes on lexing:
    - Whitespace (space, tab, '\r') is discarded; '\n' is significant (NEWLINE).
    - There is no comment syntax in the language.
    - '=' must always be followed by '=' (producing '=='); a lone '=' is a
      lexer error. Likewise ':' must always be followed by '=' (producing the
-     assignment operator ':=').
+     assignment operator ':='). A lone '.' is a lexer error too — the only
+     thing '.' is ever part of is the two-character '..' range operator.
 *)
 
 
@@ -58,15 +61,32 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    2. SYNTAX GRAMMAR
    -------------------------------------------------------------------------- *)
 
-<program>          ::= { NEWLINE } { <declaration> { NEWLINE } }
+<program>          ::= { NEWLINE } { <top-level-decl> { NEWLINE } }
+
+(* <function-decl> is only reachable from here, never from <declaration> —
+   that's the entire mechanism keeping functions non-nestable: a function
+   body's own statements only ever recurse through <declaration>, which
+   has no path back to <function-decl>. See design note 3b. *)
+<top-level-decl>    ::= <function-decl> | <declaration>
 
 <declaration>       ::= <var-declaration>
                       | <block>
                       | <if-stmt>
                       | <while-stmt>
+                      | <for-stmt>
                       | <statement>
 
-<var-declaration>   ::= <type> IDENTIFIER [ ':=' <expression> ] <end>
+<function-decl>     ::= 'func' IDENTIFIER '(' [ <param-list> ] ')'
+                         '->' <type> <block>
+
+<param-list>        ::= <type> IDENTIFIER { ',' <type> IDENTIFIER }
+
+(* The optional '[' INT ']' is what makes this an array declaration
+   instead of a plain scalar one — see design note 3e. INT here must be a
+   literal (the array's size is always known at compile time), not an
+   arbitrary <expression>. *)
+<var-declaration>   ::= <type> [ '[' INT ']' ] IDENTIFIER
+                         [ ':=' <expression> ] <end>
 
 <type>              ::= 'int' | 'float' | 'bool' | 'string'
 
@@ -76,10 +96,25 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <while-stmt>         ::= 'while' <expression> <declaration>
 
+(* Always ascending, always step 1, end exclusive — see design note 3f.
+   `start`/`end` are arbitrary expressions, each evaluated exactly once at
+   loop entry rather than re-evaluated per iteration. IDENTIFIER
+   introduces a fresh int variable scoped to the loop (shadowing an outer
+   variable of the same name is allowed, same as any other declaration —
+   ISA.bnf section 5), not a reference to an existing one. *)
+<for-stmt>          ::= 'for' IDENTIFIER 'in' <expression> '..' <expression>
+                        <declaration>
+
 <statement>         ::= <print-stmt>
+                      | <return-stmt>
                       | <expr-stmt>
 
 <print-stmt>        ::= 'print' <expression> <end>
+
+(* Legal anywhere a <statement> is (including nested inside a function
+   body's own if/while/block), but a semantic error — not a parse error —
+   outside a function body altogether; see design note 3c. *)
+<return-stmt>       ::= 'return' <expression> <end>
 
 <expr-stmt>         ::= <expression> <end>
 
@@ -94,6 +129,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <expression>        ::= <assignment>
 
 <assignment>        ::= IDENTIFIER ':=' <assignment>
+                      | IDENTIFIER '[' <expression> ']' ':=' <assignment>
                       | <logic-or>
 
 <logic-or>          ::= <logic-and> { 'or' <logic-and> }
@@ -119,7 +155,20 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | 'true'
                       | 'false'
                       | '(' <expression> ')'
+                      | <call-expr>
+                      | <array-literal>
+                      | <index-expr>
                       | IDENTIFIER
+
+<call-expr>         ::= IDENTIFIER '(' [ <arg-list> ] ')'
+
+<arg-list>          ::= <expression> { ',' <expression> }
+
+(* No nested/chained indexing (no `matrix[i][j]`) — Butter has no
+   arrays-of-arrays (design note 3e). *)
+<array-literal>     ::= '[' [ <expression> { ',' <expression> } ] ']'
+
+<index-expr>        ::= IDENTIFIER '[' <expression> ']'
 
 
 (* --------------------------------------------------------------------------
@@ -128,54 +177,81 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 (* --- Quirks fixed relative to the original reference implementation ----
 
-   a) UNARY NOW CHAINS. Previously <unary>'s operand was <primary>, because
-      parser.go's Unary() called p.Literal() directly instead of recursing
-      into itself — so '!!true' or '--5' had to be written with explicit
-      grouping ('!(!true)'). The grammar now defines
-      <unary> ::= ( '!' | '-' ) <unary> | <primary>
-      so prefix operators nest arbitrarily, matching how '!'/'-' behave in
-      virtually every other language with them. (Implementation fix needed:
-      Unary() should call p.Unary() instead of p.Literal().)
+   a) No arrays/collections, no 'switch' construct, and no unary '+'.
+      These are simply absent from the grammar today; adding them is a
+      language-growth task, not a fix. (Function/procedure declarations
+      used to be listed here too — see notes b/c below for how they were
+      added and what stayed deliberately restricted.)
+   -------------------------------------------------------------------- *)
 
-   d) BLOCKS NO LONGER REQUIRE A HARD LINE BREAK AFTER '{'. Previously
-      Block() unconditionally consumed a NEWLINE right after '{', so
-      '{ print 1 }' on one line was a parse error — only multi-line blocks
-      worked. <block> now allows zero or more leading newlines, and <end>
-      may resolve to ε when the next token is '}', so a block's lone/final
-      statement can share a line with the braces:
-        { print 1 }                  -- now valid
-        if x { print 1 } else { print 2 }   -- now valid
-      Two statements still can't share a line — there's no statement
-      separator token (e.g. ';') in Butter, so a real NEWLINE is still
-      required between them. (Implementation fix needed: make the newline
-      after '{' optional via IgnoreNewlines(), and have CheckEndline() treat
-      a lookahead '}' as satisfying the terminator without consuming it.)
+(* --- Functions (language-growth addition, not a "fix") -----------------
 
-   e) BLANK LINES ARE NOW ALLOWED ANYWHERE, including before the very first
-      top-level declaration. Previously the top-level parse loop only
-      skipped newlines *between* declarations (via IgnoreNewlines() called
-      after each one), not before the first — so a file starting with a
-      blank line failed to parse. <program> now opens with { NEWLINE } too.
-      (Implementation fix needed: call IgnoreNewlines() once before Parse()'s
-      main loop starts.)
+   b) NO NESTING, NO CLOSURES. <function-decl> is reachable only from
+      <top-level-decl>, never from <declaration> — so a function can't be
+      declared inside a block/if/while body, and a function body can't
+      declare another function. There is deliberately no mechanism for a
+      function body to read or write a top-level variable either: name
+      resolution inside a function body only ever considers that
+      function's own parameters and its own locally-declared variables
+      (see ISA.bnf section 5 for why — it falls straight out of the
+      call-frame model, not an arbitrary restriction bolted on top).
 
-   --- Intentional design choices (not bugs — left as-is) ----------------
+   c) EVERY FUNCTION MUST DECLARE A RETURN TYPE, AND ALWAYS RETURNS ONE.
+      There is no 'void'/unit type. `return` requires an expression
+      (unlike, say, an empty `return;`); and if control falls off the end
+      of a function body without hitting an explicit `return`, the
+      compiler implicitly returns the declared return type's zero value
+      — the same value a var-declaration without an initializer gets. This
+      means there is intentionally no "did every path return?" static
+      check; that's a semantic-analysis pass this compiler doesn't attempt
+      (matching ISA.bnf section 1's broader no-type-checking stance).
 
-   b) <assignment> requires an IDENTIFIER on the left; the parser actually
-      parses a full <logic-or> first and raises a parse error if the result
-      isn't a bare identifier when ':=' follows. The grammar encodes the
-      *effective* language (only identifiers are valid assignment targets),
-      the same convention used by comparable recursive-descent grammars
-      (e.g. Lox). This restriction is standard and not something to change.
+   d) ARITY IS CHECKED, TYPES ARE NOT. A call must supply exactly as many
+      arguments as the callee declares parameters — this is required
+      structurally, to know how many stack slots the callee's frame
+      reserves for them (ISA.bnf section 6), not an optional pedantic
+      check. Argument *types* are not checked against parameter types,
+      consistent with the rest of the language having no static type
+      checking.
+   -------------------------------------------------------------------- *)
 
-   c) 'if'/'else'/'while' bodies are a single <declaration>, which may
-      itself be a <block> or another <if-stmt>/<while-stmt>. This is what
-      gives 'else if' chaining for free — 'else' is simply followed by
-      another <if-stmt> production, with no separate 'elif' keyword needed.
+(* --- Arrays (language-growth addition, not a "fix") ---------------------
 
-   --- Known gaps (not "quirks" — just unbuilt features, per the README) --
+   e) FIXED SIZE, NO NESTING, CAN'T CROSS A CALL BOUNDARY. An array's size
+      is a compile-time-known INT literal, not an arbitrary expression —
+      arrays never grow, shrink, or get reallocated at runtime (ISA.bnf
+      section 2 explains why: they're just consecutive stack slots, and
+      there is still no heap or garbage collector anywhere in this VM).
+      There is no array-of-arrays (an array's element type is always a
+      plain scalar type), and — matching how a function body can't see a
+      top-level variable (note b above) — an array cannot be passed as a
+      function argument or returned from one; only scalars cross a call
+      boundary today. An array literal (`[e1, e2, ...]`) is only valid as
+      the initializer of an array declaration whose declared size matches
+      the literal's element count exactly; using one anywhere else (as a
+      bare expression, a call argument, and so on) is a compile error, the
+      same category of error as an arity mismatch.
 
-   f) No function/procedure declarations, no arrays/collections, no
-      'switch' construct, and no unary '+'. These are simply absent from
-      the grammar today; adding them is a language-growth task, not a fix.
+   f) ARRAY INDEXING IS BOUNDS-CHECKED, NOT TRUSTED. Reading or writing
+      `arr[i]` checks `i` is an INT and that `0 <= i < <declared size>` at
+      runtime, raising `RuntimeError.IndexOutOfBounds` rather than
+      silently reading/writing whatever stack slot the arithmetic happens
+      to land on — unlike, say, a scalar-only VM, an out-of-bounds array
+      access here would otherwise corrupt an arbitrary neighboring local
+      (possibly belonging to a different call frame entirely), so this
+      check is load-bearing for memory safety, not a nicety.
+   -------------------------------------------------------------------- *)
+
+(* --- The for-loop (language-growth addition, not a "fix") ---------------
+
+   g) RANGE-BASED, NOT C-STYLE. `for v in start..end body` is the only
+      form — there is no three-clause `for (init; cond; post)`. It always
+      counts up by exactly 1 and `end` is always exclusive (Python/Rust
+      `..` convention); there is no descending range and no custom step.
+      This is deliberately just sugar over the same while-loop
+      backpatched-jump pattern every other loop in this language already
+      compiles to (ISA.bnf section 4) — see ISA.bnf section 7 for exactly
+      how it desugars. A foreach-style "for element in array" is a
+      plausible future extension but isn't attempted here; write
+      `for i in 0..n { ... arr[i] ... }` instead.
    ========================================================================== *)

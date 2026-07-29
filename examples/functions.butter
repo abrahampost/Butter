@@ -1,0 +1,18 @@
+func add(int a, int b) -> int {
+    return a + b
+}
+
+func square(int n) -> int {
+    return n * n
+}
+
+func max(int a, int b) -> int {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+print add(3, 4)
+print square(5)
+print max(10, 20)

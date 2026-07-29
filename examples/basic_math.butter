@@ -1,0 +1,30 @@
+int a := 7
+int b := 3
+
+print a + b
+print a - b
+print a * b
+print a / b
+print a % b
+print a ** b
+
+float x := 2.5
+float y := 4.0
+print x + y
+print x * y
+print x / y
+
+print (a + b) * 2
+print a + b * 2
+
+bool bigger := a > b
+bool equal := a == b
+print bigger
+print equal
+print bigger and equal
+print bigger or equal
+print !bigger
+
+int n := -5
+print -n
+print n

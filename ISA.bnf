@@ -1,0 +1,437 @@
+(* ==========================================================================
+   Butter VM — Instruction Set Architecture
+   A stack-based virtual machine that is the compilation target for the
+   Butter AST defined in GRAMMAR.bnf. Implemented in src/value.zig,
+   src/chunk.zig, src/vm.zig, and src/compiler.zig.
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   1. DESIGN GOALS ("RISC applied to a stack machine")
+   -------------------------------------------------------------------------- *)
+
+(* A classic RISC ISA gets its simplicity from three commitments: every
+   instruction is the same width and decodes the same way, instructions
+   are load/store only (arithmetic never touches memory directly, only
+   registers), and the instruction set is small and orthogonal (one job
+   per instruction, compose the rest in software). This VM applies the
+   same three commitments to a stack machine instead of a register machine:
+
+   a) FIXED-WIDTH INSTRUCTIONS. Every instruction is the same
+      `struct { op: OpCode, operand: u32 }` (see src/chunk.zig), regardless
+      of what `op` is. There is no variable-length encoding and no
+      instruction that carries more than one operand. Unused operands are
+      simply zero. This trades code density (a real byte-packed encoding
+      would be smaller) for a trivial, uniform decode step — appropriate
+      for a teaching/target VM where correctness and simplicity dominate.
+      LOAD_INDEX/STORE_INDEX (section 3) need two compile-time constants
+      (an array's base slot and its length) but keep to this same one-u32
+      shape by packing both into the one operand (16 bits each) rather
+      than growing Instruction a second field — see `chunk.packIndexOperand`.
+
+   b) LOAD/STORE ONLY. Arithmetic, comparison, and logical instructions
+      (ADD, LT, NOT, ...) take zero operands and work purely on values
+      already on the stack; the only instructions that name a location
+      (a constant-pool slot or a local-variable slot) are the LOAD/STORE
+      family (PUSH_CONST, LOAD_LOCAL, STORE_LOCAL). Nothing else reaches
+      into the constant pool or a variable slot.
+
+   c) ORTHOGONAL AND MINIMAL. There is exactly one conditional-branch
+      instruction (JUMP_IF_FALSE) and one unconditional one (JUMP); a
+      JUMP_IF_TRUE was deliberately omitted because 'or' is expressible as
+      JUMP_IF_FALSE + JUMP (see section 4), the same way real RISC ISAs
+      favor a minimal set of branch primitives that software sequences
+      into everything else.
+
+   Now that the source language has functions (GRAMMAR.bnf, design notes
+   3b-d), the VM has a call stack: every function's LOAD_LOCAL/STORE_LOCAL
+   operands are slot indices *relative to the current call frame's base
+   pointer*, not absolute (see sections 5 and 6). Top-level code is simply
+   frame 0, with its base pointer fixed at 0 for the program's whole
+   lifetime — which is why nothing about existing top-level compilation
+   changed when functions were added.
+
+   There is also no type-checking pass: the compiler resolves variable
+   *names* to slots at compile time but does not check that a variable's
+   declared type agrees with what's stored into it, and the VM checks
+   *runtime* value types operation-by-operation (section 3). Static type
+   checking would be a separate semantic-analysis pass layered on top of
+   the existing parser output; it isn't attempted here. *)
+
+
+(* --------------------------------------------------------------------------
+   2. VALUE REPRESENTATION
+   -------------------------------------------------------------------------- *)
+
+<value>    ::= INT | FLOAT | BOOL | STRING
+
+(* INT and FLOAT are i64 / f64. STRING values are borrowed slices into a
+   Chunk's constant pool (which in turn borrows from the original source
+   text) — never separately allocated, copied, or freed at run time.
+   Because GRAMMAR.bnf defines no string-concatenation operator and no
+   arrays/collections (section 3a), every string a running program can ever
+   produce already exists as a literal fixed at compile time. That means
+   the VM needs no heap and no garbage collector: every `Value` is either
+   a plain scalar or a slice it never owns. *)
+
+(* A compiled program is one main Chunk (the top-level code, run as an
+   implicit frame 0 — see section 6) plus one Chunk per declared function,
+   each with its OWN constant pool. Nothing is shared between them:
+   per GRAMMAR.bnf design note 3b, a function body can only ever reference
+   its own parameters/locals, never a top-level variable or another
+   function's locals, so there is no reason for their constant pools or
+   local-slot numbering to overlap or coordinate. *)
+
+(* Arrays (GRAMMAR.bnf design note 3e) are NOT a `<value>` variant — there
+   is no runtime "array value" that gets pushed, popped, or passed around
+   as a single unit. An array is simply `<declared size>` consecutive
+   stack slots (section 5), and every individual slot still holds one
+   plain scalar `<value>` exactly as before. This is what lets arrays fit
+   into a VM with no heap and no garbage collector: the array itself isn't
+   a new kind of runtime object, just a compile-time-known grouping of the
+   same slots locals always lived in. *)
+
+
+(* --------------------------------------------------------------------------
+   3. INSTRUCTION SET
+   -------------------------------------------------------------------------- *)
+
+(* Stack effect notation: ( before -- after ), stack grows to the right. *)
+
+   PUSH_CONST   #idx     ( -- v )            push constants[idx]
+   PUSH_TRUE              ( -- true )
+   PUSH_FALSE             ( -- false )
+   POP                    ( v -- )            discard the top of stack
+
+   LOAD_LOCAL   #slot     ( -- v )            push stack[slot]
+   STORE_LOCAL  #slot     ( v -- v )          stack[slot] = v (peeks, does
+                                               not consume — this is what
+                                               lets 'x := 5' be used as an
+                                               expression, per GRAMMAR.bnf's
+                                               <assignment> production)
+
+   LOAD_INDEX   #packed(slot,length)  ( index -- v )
+                                               pops index (must be INT);
+                                               TypeMismatch otherwise.
+                                               IndexOutOfBounds unless
+                                               0 <= index < length. Else
+                                               pushes stack[slot + index]
+                                               (slot/length both unpacked
+                                               from the one operand — see
+                                               section 1a).
+   STORE_INDEX  #packed(slot,length)  ( index v -- v )
+                                               pops v, then index (same
+                                               Type/BoundsError checks as
+                                               LOAD_INDEX), sets
+                                               stack[slot + index] = v,
+                                               then pushes v back — the
+                                               same peek-not-consume shape
+                                               as STORE_LOCAL, so
+                                               'arr[i] := v' is usable as
+                                               an expression too. The
+                                               index must be compiled
+                                               (and therefore pushed)
+                                               BEFORE the value, which is
+                                               why the stack effect reads
+                                               index-then-v rather than
+                                               v-then-index.
+
+   ADD, SUB, MUL, DIV, MOD, POW
+                          ( a b -- r )        both operands must be numeric
+                                               (INT or FLOAT); INT op INT
+                                               stays INT (overflow-checked);
+                                               any FLOAT operand promotes
+                                               both to FLOAT. DIV/MOD by
+                                               zero and INT overflow are
+                                               runtime errors, not traps.
+
+   NEG                    ( a -- r )          numeric only
+   NOT                    ( a -- r )          BOOL only
+
+   EQ, NEQ                ( a b -- bool )     defined for every pair of
+                                               value types: numeric operands
+                                               compare across INT/FLOAT by
+                                               value; any other mismatched
+                                               pair of types simply compares
+                                               unequal (this mirrors '=='
+                                               in most dynamically-checked
+                                               languages, rather than being
+                                               a type error)
+   LT, LTE, GT, GTE        ( a b -- bool )    numeric operands only
+
+   JUMP         #target               ip := target
+   JUMP_IF_FALSE #target  ( bool -- bool )    peeks (does not pop) the
+                                               condition; if false, ip :=
+                                               target. Every use site is
+                                               responsible for POPping the
+                                               condition itself on both the
+                                               taken and fall-through paths
+                                               (section 4) — this is the one
+                                               instruction in the ISA with a
+                                               "conditional" stack effect,
+                                               and confining that to a single
+                                               well-tested opcode is the
+                                               payoff for keeping everything
+                                               else unconditional.
+                                               TypeMismatch if the peeked
+                                               value is not BOOL — this is
+                                               the sole place 'if'/'while'
+                                               conditions and 'and'/'or'
+                                               operands are checked to
+                                               actually be booleans.
+
+   CALL         #func_index  ( arg1 ... argN -- result )
+                                               the N arguments (N = the
+                                               callee's arity) are already
+                                               on the stack, pushed by
+                                               ordinary expression codegen
+                                               before CALL executes; CALL
+                                               itself pushes nothing. It
+                                               suspends the current chunk
+                                               (saving its ip and base
+                                               pointer as a new frame — see
+                                               section 6) and jumps to
+                                               functions[func_index]'s own
+                                               chunk at instruction 0, with
+                                               the base pointer set so the
+                                               callee's LOAD_LOCAL/
+                                               STORE_LOCAL slot 0 is exactly
+                                               where arg1 already sits.
+                                               CallStackOverflow if the
+                                               frame stack is already at
+                                               capacity.
+   RET                     ( v -- v )          pops the current frame
+                                               (discarding every argument
+                                               and local it owns — see
+                                               section 6), then leaves v,
+                                               the value the returning
+                                               function computed, as the
+                                               sole result on the caller's
+                                               stack. Every function chunk
+                                               is guaranteed by the
+                                               compiler to end in a RET
+                                               (see GRAMMAR.bnf design note
+                                               3c) — this is the only way a
+                                               function chunk's execution
+                                               ever ends.
+
+   PRINT                  ( v -- )            pop v, write it followed by
+                                               a newline
+
+   HALT                                       stop execution (only ever
+                                               appears in the main chunk,
+                                               at the very end — see
+                                               section 6)
+
+
+(* --------------------------------------------------------------------------
+   4. CODEGEN PATTERNS (how the compiler lowers control flow and short
+      circuiting onto the instructions above — the standard "backpatched
+      jump" technique)
+   -------------------------------------------------------------------------- *)
+
+   if-stmt (condition, then, optional else):
+
+       <condition>
+       JUMP_IF_FALSE  else_target
+       POP                          (* discard a truthy condition *)
+       <then-branch>
+       JUMP  end_target
+     else_target:
+       POP                          (* discard a falsy condition — this pop
+                                        happens whether or not there is an
+                                        else-branch, which is what keeps the
+                                        stack balanced either way *)
+       [ <else-branch> ]
+     end_target:
+
+   while-stmt:
+
+     loop_start:
+       <condition>
+       JUMP_IF_FALSE  exit_target
+       POP
+       <body>
+       JUMP  loop_start
+     exit_target:
+       POP
+
+   'and' (short-circuits to a false left operand without evaluating right):
+
+       <left>
+       JUMP_IF_FALSE  end_target    (* left false -> skip right, its false
+                                        value is the result *)
+       POP                          (* left true -> discard it *)
+       <right>
+     end_target:
+
+   'or' (short-circuits to a true left operand without evaluating right;
+   built from JUMP + JUMP_IF_FALSE rather than a dedicated JUMP_IF_TRUE,
+   per the minimality goal in section 1c):
+
+       <left>
+       JUMP_IF_FALSE  else_target
+       JUMP  end_target             (* left true -> skip right, its true
+                                        value is the result *)
+     else_target:
+       POP                          (* left false -> discard it *)
+       <right>
+     end_target:
+
+
+(* --------------------------------------------------------------------------
+   5. VARIABLE RESOLUTION (compile time, no runtime name lookup)
+   -------------------------------------------------------------------------- *)
+
+   The compiler keeps a list of (name, scope_depth, slot, width) entries
+   in declaration order, separately per chunk being compiled (the main
+   chunk, and then each function's chunk in turn — see section 6). `slot`
+   is tracked explicitly (a running `next_slot` counter) rather than
+   implied by position in that list, because `width` isn't always 1: a
+   plain scalar local occupies exactly one slot, but an array local
+   (GRAMMAR.bnf design note 3e) occupies `<declared size>` consecutive
+   slots starting at `slot`, so slot numbers and list position diverge as
+   soon as any array is in scope. Entering a <block> increases
+   scope_depth; leaving it removes every local declared at that depth
+   from the compiler's list, decrements `next_slot` by each removed
+   local's width (so a later sibling scope reuses the same slots instead
+   of growing the frame unboundedly), and emits one POP per slot removed
+   (an array-local's whole width, not just one POP) so the runtime stack
+   shrinks back in step with the compile-time model. A reference to an
+   undeclared name, or an assignment to one, is a compile error
+   (`CompileError.UndefinedVariable`) — one of the few forms of semantic
+   checking this compiler does perform, since it is required just to
+   assign slots at all, not an optional extra. Shadowing an outer variable
+   in an inner block is allowed (lookup walks the locals list from the
+   end, so the innermost matching declaration wins); redeclaring the same
+   name twice *within one scope* is not rejected — it simply shadows the
+   earlier slot from that point on. This mirrors the Lox-family "locals
+   resolved to stack slots" design (as in Crafting Interpreters' clox).
+
+   An array-typed local's bare name resolves for LOAD_LOCAL/STORE_LOCAL
+   purposes exactly like a scalar's (same lookup, same list) but using it
+   that way is a compile error (`CompileError.ArrayUsedAsScalar`) — arrays
+   are only ever accessed through LOAD_INDEX/STORE_INDEX (section 3),
+   which pack that same `slot` together with `width` (there called
+   `length`, for the bounds check) into one instruction operand.
+
+   A function's parameters are simply its first `arity` locals (slots
+   0..arity-1), added to that function's locals list before its body is
+   compiled at all — from the compiler's perspective a parameter is just a
+   local that already has a value by the time the body starts, the same
+   way a var-declaration's initializer already has a value on the stack
+   before the declaration finishes (section 2). Locals lists are entirely
+   separate per chunk: a function's locals list starts fresh (containing
+   only its own parameters) and is discarded once that function's chunk is
+   done compiling, which is what makes it structurally impossible for a
+   function body to resolve a top-level variable's name — the compiler
+   never even has that name in scope while compiling the function (per
+   GRAMMAR.bnf design note 3b).
+
+
+(* --------------------------------------------------------------------------
+   6. FUNCTION CALLS & RECURSION
+   -------------------------------------------------------------------------- *)
+
+   Each declared function compiles to its own `chunk_mod.Function` — a
+   name, an arity, and a self-contained Chunk (own instructions, own
+   constant pool). A compiled `Program` is one main Chunk (top-level code)
+   plus a slice of these, indexed by the operand CALL instructions use to
+   name their target (resolved by name to that index at compile time —
+   see compiler.zig's function table, built before any function body is
+   compiled so that calls resolve regardless of declaration order,
+   including a function calling itself or two functions calling each
+   other).
+
+   CALLING CONVENTION. A call expression's arguments compile as ordinary
+   expressions, left to right, exactly like any other operator's operands
+   — by the time CALL executes, they are simply sitting on top of the
+   stack in order. CALL then:
+
+     1. Checks the frame stack isn't already at capacity
+        (CallStackOverflow if it is — this is what turns unbounded
+        recursion into a catchable runtime error instead of a native
+        stack overflow/crash).
+     2. Pushes a frame recording the CALLER's chunk, ip (already advanced
+        past the CALL instruction, so execution resumes right after it),
+        and base pointer — everything needed to resume the caller once
+        the callee returns.
+     3. Sets the new base pointer to `sp - arity`: since the N arguments
+        are already the top N values on the stack, this makes them
+        exactly the callee's LOAD_LOCAL/STORE_LOCAL slots 0..arity-1
+        without copying them anywhere.
+     4. Switches to the callee's chunk and jumps to instruction 0.
+
+   RET does the reverse: pop the returning function's result, pop the
+   current frame, reset the stack pointer to that frame's base pointer
+   (discarding every argument, parameter-slot, and local the callee ever
+   pushed, in one step — whether or not the compiler's own block-scope POP
+   bookkeeping ran, since a `return` can fire from arbitrarily deep inside
+   nested if/while/block bodies and always unwinds the whole frame
+   directly), push the result back, and restore the chunk/ip/base pointer
+   from the popped frame.
+
+   RECURSION FALLS OUT FOR FREE. Nothing about CALL or RET is aware of
+   whether the callee is the same function as the caller. Each call gets
+   its own frame and its own base pointer into a fresh region of the
+   *same* stack array, so a function calling itself (or two functions
+   calling each other) just works: fib(n-1) and fib(n-2) each get their
+   own base pointer, so their respective slot-0 values (their own `n`)
+   never collide, no matter how deep the recursion goes — until either the
+   frame stack (CallStackOverflow) or the value stack itself
+   (StackOverflow) runs out of room.
+
+   TOP LEVEL IS FRAME 0. There's no special-casing anywhere for "not
+   inside a function": top-level code is simply the main chunk, executing
+   with base pointer 0 for the program's entire lifetime, and it never
+   needs a frame pushed for itself because nothing ever CALLs into it —
+   it's where `run` starts. This is also why `return` is restricted to
+   inside a function body (GRAMMAR.bnf design note 3c) rather than a
+   supported way to end the program early: RET always pops a frame that a
+   CALL pushed, and no CALL ever runs before the main chunk starts, so
+   there is no frame to pop at the top level.
+
+
+(* --------------------------------------------------------------------------
+   7. THE FOR-LOOP (desugars to section 4's while-stmt pattern)
+   -------------------------------------------------------------------------- *)
+
+   `for v in start..end body` (GRAMMAR.bnf design note 3g) introduces its
+   own wrapper scope holding two hidden locals the compiler generates —
+   the range's end bound (evaluated once) and the loop variable itself —
+   then emits *exactly* the while-stmt pattern from section 4, just with
+   the condition/increment hardcoded to those two locals instead of
+   arbitrary compiled expressions:
+
+       <end-expr>                    (* hidden local: end_slot *)
+       <start-expr>                  (* hidden local: var_slot, = v *)
+     loop_start:
+       LOAD_LOCAL  var_slot
+       LOAD_LOCAL  end_slot
+       LT
+       JUMP_IF_FALSE  exit_target
+       POP
+       <body>                        (* v resolves as an ordinary local *)
+       LOAD_LOCAL  var_slot
+       PUSH_CONST  #1
+       ADD
+       STORE_LOCAL  var_slot
+       POP
+       JUMP  loop_start
+     exit_target:
+       POP
+       (* both hidden locals popped as the wrapper scope closes,
+          section 5 *)
+
+   No new opcodes are involved — the same way 'and'/'or' (section 4) are
+   sugar over JUMP_IF_FALSE/JUMP rather than dedicated instructions, `for`
+   is sugar over the exact same LOAD_LOCAL/ADD/STORE_LOCAL/JUMP primitives
+   every other loop already uses. Because `end_slot`'s value is computed
+   once up front and never touched again, re-assigning whatever expression
+   produced `end` inside the loop body has no effect on how many
+   iterations run (see the "bounds evaluated once" behavior this
+   guarantees). The hidden end-bound local is given the empty string as
+   its name — never a legal IDENTIFIER lexeme (GRAMMAR.bnf section 1), so
+   it can never collide with, shadow, or be resolved by any name a user
+   actually writes.
+   ========================================================================== *)
