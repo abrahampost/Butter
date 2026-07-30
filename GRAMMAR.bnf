@@ -307,7 +307,23 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      writing through one alias silently change every other variable that
      happens to hold "the same" string. Reusing the bracket syntax for a
      read while leaving it a `RuntimeError.TypeMismatch` for a write avoids
-     that surprise without needing a separate copy-on-write story. *)
+     that surprise without needing a separate copy-on-write story.
+   - `+` is overloaded onto strings rather than introducing a separate
+     `concat` builtin: `a + b` with both operands STRING evaluates to a
+     fresh string of `a`'s bytes followed by `b`'s (a compile-time-
+     unchecked `<addition>`, same as numeric `+` — the VM decides by the
+     operands' runtime shape, ISA.bnf section 2). A string operand paired
+     with a non-string one (including a number) is
+     `RuntimeError.TypeMismatch`; there is no implicit numeric-to-string
+     conversion (see `stringify`, above, for that).
+   - `<`/`<=`/`>`/`>=` (`<comparison>`) are similarly overloaded: with both
+     operands STRING they compare byte-lexicographically (an all-bytes-
+     equal common prefix orders the shorter string first — the same
+     ordering `[]u8` gets under `std.mem.order` in the host language), not
+     numerically. `==`/`!=` already worked on strings via `eql` (content
+     equality, above); this extends the other four comparison operators to
+     match rather than leaving them numeric-only. A string operand paired
+     with a non-string one is `RuntimeError.TypeMismatch`, same as `+`. *)
 
 (* --- JSON ---
    - `json(buf, count)` parses `count` bytes of an `int` buffer as JSON text

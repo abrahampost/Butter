@@ -12,26 +12,20 @@ it) → **P4** nice-to-have / infrastructure polish.
 
 ## P0 — blocking for basic CLI tools
 
-### 1. String concatenation
-`+` only accepts numeric operands (`popNumericPair` in
-[src/vm.zig:316](src/vm.zig#L316)). There is no way to build a composite
-string (`"error: " + msg`) anywhere in the language.
-- Add string+string handling to the `add` path in `vm.zig` (new heap
-  string, byte-concatenation), or introduce a dedicated `concat`
-  builtin/operator if overloading `+` is undesirable.
-- Update [GRAMMAR.bnf](GRAMMAR.bnf) section 3 ("Strings" design notes) and
-  [ISA.bnf](ISA.bnf) to document the new semantics.
-- Add unit tests in `vm.zig` and an integration case under `tests/cases/`.
+### 1. String concatenation — DONE
+`add()` in [src/vm.zig](src/vm.zig) now handles a STRING+STRING pair
+(byte-concatenation into a fresh heap string) alongside the existing
+numeric path; any other mismatched pairing is still `TypeMismatch`.
+Documented in GRAMMAR.bnf's Strings design notes and ISA.bnf's ADD entry.
+Covered by unit tests in `src/vm.zig` and the `strings` integration case
+under `tests/cases/`.
 
-### 2. String ordering comparisons (`<`, `<=`, `>`, `>=`)
-`compare()` in [src/vm.zig:376](src/vm.zig#L376) also routes through
-`popNumericPair` — only `==`/`!=` work on strings today (via `Value.eql`).
-Sorting or alphabetizing strings is impossible.
-- Extend `compare()` to do byte-lexicographic comparison when both
-  operands are strings.
-- Document in GRAMMAR.bnf/ISA.bnf.
-- Add tests covering equal-prefix, differing-length, and empty-string
-  cases.
+### 2. String ordering comparisons (`<`, `<=`, `>`, `>=`) — DONE
+`compare()` in [src/vm.zig](src/vm.zig) now does byte-lexicographic
+comparison (`std.mem.order`) when both operands are STRING, alongside the
+existing numeric path. Documented in GRAMMAR.bnf/ISA.bnf. Covered by unit
+tests (equal-prefix, differing-length, empty-string cases) and the
+`strings` integration case.
 
 ### 3. Program argument access (`argv`)
 [src/main.zig:36](src/main.zig#L36) consumes all CLI args itself
@@ -59,14 +53,10 @@ tools).
 - Add tests: normal halt still exits 0, `exit(n)` exits `n`, `exit` mid-
   function skips remaining code.
 
-### 5. Number → string composition
-`stringify(int)` produces an unquoted JSON number (used internally by
-`stackPush` in [src/std/collections.std.butter:111](src/std/collections.std.butter#L111)
-to build map keys), but combined with task #1's absence there is no way
-to interpolate a number into a larger message string.
-- Depends on task #1 landing first (or ship together).
-- Once `+` supports strings, verify `stringify(n) + " done"` works
-  end-to-end; add an integration test exercising it.
+### 5. Number → string composition — DONE
+Verified `stringify(n) + " ..."` works end-to-end now that task #1 has
+landed; covered by the last line of the `strings` integration case
+(`tests/cases/strings.butter`/`.expected`).
 
 ---
 

@@ -313,13 +313,41 @@ pub const Vm = struct {
         return result;
     }
 
-    fn add(self: *Vm) RuntimeError!void {
-        const p = try self.popNumericPair();
-        if (p.a == .int and p.b == .int) {
-            try self.push(.{ .int = try checkedAdd(p.a.int, p.b.int) });
-        } else {
-            try self.push(.{ .float = p.a.asFloat() + p.b.asFloat() });
+    /// `+` (GRAMMAR.bnf section 3, ISA.bnf ADD): numeric addition when both
+    /// operands are numbers, byte-concatenation into a fresh heap string
+    /// when both are strings, `TypeMismatch` otherwise. Unlike
+    /// `popNumericPair`'s callers, this can't just check `isNumeric` up
+    /// front — a string/string pair is valid here — so it pops and
+    /// classifies the operands itself.
+    fn add(self: *Vm) (RuntimeError || std.mem.Allocator.Error)!void {
+        const b = try self.pop();
+        const a = try self.pop();
+        if (a.isNumeric() and b.isNumeric()) {
+            if (a == .int and b == .int) {
+                try self.push(.{ .int = try checkedAdd(a.int, b.int) });
+            } else {
+                try self.push(.{ .float = a.asFloat() + b.asFloat() });
+            }
+            return;
         }
+        if (a.asStringBytes()) |av| {
+            if (b.asStringBytes()) |bv| {
+                const bytes = try self.allocator.alloc(u8, av.len + bv.len);
+                @memcpy(bytes[0..av.len], av);
+                @memcpy(bytes[av.len..], bv);
+                const obj = Object.create(self.allocator, .{ .string = bytes }) catch |err| {
+                    self.allocator.free(bytes);
+                    return err;
+                };
+                a.decref(self.allocator);
+                b.decref(self.allocator);
+                try self.push(.{ .object = obj });
+                return;
+            }
+        }
+        a.decref(self.allocator);
+        b.decref(self.allocator);
+        return RuntimeError.TypeMismatch;
     }
 
     fn sub(self: *Vm) RuntimeError!void {
@@ -373,20 +401,47 @@ pub const Vm = struct {
 
     const CompareOp = enum { lt, lte, gt, gte };
 
+    /// `<`/`<=`/`>`/`>=` (GRAMMAR.bnf section 3, ISA.bnf CMP_*): numeric
+    /// ordering when both operands are numbers, byte-lexicographic
+    /// ordering (`std.mem.order`) when both are strings, `TypeMismatch`
+    /// otherwise. Mirrors `add`'s string/numeric split rather than
+    /// `popNumericPair`, since a string/string pair is valid here too.
     fn compare(self: *Vm, comptime op: CompareOp) RuntimeError!void {
-        const p = try self.popNumericPair();
-        const result = if (p.a == .int and p.b == .int) switch (op) {
-            .lt => p.a.int < p.b.int,
-            .lte => p.a.int <= p.b.int,
-            .gt => p.a.int > p.b.int,
-            .gte => p.a.int >= p.b.int,
-        } else switch (op) {
-            .lt => p.a.asFloat() < p.b.asFloat(),
-            .lte => p.a.asFloat() <= p.b.asFloat(),
-            .gt => p.a.asFloat() > p.b.asFloat(),
-            .gte => p.a.asFloat() >= p.b.asFloat(),
-        };
-        try self.push(.{ .boolean = result });
+        const b = try self.pop();
+        const a = try self.pop();
+        if (a.isNumeric() and b.isNumeric()) {
+            const result = if (a == .int and b == .int) switch (op) {
+                .lt => a.int < b.int,
+                .lte => a.int <= b.int,
+                .gt => a.int > b.int,
+                .gte => a.int >= b.int,
+            } else switch (op) {
+                .lt => a.asFloat() < b.asFloat(),
+                .lte => a.asFloat() <= b.asFloat(),
+                .gt => a.asFloat() > b.asFloat(),
+                .gte => a.asFloat() >= b.asFloat(),
+            };
+            try self.push(.{ .boolean = result });
+            return;
+        }
+        if (a.asStringBytes()) |av| {
+            if (b.asStringBytes()) |bv| {
+                const ord = std.mem.order(u8, av, bv);
+                const result = switch (op) {
+                    .lt => ord == .lt,
+                    .lte => ord != .gt,
+                    .gt => ord == .gt,
+                    .gte => ord != .lt,
+                };
+                a.decref(self.allocator);
+                b.decref(self.allocator);
+                try self.push(.{ .boolean = result });
+                return;
+            }
+        }
+        a.decref(self.allocator);
+        b.decref(self.allocator);
+        return RuntimeError.TypeMismatch;
     }
 
     fn failFile(self: *Vm, comptime err: RuntimeError, operation: []const u8, path: []const u8, cause: []const u8) RuntimeError {
@@ -1193,6 +1248,145 @@ test "adding a bool to an int is a type mismatch" {
     const one = try chunk.addConstant(allocator, .{ .int = 1 });
     _ = try chunk.emitWithOperand(allocator, .push_const, one);
     _ = try chunk.emit(allocator, .add);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "adding two strings concatenates them into a fresh heap string" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const hello = try chunk.addConstant(allocator, try Value.newString(allocator, "hello, "));
+    const world = try chunk.addConstant(allocator, try Value.newString(allocator, "world"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, hello);
+    _ = try chunk.emitWithOperand(allocator, .push_const, world);
+    _ = try chunk.emit(allocator, .add);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("hello, world\n", buf[0..len]);
+}
+
+test "adding an empty string to a string is a no-op concatenation" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const empty = try chunk.addConstant(allocator, try Value.newString(allocator, ""));
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "hi"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, empty);
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .add);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("hi\n", buf[0..len]);
+}
+
+test "adding a string to an int is a type mismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "x"));
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    _ = try chunk.emit(allocator, .add);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "string ordering compares lexicographically by byte, not by length" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    // "ab" < "b" (first differing byte 'a' < 'b'), even though "ab" is longer.
+    const ab = try chunk.addConstant(allocator, try Value.newString(allocator, "ab"));
+    const b = try chunk.addConstant(allocator, try Value.newString(allocator, "b"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, ab);
+    _ = try chunk.emitWithOperand(allocator, .push_const, b);
+    _ = try chunk.emit(allocator, .lt);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("true\n", buf[0..len]);
+}
+
+test "string ordering: a common prefix orders the shorter string first" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const abc = try chunk.addConstant(allocator, try Value.newString(allocator, "abc"));
+    const ab = try chunk.addConstant(allocator, try Value.newString(allocator, "ab"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, ab);
+    _ = try chunk.emitWithOperand(allocator, .push_const, abc);
+    _ = try chunk.emit(allocator, .lte);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("true\n", buf[0..len]);
+}
+
+test "string ordering: equal strings are neither less nor greater" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "same"));
+    const b = try chunk.addConstant(allocator, try Value.newString(allocator, "same"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emitWithOperand(allocator, .push_const, b);
+    _ = try chunk.emit(allocator, .gt);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("false\n", buf[0..len]);
+}
+
+test "an empty string orders before any non-empty string" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const empty = try chunk.addConstant(allocator, try Value.newString(allocator, ""));
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, empty);
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .lt);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("true\n", buf[0..len]);
+}
+
+test "comparing a string to a number is a type mismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "1"));
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    _ = try chunk.emit(allocator, .lt);
     _ = try chunk.emit(allocator, .halt);
 
     try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);

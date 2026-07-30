@@ -144,7 +144,21 @@
                                                (must be ARRAY_REF); pushes
                                                ref.len as an INT.
 
-   ADD, SUB, MUL, DIV, MOD, POW
+   ADD                    ( a b -- r )        two shapes: both operands
+                                               numeric (INT or FLOAT) behaves
+                                               like SUB/MUL/etc. below; both
+                                               operands STRING instead pushes
+                                               a FRESH heap string (section
+                                               11) of a's bytes followed by
+                                               b's, decreffing both operand
+                                               objects (their bytes are
+                                               copied, not adopted). Any other
+                                               pairing (including one STRING
+                                               and one numeric) is
+                                               TypeMismatch, decreffing
+                                               whichever operand(s) are heap
+                                               objects.
+   SUB, MUL, DIV, MOD, POW
                           ( a b -- r )        both operands numeric (INT or
                                                FLOAT); INT op INT stays INT
                                                (overflow-checked); any FLOAT
@@ -167,7 +181,17 @@
                                                of types simply compares
                                                unequal. Decrefs both operands
                                                after comparing.
-   LT, LTE, GT, GTE        ( a b -- bool )    numeric operands only
+   LT, LTE, GT, GTE        ( a b -- bool )    two shapes, mirroring ADD: both
+                                               operands numeric compare by
+                                               value; both operands STRING
+                                               compare byte-lexicographically
+                                               (an equal common prefix orders
+                                               the shorter one first),
+                                               decreffing both operand
+                                               objects. Any other pairing is
+                                               TypeMismatch (decreffing
+                                               whichever operand(s) are heap
+                                               objects).
 
    JUMP         #target               ip := target
    JUMP_IF_FALSE #target  ( bool -- bool )    peeks (does not pop) the

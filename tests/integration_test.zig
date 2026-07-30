@@ -97,6 +97,10 @@ test "string_indexing: hand-rolled key=value;... parsing via s[i]/s[a..b]" {
     try expectCaseOutput("string_indexing");
 }
 
+test "strings: concatenation and lexicographic ordering, incl. a bubble sort" {
+    try expectCaseOutput("strings");
+}
+
 // ---- Error-path cases ------------------------------------------------
 //
 // Programs that are expected to fail: no .expected file (there is nothing

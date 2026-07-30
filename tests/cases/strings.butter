@@ -1,0 +1,25 @@
+list names := ["banana", "apple", "cherry", "date"]
+int n := len(names)
+for i in 0..n {
+    for j in 0..(n - i - 1) {
+        if names[j] > names[j + 1] {
+            string temp := names[j]
+            names[j] := names[j + 1]
+            names[j + 1] := temp
+        }
+    }
+}
+for i in 0..n {
+    print names[i]
+}
+
+string greeting := "Hello, " + "world" + "!"
+print greeting
+
+print "abc" < "abd"
+print "abc" <= "abc"
+print "z" > "a"
+print "" >= ""
+print "ab" < "b"
+
+print stringify(42) + " is the answer"
