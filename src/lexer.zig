@@ -37,6 +37,15 @@ pub const TokenType = enum {
     kw_open,
     kw_close,
     kw_append,
+    kw_map,
+    kw_list,
+    kw_push,
+    kw_keys,
+    kw_has,
+    kw_delete,
+    kw_json,
+    kw_stringify,
+    kw_null,
 
     // Operators and punctuation
     plus,
@@ -58,6 +67,7 @@ pub const TokenType = enum {
     less_equal,
     greater,
     greater_equal,
+    colon,
     colon_equal,
     arrow,
     comma,
@@ -95,6 +105,15 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "open", .kw_open },
     .{ "close", .kw_close },
     .{ "append", .kw_append },
+    .{ "map", .kw_map },
+    .{ "list", .kw_list },
+    .{ "push", .kw_push },
+    .{ "keys", .kw_keys },
+    .{ "has", .kw_has },
+    .{ "delete", .kw_delete },
+    .{ "json", .kw_json },
+    .{ "stringify", .kw_stringify },
+    .{ "null", .kw_null },
 });
 
 pub const Token = struct {
@@ -118,7 +137,6 @@ pub const Error = error{
     UnterminatedString,
     MalformedNumber,
     LoneEqual,
-    LoneColon,
 };
 
 pub const Lexer = struct {
@@ -201,7 +219,7 @@ pub const Lexer = struct {
     }
 
     fn isAlpha(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
     }
 
     fn isAlphaNumeric(c: u8) bool {
@@ -272,7 +290,11 @@ pub const Lexer = struct {
             '<' => self.makeToken(if (self.match('=')) .less_equal else .less),
             '>' => self.makeToken(if (self.match('=')) .greater_equal else .greater),
             '=' => if (self.match('=')) self.makeToken(.equal_equal) else self.fail(Error.LoneEqual, "'=' must be followed by '=' (did you mean '=='?)"),
-            ':' => if (self.match('=')) self.makeToken(.colon_equal) else self.fail(Error.LoneColon, "':' must be followed by '=' (did you mean ':='?)"),
+            // Unlike '=', a lone ':' is legal on its own now (GRAMMAR.bnf
+            // design note 3m) — it's what separates a key from its value in
+            // a map literal (`{"a": 1}`) — so only ':=' gets its own token;
+            // a bare ':' is simply `.colon`, not an error.
+            ':' => self.makeToken(if (self.match('=')) .colon_equal else .colon),
             else => self.fail(Error.UnexpectedCharacter, "unexpected character"),
         };
     }
@@ -405,6 +427,25 @@ test "identifiers may contain digits but not start with one" {
     try std.testing.expectEqualStrings("y2z", b.lexeme);
 }
 
+test "identifiers may contain or start with underscores" {
+    var lexer = Lexer.init("_foo bar_baz _1a __");
+    const a = try lexer.next();
+    try std.testing.expectEqual(TokenType.identifier, a.type);
+    try std.testing.expectEqualStrings("_foo", a.lexeme);
+
+    const b = try lexer.next();
+    try std.testing.expectEqual(TokenType.identifier, b.type);
+    try std.testing.expectEqualStrings("bar_baz", b.lexeme);
+
+    const c = try lexer.next();
+    try std.testing.expectEqual(TokenType.identifier, c.type);
+    try std.testing.expectEqualStrings("_1a", c.lexeme);
+
+    const d = try lexer.next();
+    try std.testing.expectEqual(TokenType.identifier, d.type);
+    try std.testing.expectEqualStrings("__", d.lexeme);
+}
+
 test "newline is a significant token, other whitespace is not" {
     try expectTokenTypes(" \t1 \r\n 2\n", &.{ .int, .newline, .int, .newline, .eof });
 }
@@ -414,9 +455,12 @@ test "lone '=' is a lexer error" {
     try std.testing.expectError(Error.LoneEqual, lexer.next());
 }
 
-test "lone ':' is a lexer error" {
-    var lexer = Lexer.init(":");
-    try std.testing.expectError(Error.LoneColon, lexer.next());
+test "a lone ':' lexes as its own token (map-literal key separator)" {
+    try expectTokenTypes(":", &.{ .colon, .eof });
+}
+
+test "':=' still lexes as one token, distinct from a lone ':'" {
+    try expectTokenTypes(": :=", &.{ .colon, .colon_equal, .eof });
 }
 
 test "diagnostic reports line and column of the failure" {
@@ -465,4 +509,10 @@ test "a comment with no trailing newline runs to eof" {
 
 test "'#' immediately followed by newline is an empty comment" {
     try expectTokenTypes("1 #\n2", &.{ .int, .newline, .int, .eof });
+}
+
+test "map/list and their builtins are recognized as keywords" {
+    try expectTokenTypes("map list push keys has delete json stringify null mapx", &.{
+        .kw_map, .kw_list, .kw_push, .kw_keys, .kw_has, .kw_delete, .kw_json, .kw_stringify, .kw_null, .identifier, .eof,
+    });
 }

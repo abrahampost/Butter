@@ -25,7 +25,7 @@
    -------------------------------------------------------------------------- *)
 
 <digit>      ::= '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'
-<alpha>      ::= 'a' | ... | 'z' | 'A' | ... | 'Z'
+<alpha>      ::= 'a' | ... | 'z' | 'A' | ... | 'Z' | '_'
 <alphanum>   ::= <alpha> | <digit>
 
 IDENTIFIER   ::= <alpha> { <alphanum> }
@@ -42,11 +42,13 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'func' | 'return' | 'for' | 'in' | 'import' | 'export'
                | 'len' | 'read' | 'write' | 'open' | 'close'
                | 'stdin' | 'stdout' | 'stderr' | 'append'
+               | 'map' | 'list' | 'push' | 'keys' | 'has' | 'delete'
+               | 'json' | 'stringify' | 'null'
 
 (* Operators and punctuation *)
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
-               | '!' | '!=' | '==' | '<' | '<=' | '>' | '>=' | ':='
+               | '!' | '!=' | '==' | '<' | '<=' | '>' | '>=' | ':' | ':='
                | '->' | ',' | '..'
 
 (* Notes on lexing:
@@ -57,9 +59,12 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      terminating it is still scanned as its own NEWLINE token immediately
      after. A comment does not nest and is not recognized inside a STRING.
    - '=' must always be followed by '=' (producing '=='); a lone '=' is a
-     lexer error. Likewise ':' must always be followed by '=' (producing the
-     assignment operator ':='). A lone '.' is a lexer error too — the only
-     thing '.' is ever part of is the two-character '..' range operator.
+     lexer error. ':' is different: ':=' is still its own single token, but
+     a lone ':' is legal on its own too, as the separator between a map
+     literal's key and its value (design note 3m) — unlike '=', there was
+     no existing meaning a lone ':' would ambiguously collide with. A lone
+     '.' is still a lexer error — the only thing '.' is ever part of is the
+     two-character '..' range operator.
 *)
 
 
@@ -109,11 +114,14 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 (* The optional '[' INT ']' is what makes this an array declaration
    instead of a plain scalar one — see design note 3e. INT here must be a
    literal (the array's size is always known at compile time), not an
-   arbitrary <expression>. *)
+   arbitrary <expression>. It never applies when <type> is 'map' or 'list'
+   — a map/list declaration is always exactly one value, never a run of
+   raw slots (design note 3m) — so `map[3] m` is a parse error: the array
+   suffix is simply never attempted after a 'map'/'list' type token. *)
 <var-declaration>   ::= <type> [ '[' INT ']' ] IDENTIFIER
                          [ ':=' <expression> ] <end>
 
-<type>              ::= 'int' | 'float' | 'bool' | 'string'
+<type>              ::= 'int' | 'float' | 'bool' | 'string' | 'map' | 'list'
 
 <block>             ::= '{' { NEWLINE } { <declaration> { NEWLINE } } '}'
 
@@ -158,8 +166,16 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <expression>        ::= <assignment>
 
+(* The second form is recognized after the fact, not predictively: the
+   parser parses a general <expression> first, and only afterward — if a
+   ':=' actually follows — checks whether what it parsed has the shape of
+   a bare identifier or a <primary> ending in a '[' <expression> ']' suffix,
+   reinterpreting it as an assignment target if so (design note 3m; this is
+   exactly how the bare-IDENTIFIER case already worked before maps/lists
+   existed, just now covering a `<primary>` base instead of only IDENTIFIER
+   directly). Anything else left of ':=' is a parse error either way. *)
 <assignment>        ::= IDENTIFIER ':=' <assignment>
-                      | IDENTIFIER '[' <expression> ']' ':=' <assignment>
+                      | <primary> '[' <expression> ']' ':=' <assignment>
                       | <logic-or>
 
 <logic-or>          ::= <logic-and> { 'or' <logic-and> }
@@ -179,19 +195,40 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <unary>             ::= ( '!' | '-' ) <unary>
                       | <primary>
 
-<primary>           ::= INT
+(* <primary>'s postfix '[' <expression> ']' suffix is what lets bracket
+   indexing CHAIN (`doc["a"]["b"]`, design note 3m) — applied uniformly
+   after ANY <atom>, not just IDENTIFIER. A shape that doesn't actually
+   name something indexable (`5[0]`) isn't rejected here, in the grammar —
+   it's rejected later, by the compiler (a statically-known non-array/
+   collection bare local) or the VM (`RuntimeError.TypeMismatch` for
+   anything else), the same "checked, not trusted" stance the rest of this
+   language already takes rather than a grammar-level restriction. A FIXED
+   or GENERIC array (design notes 3e/3j) is the one exception that still
+   can't chain in practice — its element is always scalar, so indexing
+   further only ever reaches the VM's own runtime type check, never a
+   second array/list/map layer. *)
+<primary>           ::= <atom> { '[' <expression> ']' }
+
+<atom>              ::= INT
                       | FLOAT
                       | STRING
                       | 'true'
                       | 'false'
+                      | 'null'
                       | '(' <expression> ')'
                       | <call-expr>
                       | <array-literal>
-                      | <index-expr>
+                      | <map-literal>
                       | <len-expr>
                       | <read-expr>
                       | <write-expr>
                       | <open-expr>
+                      | <push-expr>
+                      | <keys-expr>
+                      | <has-expr>
+                      | <delete-expr>
+                      | <json-expr>
+                      | <stringify-expr>
                       | 'stdin' | 'stdout' | 'stderr'
                       | IDENTIFIER
 
@@ -199,16 +236,34 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <arg-list>          ::= <expression> { ',' <expression> }
 
-(* No nested/chained indexing (no `matrix[i][j]`) — Butter has no
-   arrays-of-arrays (design note 3e). *)
+(* Doubles as a `list` initializer (design note 3m) — this production is
+   unchanged either way; only the compiler's handling of it differs based
+   on what's being initialized. Beyond a fixed-array-initializer position,
+   a bracketed literal now always means "build a list" (design note 3m)
+   rather than being a compile error, the one place this grammar's
+   original "no nested/chained indexing" story (design note 3e) actually
+   changes: a LIST can hold another list/map as an element, so a list of
+   lists is fully expressible — just never through this `[N]`-suffix array
+   syntax, only through nesting two list/map values themselves. *)
 <array-literal>     ::= '[' [ <expression> { ',' <expression> } ] ']'
 
-<index-expr>        ::= IDENTIFIER '[' <expression> ']'
+(* Keys are STRING tokens (static text), not arbitrary expressions — a
+   dynamic key remains fully expressible via `m[expr] := v` once the map
+   exists. Never ambiguous with <block> (which also starts with '{'): a
+   block is only ever reached in statement position, a map literal only in
+   expression position, so the parser never has to disambiguate the two at
+   the same decision point. *)
+<map-literal>       ::= '{' [ <map-entry> { ',' <map-entry> } ] '}'
+<map-entry>         ::= STRING ':' <expression>
 
-(* Only ever a bare IDENTIFIER, not an arbitrary expression — same
-   restriction as <index-expr>'s target, and for the same reason: arrays
-   aren't first-class values to compute one from (design note 3e). *)
-<len-expr>          ::= 'len' '(' IDENTIFIER ')'
+(* Relaxed from a bare IDENTIFIER (design note 3m) now that a map/list is a
+   genuine first-class runtime value. A bare identifier naming a fixed or
+   generic array still gets the exact same compile-time-constant-fold /
+   runtime-length-read treatment as before (arrays still aren't first-class,
+   design note 3e) — that's now a compiler-level pattern match on the
+   parsed shape, not a parser-level restriction; anything else compiles as
+   an ordinary expression, checked at run time. *)
+<len-expr>          ::= 'len' '(' <expression> ')'
 
 (* Byte-stream I/O — see design note 3k. `stdin`/`stdout`/`stderr` are bare
    keywords (matched by <primary> directly, above) that evaluate to a
@@ -223,8 +278,9 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 (* Reads up to `len(IDENTIFIER)` bytes into that buffer and evaluates to
    how many were actually read — 0, and only 0, at end of input. The
-   destination is a bare array name for the same reason <index-expr>'s and
-   <len-expr>'s targets are. *)
+   destination is a bare array name — arrays still aren't first-class
+   values to read into, design note 3e — the one restriction `<len-expr>`
+   no longer shares now that a map/list is a first-class runtime value. *)
 <read-expr>         ::= 'read' '(' <expression> ',' IDENTIFIER ')'
 
 (* Two forms, told apart by argument count alone. The two-argument form
@@ -246,6 +302,38 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <open-mode>         ::= 'read' | 'write' | 'append'
 
+(* Maps and lists — see design note 3m. All four take arbitrary
+   <expression>s, not bare identifiers: a map/list is a genuine first-class
+   runtime value, unlike the array-era primitives above that are restricted
+   to a name because arrays aren't first-class (design note 3e). *)
+
+(* Grows `list` by one element, evaluating to its new length (mirroring
+   <write-expr>'s "evaluates to a count" convention). *)
+<push-expr>         ::= 'push' '(' <expression> ',' <expression> ')'
+
+(* A fresh `list` of `map`'s own keys, in insertion order — how map/list
+   iteration works (`for i in 0..len(ks) { ... }`) instead of a dedicated
+   foreach form (design note 3g already declines one). *)
+<keys-expr>         ::= 'keys' '(' <expression> ')'
+
+(* Whether `key` is present in `map`, without the runtime error a
+   bracket-read raises for a missing one. *)
+<has-expr>          ::= 'has' '(' <expression> ',' <expression> ')'
+
+(* Removes `key` from `map` if present, evaluating to whether it was. *)
+<delete-expr>       ::= 'delete' '(' <expression> ',' <expression> ')'
+
+(* JSON — see design note 3n. Parses the first `count` bytes of an `int`
+   buffer as JSON text and evaluates to whatever the document's root turns
+   out to be. `buffer` is a bare array name, the same restriction
+   <read-expr>'s destination has and for the same reason (design note 3e). *)
+<json-expr>         ::= 'json' '(' IDENTIFIER ',' <expression> ')'
+
+(* The reverse of <json-expr> — see design note 3o. Renders `value` (an
+   arbitrary expression, unlike <json-expr>'s buffer) as JSON text and
+   evaluates to a `string`. *)
+<stringify-expr>    ::= 'stringify' '(' <expression> ')'
+
 
 (* --------------------------------------------------------------------------
    3. DESIGN NOTES
@@ -257,7 +345,8 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
       These are simply absent from the grammar today; adding them is a
       language-growth task, not a fix. (Function/procedure declarations
       used to be listed here too — see notes b/c below for how they were
-      added and what stayed deliberately restricted.)
+      added and what stayed deliberately restricted; arrays and maps/lists
+      likewise moved out from here as they were added — see notes e and m.)
    -------------------------------------------------------------------- *)
 
 (* --- Functions (language-growth addition, not a "fix") -----------------
@@ -317,11 +406,11 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
       return type, or the initializer of an array var-declaration — the
       expression there is restricted to exactly two forms: a bare
       IDENTIFIER naming an array of matching length (the same restriction
-      <index-expr> and <len-expr> already place on their own target), or a
-      <call-expr> to a function whose own return type is an array of
-      matching length. This is what lets array-processing functions
-      compose (`sum(doubleAll(nums))`) without arrays ever needing to be a
-      general expression form.
+      bracket-indexing and `len` already place on a FIXED/GENERIC array
+      target — notes f and i), or a <call-expr> to a function whose own
+      return type is an array of matching length. This is what lets
+      array-processing functions compose (`sum(doubleAll(nums))`) without
+      arrays ever needing to be a general expression form.
 
    e2) ARITY COUNTS PARAMETERS, NOT STACK SLOTS. Design note d's "supply
       exactly as many arguments as the callee declares parameters" still
@@ -339,17 +428,20 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
       (possibly belonging to a different call frame entirely), so this
       check is load-bearing for memory safety, not a nicety.
 
-   i) `len(arr)` IS A COMPILE-TIME CONSTANT, NOT A RUNTIME QUERY. Because
-      an array's size can never change after its declaration (note e
-      above), `len(arr)` needs no runtime representation at all — it
+   i) `len(arr)` ON A FIXED ARRAY IS A COMPILE-TIME CONSTANT, NOT A RUNTIME
+      QUERY. Because an array's size can never change after its
+      declaration (note e above), `len(arr)` needs no runtime
+      representation at all when `arr` is a bare IDENTIFIER naming one — it
       resolves at compile time to the same INT literal the declaration
       itself used, exactly as if you'd written that literal by hand (see
-      ISA.bnf section 2's array-length addendum). Like <index-expr>,
-      `len`'s argument is only ever a bare IDENTIFIER, never an arbitrary
-      expression — there is no array-valued expression to call `len` on
-      in the first place, since arrays aren't first-class values (note e).
-      This is the building block a hand-written standard-library function
-      needs to loop over an array it's handed the size of without a
+      ISA.bnf section 2's array-length addendum), the same bare-IDENTIFIER
+      restriction bracket-indexing places on a FIXED/GENERIC array target
+      (note f) — there is no array-valued expression to call `len` on in
+      the first place, since arrays aren't first-class values (note e).
+      `len`'s argument is no longer restricted to that one case, though:
+      see note m for a map/list, where it's a genuine runtime operation
+      instead. This is the building block a hand-written standard-library
+      function needs to loop over an array it's handed the size of without a
       caller having to pass the size separately — e.g.
       `for i in 0..len(arr) { ... }` — and combined with note e's
       by-value call-boundary passing, this is enough to write and compose
@@ -552,6 +644,154 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
       sandboxed program simply doesn't grant it filesystem access at all,
       in which case `open` fails with `RuntimeError.FilesUnavailable`
       instead of touching anything on disk.
+   -------------------------------------------------------------------- *)
+
+(* --- Maps and lists (language-growth addition, not a "fix") -------------
+
+   m) THE VM'S FIRST HEAP. Every previous piece of language growth in this
+      document was careful to say some version of "and this still needs no
+      heap" (arrays are consecutive stack slots; a generic array is a
+      reference into the same stack; a stream is an index into a fixed
+      table). Maps and lists are the first values that genuinely can't be
+      represented that way: their size isn't known at compile time, doesn't
+      fit in a fixed number of slots, and can change after they're created.
+      So this is the first feature that gives the VM a real heap and a real
+      allocator — see ISA.bnf section 11 for the refcounted representation
+      this requires, and the accepted tradeoff (a self-referential
+      structure leaks) that comes with it.
+
+      `map` and `list` are new entries in `<type>`, not new suffixes on an
+      existing scalar type the way a fixed/generic array is — a `map`- or
+      `list`-declared local is always exactly one runtime value (a
+      reference to a heap object), never a run of raw stack slots, which is
+      also why neither ever takes the `[N]`/`[]` array suffix
+      `int`/`float`/`bool`/`string` can. Reading/writing an element reuses
+      the EXISTING bracket-indexing syntax (the assignment production's
+      `<primary> '[' <expression> ']' ':=' <assignment>` form, and
+      `<primary>`'s own postfix suffix) rather than adding get/set
+      functions — those productions already accepted an arbitrary
+      `<expression>` inside the brackets, so no grammar change was needed
+      there at all beyond generalizing the indexed thing from a bare
+      IDENTIFIER to any `<primary>` (which is what lets indexing CHAIN,
+      `doc["a"]["b"]`) — only a runtime distinction between "index by INT
+      into a list" and "index by STRING key into a map," which the VM
+      checks regardless of what the compiler expected a given local to hold
+      (the same "declared type isn't checked" latitude every other variable
+      already has, applied here too).
+
+      A map/list value is a REFERENCE TO A SHARED HEAP OBJECT, not a copy:
+      `b := a` where `a` is a list makes `b` an alias of the very same
+      list, and mutating one through `push`/index-assignment is visible
+      through the other — this is deliberately different from a fixed
+      array (always copied, note e) and closer to (but simpler than) a
+      generic array reference (note j). It's simpler because a map/list
+      reference never points into a stack frame that could be torn down
+      while a reference to it still exists — it's a heap allocation with
+      its own independent lifetime (refcounted, freed when the last
+      reference goes away — ISA.bnf section 11) — so, unlike note j's
+      generic array references, there is NO RESTRICTION on returning one,
+      storing one inside another map/list, or handing one to a function and
+      getting it back. Nesting falls out for free: a list of maps, a map of
+      lists, a list of lists are all just ordinary heap objects holding
+      values that happen to be other heap objects — the one place this
+      document's original "no nested/chained indexing" story (note e)
+      genuinely changes, though only through these new heap values, never
+      through the old fixed-slot array mechanism, which stays exactly as
+      restricted as it always was.
+
+      Growing a list is `push(list, value)`, evaluating to the list's new
+      length (mirroring `write`'s "evaluates to a count" convention) rather
+      than being a bracket-assignment, since bracket-assignment on a list
+      still requires an in-bounds index (exactly like an array) — there's
+      no auto-vivifying `xs[len(xs)] := v`. There is deliberately no way to
+      remove an element from a list in this pass (only a map key, via
+      `delete`) — write it another way for now, matching this grammar's
+      existing practice (note g) of declining a feature rather than
+      half-committing to it.
+
+      Iterating a map's keys is `keys(m) -> list`, not new loop syntax —
+      note g already declined to add a foreach form, and this is consistent
+      with that: `for i in 0..len(ks) { ks[i] ... }` over an ordinary list
+      is enough, and keeps `for` exactly the range-based form it's always
+      been. `has(map, key)` answers whether a key is present without
+      raising an error the way reading a missing key does
+      (`RuntimeError.KeyNotFound`) — a map's bracket-read requires
+      existence, the same "checked" stance array bounds have, but
+      `has`/`delete` are explicitly the escape hatch for code that doesn't
+      want that check to be fatal.
+
+      `len(...)` is relaxed from a bare IDENTIFIER to an arbitrary
+      `<expression>`, the same move note k made for `read`/`write`'s
+      stream position once a stream could be a genuine runtime value: a
+      bare fixed- or generic-array name still gets the exact same
+      treatment it always did (a compile-time constant, or a cheap runtime
+      field read — ISA.bnf section 2), because arrays still aren't
+      first-class values (note e is unchanged) — but a map or list
+      genuinely IS one now, so `len` on anything else is a real runtime
+      operation on whatever value it's handed,
+      `RuntimeError.TypeMismatch` if that value turns out not to be a list
+      or a map.
+   -------------------------------------------------------------------- *)
+
+(* --- JSON (language-growth addition, not a "fix") ------------------------
+
+   n) `json(buffer, count)` parses the first `count` bytes of an `int`
+      buffer — a byte buffer, the same convention `read`/`write`'s buffer
+      forms already use (note k), not a STRING — as JSON text, and
+      evaluates to whatever value the document's root turns out to be: a
+      number, a boolean, `null`, a string, a list, or a map. This is
+      deliberately NOT a `func` a program could declare an equivalent of: a
+      `func`'s return type is fixed and declared once (note c) — `int`,
+      `map`, whatever — but a parsed JSON document's root type is only
+      known once the bytes are actually read, which is exactly the kind of
+      genuinely dynamic result this language has otherwise never needed a
+      mechanism for. So `json` is a special form, parsed like
+      `len`/`read`/`write`/`open`, not an ordinary call.
+
+      The buffer-not-string choice also sidesteps a prerequisite this
+      language doesn't otherwise have: there is still no way to turn bytes
+      a program `read` from a file or stream into a Butter STRING value
+      (every STRING used to be a borrowed compile-time literal — ISA.bnf
+      section 2 — and even now that heap strings exist (note m), nothing
+      yet converts a raw byte buffer into one directly). `json` doesn't
+      need that primitive as a stepping stone: it consumes the buffer
+      directly and produces whatever heap strings/maps/lists the
+      document's own string/object/array values require, via the same heap
+      note m already introduced.
+
+      Malformed input is `RuntimeError.JsonParseFailed`, with
+      `Vm.diagnostic` carrying a description of what went wrong — the same
+      side-channel files already established (ISA.bnf section 10) for an
+      error a bare Zig error tag can't carry enough detail for on its own.
+
+   o) `stringify(value)` is `json`'s reverse: it renders ANY value — not
+      just a map/list, any of the six kinds note n) lists — as JSON text and
+      evaluates to a `string`. Unlike `json`, `value`'s TYPE is no obstacle
+      to `stringify` being an ordinary `func` (a `string` return type is
+      just as fixed and declarable as any other — note c); it's a special
+      form anyway, parsed like `json` itself, because nothing in this
+      language lets a `func` build a `string` a piece at a time (no
+      concatenation, no formatting) the way `stringify`'s own recursive
+      walk over a value needs to.
+
+      THIS IS A DEDICATED JSON ENCODER, NOT `print` REPURPOSED. `Value.print`
+      (ISA.bnf section 2) already renders a list/map in JSON-*shaped* syntax
+      for human-readable debug output (`print [1, "a"]` writes `[1, "a"]`),
+      but it does so unescaped — a string containing a `"` or a control
+      character comes out as broken JSON, because `print` exists to be read
+      by a person watching the program run, not re-parsed. `stringify`
+      instead escapes properly (quote, backslash, and control characters —
+      via `std.json.Stringify.encodeJsonString`, the same "let std.json
+      handle the solved problem" split `json` itself already makes for
+      parsing), so what it produces round-trips back through `json(...)`
+      for any string a document could actually contain.
+
+      A STREAM OR ARRAY REFERENCE HAS NO JSON REPRESENTATION. Both are
+      reachable here — `stringify(stdout)` parses, and a stream can end up
+      nested inside a list/map via `push`/`m[k] := stdout` — but JSON has no
+      value for either, so encoding one is `RuntimeError.TypeMismatch`
+      rather than `print`'s `<stdout>`/`<array>` placeholder text; a JSON
+      encoder has no business inventing text that isn't valid JSON.
    -------------------------------------------------------------------- *)
 
 (* --- The for-loop (language-growth addition, not a "fix") ---------------

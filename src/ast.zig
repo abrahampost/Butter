@@ -26,6 +26,15 @@ pub const ValueType = enum {
     float,
     bool,
     string,
+    /// A refcounted heap map (GRAMMAR.bnf design note 3m) — unlike the
+    /// other four, this is always exactly one runtime value (a heap
+    /// reference), never a run of raw stack slots, so it never takes the
+    /// `[N]`/`[]` array suffix `Param`/`VarDecl`/`FunctionDecl` otherwise
+    /// allow.
+    map,
+    /// A refcounted heap list (GRAMMAR.bnf design note 3m) — same story as
+    /// `map`, but ordered/indexed by INT instead of by STRING key.
+    list,
 };
 
 pub const UnaryOp = enum {
@@ -55,6 +64,10 @@ pub const Literal = union(enum) {
     float: f64,
     string: []const u8,
     boolean: bool,
+    /// JSON's `null` (ISA.bnf section 12) — named `null_value`, not `null`,
+    /// since `null` is a reserved word and can't name a union field
+    /// directly (matching `value.Value.null_value`'s own naming).
+    null_value,
 };
 
 /// A parameter's or a function's return type's optional array-ness: either
@@ -89,15 +102,49 @@ pub const Expr = union(enum) {
     array_literal: []*Expr,
     index: Index,
     index_assign: IndexAssign,
-    /// `len(IDENTIFIER)` — only ever a bare array name, matching `Index`'s
-    /// restriction to bare identifiers (no chained/computed targets).
-    len_of: []const u8,
+    /// `len(<expression>)`. Relaxed from a bare array name to an arbitrary
+    /// expression (GRAMMAR.bnf design note 3m) now that a map/list is a
+    /// genuine first-class runtime value — the compiler still special-cases
+    /// a bare `.variable` naming a fixed/generic array to fold to a
+    /// compile-time constant or `LOAD_REF_LEN` exactly as before (arrays
+    /// still aren't first-class, design note 3e); anything else compiles as
+    /// an ordinary expression followed by `LEN_VALUE`.
+    len_of: *Expr,
     /// One of the three keyword-named streams, as a value.
     stream_literal: Stream.Standard,
     read_bytes: ReadBytes,
     write_value: WriteValue,
     write_bytes: WriteBytes,
     open_file: OpenFile,
+    /// `{ "k1": v1, "k2": v2, ... }` (GRAMMAR.bnf design note 3m). Keys are
+    /// static STRING tokens, not arbitrary expressions — a dynamic key is
+    /// still fully expressible via `m[expr] := v` once the map exists.
+    map_literal: []MapEntry,
+    /// `push(list, value)` — grows a list by one element, evaluating to its
+    /// new length (mirroring `write`'s "evaluates to a count" convention).
+    list_push: ListPush,
+    /// `has(map, key)` — whether `key` is present, without the
+    /// `RuntimeError.KeyNotFound` a bracket-read raises for a missing one.
+    map_has: MapHas,
+    /// `delete(map, key)` — removes `key` if present, evaluating to whether
+    /// it was.
+    map_delete: MapDelete,
+    /// `keys(map)` — a fresh `list` of the map's own keys, in insertion
+    /// order. How map/list iteration works (`for i in 0..len(ks) { ... }`)
+    /// instead of a dedicated foreach form (GRAMMAR.bnf design note 3g).
+    map_keys: *Expr,
+    /// `json(buffer, count)` (GRAMMAR.bnf design note 3n) — parses the first
+    /// `count` bytes of an `int` buffer as JSON, evaluating to whatever the
+    /// document's root turns out to be. `buffer` is a bare array name, the
+    /// same restriction `ReadBytes`'s destination has and for the same
+    /// reason: arrays still aren't first-class (design note 3e).
+    json_parse: JsonParse,
+    /// `stringify(value)` (GRAMMAR.bnf design note 3o) — the reverse of
+    /// `json_parse`: renders an arbitrary value as JSON text, evaluating to
+    /// a fresh heap `string`. `value` is a general expression (unlike
+    /// `json_parse`'s buffer, this has no array-identifier restriction to
+    /// inherit — it reads a value, it doesn't name a buffer to fill).
+    json_stringify: *Expr,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -120,17 +167,48 @@ pub const Expr = union(enum) {
         args: []*Expr,
     };
 
-    /// `arr[index]` — only ever a bare IDENTIFIER followed by '[', no
-    /// chained/nested indexing (Butter has no arrays-of-arrays).
+    /// `<base>[index]`. `base` is a general expression, not just a bare
+    /// name — this is what lets bracket-indexing CHAIN for map/list values
+    /// (`doc["a"]["b"]`, GRAMMAR.bnf design note 3m), unlike an array
+    /// (design note 3e), which still only ever resolves through a bare
+    /// `.variable` base: the compiler rejects (or, for a non-identifier
+    /// base, the VM rejects at run time) any other shape for a fixed/
+    /// generic array target, since an array element is always scalar and
+    /// therefore never itself indexable.
     pub const Index = struct {
-        name: []const u8,
+        base: *Expr,
         index: *Expr,
     };
 
     pub const IndexAssign = struct {
-        name: []const u8,
+        base: *Expr,
         index: *Expr,
         value: *Expr,
+    };
+
+    pub const MapEntry = struct {
+        key: []const u8,
+        value: *Expr,
+    };
+
+    pub const ListPush = struct {
+        list: *Expr,
+        value: *Expr,
+    };
+
+    pub const MapHas = struct {
+        map: *Expr,
+        key: *Expr,
+    };
+
+    pub const MapDelete = struct {
+        map: *Expr,
+        key: *Expr,
+    };
+
+    pub const JsonParse = struct {
+        buffer: []const u8,
+        count: *Expr,
     };
 
     /// `read(stream, buffer)` — fills `buffer`'s elements with raw bytes
@@ -261,6 +339,7 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             .float => |v| try writer.print("{d}", .{v}),
             .string => |v| try writer.print("\"{s}\"", .{v}),
             .boolean => |v| try writer.print("{}", .{v}),
+            .null_value => try writer.writeAll("null"),
         },
         .variable => |name| try writer.writeAll(name),
         .unary => |u| {
@@ -305,18 +384,26 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try writer.writeAll(")");
         },
         .index => |i| {
-            try writer.print("(index {s} ", .{i.name});
+            try writer.writeAll("(index ");
+            try printExpr(writer, i.base);
+            try writer.writeAll(" ");
             try printExpr(writer, i.index);
             try writer.writeAll(")");
         },
         .index_assign => |ia| {
-            try writer.print("(:= (index {s} ", .{ia.name});
+            try writer.writeAll("(:= (index ");
+            try printExpr(writer, ia.base);
+            try writer.writeAll(" ");
             try printExpr(writer, ia.index);
             try writer.writeAll(") ");
             try printExpr(writer, ia.value);
             try writer.writeAll(")");
         },
-        .len_of => |name| try writer.print("(len {s})", .{name}),
+        .len_of => |e| {
+            try writer.writeAll("(len ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
         .stream_literal => |s| try writer.writeAll(s.name()),
         .read_bytes => |r| {
             try writer.writeAll("(read ");
@@ -341,6 +428,51 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try writer.writeAll("(open ");
             try printExpr(writer, o.path);
             try writer.print(" {s})", .{o.mode.name()});
+        },
+        .map_literal => |entries| {
+            try writer.writeAll("(map");
+            for (entries) |entry| {
+                try writer.print(" (\"{s}\" ", .{entry.key});
+                try printExpr(writer, entry.value);
+                try writer.writeAll(")");
+            }
+            try writer.writeAll(")");
+        },
+        .list_push => |p| {
+            try writer.writeAll("(push ");
+            try printExpr(writer, p.list);
+            try writer.writeAll(" ");
+            try printExpr(writer, p.value);
+            try writer.writeAll(")");
+        },
+        .map_has => |h| {
+            try writer.writeAll("(has ");
+            try printExpr(writer, h.map);
+            try writer.writeAll(" ");
+            try printExpr(writer, h.key);
+            try writer.writeAll(")");
+        },
+        .map_delete => |d| {
+            try writer.writeAll("(delete ");
+            try printExpr(writer, d.map);
+            try writer.writeAll(" ");
+            try printExpr(writer, d.key);
+            try writer.writeAll(")");
+        },
+        .map_keys => |m| {
+            try writer.writeAll("(keys ");
+            try printExpr(writer, m);
+            try writer.writeAll(")");
+        },
+        .json_parse => |j| {
+            try writer.print("(json {s} ", .{j.buffer});
+            try printExpr(writer, j.count);
+            try writer.writeAll(")");
+        },
+        .json_stringify => |e| {
+            try writer.writeAll("(stringify ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
         },
     }
 }
@@ -377,6 +509,8 @@ fn valueTypeName(t: ValueType) []const u8 {
         .float => "float",
         .bool => "bool",
         .string => "string",
+        .map => "map",
+        .list => "list",
     };
 }
 

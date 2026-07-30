@@ -64,9 +64,10 @@ pub fn main(init: std.process.Init) !void {
         stdin_reader.interface.allocRemaining(gpa, .unlimited) catch |err| {
             printUsageAndExit("error: failed to read standard input: {s}", .{@errorName(err)});
         }
-    else std.Io.Dir.cwd().readFileAlloc(init.io, file_path.?, gpa, .unlimited) catch |err| {
-        printUsageAndExit("error: failed to read '{s}': {s}", .{ file_path.?, @errorName(err) });
-    };
+    else
+        std.Io.Dir.cwd().readFileAlloc(init.io, file_path.?, gpa, .unlimited) catch |err| {
+            printUsageAndExit("error: failed to read '{s}': {s}", .{ file_path.?, @errorName(err) });
+        };
 
     // Relative `import`s resolve against the entry file's own directory
     // (or the current directory, for --stdin, which has no file of its
@@ -116,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
     var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
     const stderr_writer = &stderr_file_writer.interface;
 
-    var vm = butter.vm.Vm.init();
+    var vm = butter.vm.Vm.init(gpa);
     vm.run(&chunk, .{
         .out = stdout_writer,
         .err = stderr_writer,

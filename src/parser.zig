@@ -144,7 +144,7 @@ pub const Parser = struct {
 
     fn declaration(self: *Parser) Error!ast.Stmt {
         return switch (self.peek().type) {
-            .kw_int, .kw_float, .kw_bool, .kw_string => self.varDeclaration(),
+            .kw_int, .kw_float, .kw_bool, .kw_string, .kw_map, .kw_list => self.varDeclaration(),
             .lbrace => self.block(),
             .kw_if => self.ifStatement(),
             .kw_while => self.whileStatement(),
@@ -153,7 +153,7 @@ pub const Parser = struct {
         };
     }
 
-    /// <type> ::= 'int' | 'float' | 'bool' | 'string'
+    /// <type> ::= 'int' | 'float' | 'bool' | 'string' | 'map' | 'list'
     fn parseType(self: *Parser) Error!ast.ValueType {
         const tok = self.peek();
         const value_type: ast.ValueType = switch (tok.type) {
@@ -161,6 +161,8 @@ pub const Parser = struct {
             .kw_float => .float,
             .kw_bool => .bool,
             .kw_string => .string,
+            .kw_map => .map,
+            .kw_list => .list,
             else => return self.fail("expected a type"),
         };
         _ = self.advance();
@@ -192,7 +194,11 @@ pub const Parser = struct {
         if (!self.check(.rparen)) {
             while (true) {
                 const param_type = try self.parseType();
-                const param_array_size = try self.parseArraySpec();
+                // map/list never take the array suffix — they're always
+                // exactly one value, never a run of raw slots (GRAMMAR.bnf
+                // design note 3m) — so this is simply never attempted for
+                // them, the same way it's never attempted for a param name.
+                const param_array_size = if (param_type == .map or param_type == .list) null else try self.parseArraySpec();
                 const param_name = try self.expect(.identifier, "expected a parameter name");
                 try params.append(self.allocator(), .{ .type = param_type, .name = param_name.lexeme, .array_size = param_array_size });
                 if (!self.match(.comma)) break;
@@ -201,7 +207,7 @@ pub const Parser = struct {
         _ = try self.expect(.rparen, "expected ')' after parameters");
         _ = try self.expect(.arrow, "expected '->' before return type");
         const return_type = try self.parseType();
-        const return_array_size = try self.parseArraySpec();
+        const return_array_size = if (return_type == .map or return_type == .list) null else try self.parseArraySpec();
 
         const body_stmt = try self.block();
 
@@ -241,7 +247,11 @@ pub const Parser = struct {
     ///                       [ ':=' <expression> ] <end>
     fn varDeclaration(self: *Parser) Error!ast.Stmt {
         const value_type = try self.parseType();
-        const array_len = try self.parseOptionalArraySize();
+        // map/list never take the array-size suffix (GRAMMAR.bnf design
+        // note 3m) — writing `map[3] m` simply never gets this far as an
+        // array declaration; the next token (still `[`) fails the
+        // IDENTIFIER expectation below instead.
+        const array_len = if (value_type == .map or value_type == .list) null else try self.parseOptionalArraySize();
         const name_tok = try self.expect(.identifier, "expected a variable name");
 
         var initializer: ?*ast.Expr = null;
@@ -374,7 +384,7 @@ pub const Parser = struct {
                 return self.createExpr(.{ .assign = .{ .name = expr.variable, .value = value } });
             }
             if (expr.* == .index) {
-                return self.createExpr(.{ .index_assign = .{ .name = expr.index.name, .index = expr.index.index, .value = value } });
+                return self.createExpr(.{ .index_assign = .{ .base = expr.index.base, .index = expr.index.index, .value = value } });
             }
 
             self.diagnostic = .{ .line = equals.line, .column = equals.column, .message = "invalid assignment target: only a bare identifier or an indexed array element may appear left of ':='" };
@@ -470,10 +480,29 @@ pub const Parser = struct {
         return self.primary();
     }
 
-    /// <primary> ::= INT | FLOAT | STRING | 'true' | 'false'
-    ///            | '(' <expression> ')' | <call-expr> | <array-literal>
-    ///            | <len-expr> | <read-expr> | <write-expr> | IDENTIFIER
+    /// <primary> ::= <atom> { '[' <expression> ']' }
+    ///
+    /// The postfix `'[' <expression> ']'` suffix is what lets bracket-
+    /// indexing CHAIN (`doc["a"]["b"]`, GRAMMAR.bnf design note 3m) — it's
+    /// applied uniformly after ANY atom, not just an IDENTIFIER; a shape
+    /// that doesn't actually name something indexable (`5[0]`) is rejected
+    /// later, by the compiler (a statically-known non-array/collection bare
+    /// local) or the VM (`RuntimeError.TypeMismatch` for anything else),
+    /// the same "checked, not trusted" stance the rest of this VM already
+    /// takes rather than trying to reject it here in the grammar.
     fn primary(self: *Parser) Error!*ast.Expr {
+        var expr = try self.atom();
+        while (self.check(.lbracket)) expr = try self.finishIndex(expr);
+        return expr;
+    }
+
+    /// <atom> ::= INT | FLOAT | STRING | 'true' | 'false' | 'null'
+    ///         | '(' <expression> ')' | <call-expr> | <array-literal>
+    ///         | <map-literal> | <len-expr> | <read-expr> | <write-expr>
+    ///         | <open-expr> | <push-expr> | <keys-expr> | <has-expr>
+    ///         | <delete-expr> | <json-expr> | <stringify-expr>
+    ///         | 'stdin' | 'stdout' | 'stderr' | IDENTIFIER
+    fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
         switch (tok.type) {
             .int => {
@@ -500,10 +529,13 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.createExpr(.{ .literal = .{ .boolean = false } });
             },
+            .kw_null => {
+                _ = self.advance();
+                return self.createExpr(.{ .literal = .null_value });
+            },
             .identifier => {
                 _ = self.advance();
                 if (self.check(.lparen)) return self.finishCall(tok.lexeme);
-                if (self.check(.lbracket)) return self.finishIndex(tok.lexeme);
                 return self.createExpr(.{ .variable = tok.lexeme });
             },
             .lparen => {
@@ -513,10 +545,17 @@ pub const Parser = struct {
                 return self.createExpr(.{ .grouping = inner });
             },
             .lbracket => return self.arrayLiteral(),
+            .lbrace => return self.mapLiteral(),
             .kw_len => return self.lenExpr(),
             .kw_read => return self.readExpr(),
             .kw_write => return self.writeExpr(),
             .kw_open => return self.openExpr(),
+            .kw_push => return self.pushExpr(),
+            .kw_keys => return self.keysExpr(),
+            .kw_has => return self.hasExpr(),
+            .kw_delete => return self.deleteExpr(),
+            .kw_json => return self.jsonExpr(),
+            .kw_stringify => return self.stringifyExpr(),
             .kw_stdin => {
                 _ = self.advance();
                 return self.createExpr(.{ .stream_literal = .stdin });
@@ -551,34 +590,32 @@ pub const Parser = struct {
         return self.createExpr(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.allocator()) } });
     }
 
-    /// `<array-index> ::= IDENTIFIER '[' <expression> ']'`
-    ///
-    /// Called with the array name already consumed and '[' as the next
-    /// token (see `primary`'s IDENTIFIER case). Produces an `.index` node
-    /// regardless of whether it ends up being read or assigned to —
-    /// `assignment` is what turns a trailing `':=' <expr>` into an
-    /// `.index_assign` instead (matching how a bare `.variable` becomes
-    /// `.assign`).
-    fn finishIndex(self: *Parser, name: []const u8) Error!*ast.Expr {
+    /// `'[' <expression> ']'` postfix suffix — see `primary`'s doc comment.
+    /// Called with `base` already parsed and '[' as the next token.
+    /// Produces an `.index` node regardless of whether it ends up being
+    /// read or assigned to — `assignment` is what turns a trailing
+    /// `':=' <expr>` into an `.index_assign` instead (matching how a bare
+    /// `.variable` becomes `.assign`).
+    fn finishIndex(self: *Parser, base: *ast.Expr) Error!*ast.Expr {
         _ = self.advance(); // '['
         const index_expr = try self.expression();
         _ = try self.expect(.rbracket, "expected ']' after array index");
-        return self.createExpr(.{ .index = .{ .name = name, .index = index_expr } });
+        return self.createExpr(.{ .index = .{ .base = base, .index = index_expr } });
     }
 
-    /// <len-expr> ::= 'len' '(' IDENTIFIER ')'
+    /// <len-expr> ::= 'len' '(' <expression> ')'
     ///
-    /// Only a bare identifier is accepted — arrays aren't first-class
-    /// expressions (GRAMMAR.bnf design note 3e), so `len(...)`'s argument
-    /// can only ever be an array's own name, never an arbitrary
-    /// expression, the same restriction `finishIndex` already places on
-    /// `arr[...]`'s target.
+    /// Relaxed from a bare IDENTIFIER (GRAMMAR.bnf design note 3m) now that
+    /// a map/list is a genuine first-class runtime value — the compiler
+    /// still special-cases a bare `.variable` naming a fixed/generic array
+    /// to fold at compile time, exactly as before; arrays themselves still
+    /// aren't first-class (design note 3e).
     fn lenExpr(self: *Parser) Error!*ast.Expr {
         _ = self.advance(); // 'len'
         _ = try self.expect(.lparen, "expected '(' after 'len'");
-        const name_tok = try self.expect(.identifier, "expected an array name");
-        _ = try self.expect(.rparen, "expected ')' after array name");
-        return self.createExpr(.{ .len_of = name_tok.lexeme });
+        const target = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the argument");
+        return self.createExpr(.{ .len_of = target });
     }
 
     /// <read-expr> ::= 'read' '(' <expression> ',' IDENTIFIER ')'
@@ -652,6 +689,10 @@ pub const Parser = struct {
     }
 
     /// <array-literal> ::= '[' [ <expression> { ',' <expression> } ] ']'
+    ///
+    /// Doubles as a `list` initializer (GRAMMAR.bnf design note 3m) — this
+    /// production is unchanged either way; only the compiler's handling of
+    /// it differs, based on what's being initialized.
     fn arrayLiteral(self: *Parser) Error!*ast.Expr {
         _ = self.advance(); // '['
         var elems: std.ArrayList(*ast.Expr) = .empty;
@@ -663,6 +704,97 @@ pub const Parser = struct {
         }
         _ = try self.expect(.rbracket, "expected ']' after array literal");
         return self.createExpr(.{ .array_literal = try elems.toOwnedSlice(self.allocator()) });
+    }
+
+    /// <map-literal> ::= '{' [ <map-entry> { ',' <map-entry> } ] '}'
+    /// <map-entry>   ::= STRING ':' <expression>
+    ///
+    /// Keys are STRING tokens (static text), not arbitrary expressions —
+    /// this is never a conflict with `<block>` (which also starts with
+    /// '{'): a block is only ever reached in statement position, a map
+    /// literal only in expression position, so the parser never has to
+    /// disambiguate the two at the same decision point.
+    fn mapLiteral(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // '{'
+        var entries: std.ArrayList(ast.Expr.MapEntry) = .empty;
+        if (!self.check(.rbrace)) {
+            while (true) {
+                const key_tok = try self.expect(.string, "expected a string key in map literal");
+                const key = key_tok.lexeme[1 .. key_tok.lexeme.len - 1];
+                _ = try self.expect(.colon, "expected ':' after map key");
+                const value = try self.expression();
+                try entries.append(self.allocator(), .{ .key = key, .value = value });
+                if (!self.match(.comma)) break;
+            }
+        }
+        _ = try self.expect(.rbrace, "expected '}' after map literal");
+        return self.createExpr(.{ .map_literal = try entries.toOwnedSlice(self.allocator()) });
+    }
+
+    /// <push-expr> ::= 'push' '(' <expression> ',' <expression> ')'
+    fn pushExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'push'
+        _ = try self.expect(.lparen, "expected '(' after 'push'");
+        const list = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the list");
+        const value = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the value to push");
+        return self.createExpr(.{ .list_push = .{ .list = list, .value = value } });
+    }
+
+    /// <keys-expr> ::= 'keys' '(' <expression> ')'
+    fn keysExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'keys'
+        _ = try self.expect(.lparen, "expected '(' after 'keys'");
+        const map = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the map");
+        return self.createExpr(.{ .map_keys = map });
+    }
+
+    /// <has-expr> ::= 'has' '(' <expression> ',' <expression> ')'
+    fn hasExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'has'
+        _ = try self.expect(.lparen, "expected '(' after 'has'");
+        const map = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the map");
+        const key = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the key");
+        return self.createExpr(.{ .map_has = .{ .map = map, .key = key } });
+    }
+
+    /// <delete-expr> ::= 'delete' '(' <expression> ',' <expression> ')'
+    fn deleteExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'delete'
+        _ = try self.expect(.lparen, "expected '(' after 'delete'");
+        const map = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the map");
+        const key = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the key");
+        return self.createExpr(.{ .map_delete = .{ .map = map, .key = key } });
+    }
+
+    /// <json-expr> ::= 'json' '(' IDENTIFIER ',' <expression> ')'
+    ///
+    /// The buffer is a bare identifier, the same restriction `read`'s
+    /// destination and `write`'s buffer form have and for the same reason:
+    /// arrays still aren't first-class (GRAMMAR.bnf design note 3e).
+    fn jsonExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'json'
+        _ = try self.expect(.lparen, "expected '(' after 'json'");
+        const name_tok = try self.expect(.identifier, "expected a buffer (array) name to parse");
+        _ = try self.expect(.comma, "expected ',' after the buffer name");
+        const count = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the byte count");
+        return self.createExpr(.{ .json_parse = .{ .buffer = name_tok.lexeme, .count = count } });
+    }
+
+    /// <stringify-expr> ::= 'stringify' '(' <expression> ')'
+    fn stringifyExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'stringify'
+        _ = try self.expect(.lparen, "expected '(' after 'stringify'");
+        const value = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the value to stringify");
+        return self.createExpr(.{ .json_stringify = value });
     }
 };
 
@@ -1053,6 +1185,79 @@ test "parses indexed assignment" {
     try expectExprSexpr("arr[0] := 9", "(:= (index arr 0) 9)");
 }
 
+// ---- Maps, lists, and JSON (GRAMMAR.bnf design notes 3m/3n) -------------
+
+test "parses a map declaration with no initializer" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "map m\n");
+    defer result.parser.deinit();
+
+    const decl = result.program[0].var_decl;
+    try std.testing.expectEqual(ast.ValueType.map, decl.type);
+    try std.testing.expectEqual(@as(?u32, null), decl.array_len);
+    try std.testing.expect(decl.initializer == null);
+}
+
+test "parses a list declaration with an array-literal initializer" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "list xs := [1, 2, 3]\n");
+    defer result.parser.deinit();
+
+    const decl = result.program[0].var_decl;
+    try std.testing.expectEqual(ast.ValueType.list, decl.type);
+    try std.testing.expectEqual(@as(usize, 3), decl.initializer.?.array_literal.len);
+}
+
+test "map/list never take an array-size suffix" {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init("map[3] m\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
+}
+
+test "parses an empty map literal" {
+    try expectExprSexpr("{}", "(map)");
+}
+
+test "parses a map literal with string keys" {
+    try expectExprSexpr(
+        \\{"a": 1, "b": 2}
+    , "(map (\"a\" 1) (\"b\" 2))");
+}
+
+test "parses push/keys/has/delete/json/stringify as expressions" {
+    try expectExprSexpr("push(xs, 1)", "(push xs 1)");
+    try expectExprSexpr("keys(m)", "(keys m)");
+    try expectExprSexpr("has(m, \"a\")", "(has m \"a\")");
+    try expectExprSexpr("delete(m, \"a\")", "(delete m \"a\")");
+    try expectExprSexpr("json(buf, n)", "(json buf n)");
+    try expectExprSexpr("stringify(m)", "(stringify m)");
+}
+
+test "parses 'null' as a literal" {
+    try expectExprSexpr("null", "null");
+}
+
+test "bracket indexing chains off any expression, not just a bare identifier" {
+    try expectExprSexpr("doc[\"a\"][\"b\"]", "(index (index doc \"a\") \"b\")");
+}
+
+test "chained indexing may be an assignment target" {
+    try expectExprSexpr("doc[\"a\"][\"b\"] := 1", "(:= (index (index doc \"a\") \"b\") 1)");
+}
+
+test "a lone '{' after an expression position starts a map literal, not a block" {
+    // Never ambiguous with <block>: a block is only ever reached in
+    // statement position (declaration/if/while/for/function bodies), a map
+    // literal only in expression position — this exercises the latter.
+    try expectExprSexpr("push(xs, {})", "(push xs (map))");
+}
+
 test "parses a for loop over a range" {
     const allocator = std.testing.allocator;
     var result = try parseProgramSource(allocator,
@@ -1073,16 +1278,15 @@ test "parses len(...) with a bare array name" {
     try expectExprSexpr("len(arr)", "(len arr)");
 }
 
-test "len(...) requires a bare identifier, not an arbitrary expression" {
-    const allocator = std.testing.allocator;
-    var lex = lexer.Lexer.init("len(1 + 2)");
-    const tokens = try lex.tokenizeAll(allocator);
-    defer allocator.free(tokens);
-
-    var parser = Parser.init(allocator, tokens);
-    defer parser.deinit();
-
-    try std.testing.expectError(Error.UnexpectedToken, parser.expression());
+test "len(...) accepts an arbitrary expression, not just a bare identifier (design note 3m)" {
+    // Relaxed once a map/list made `len`'s argument a genuine runtime value
+    // in the general case — a bare array name still gets special
+    // compile-time treatment (ISA.bnf section 2), but that's now a
+    // compiler-level pattern match on the parsed shape, not a parser-level
+    // restriction. Whether `len(1 + 2)` is actually valid at RUNTIME (it
+    // isn't — TypeMismatch, since an int isn't a list or a map) is a
+    // compiler.zig-level concern, not this one.
+    try expectExprSexpr("len(1 + 2)", "(len (+ 1 2))");
 }
 
 test "parses read(...) with each stream and a bare buffer name" {

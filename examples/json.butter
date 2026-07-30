@@ -1,0 +1,64 @@
+# JSON: open/read a real file into a byte buffer, then let json(...) parse
+# it into a map/list tree — and, at the end, stringify(...) a value back
+# into JSON text and write it out again. GRAMMAR.bnf design notes 3m, 3n,
+# and 3o; ISA.bnf sections 11, 12, and 13.
+#
+#   zig build run -- examples/json.butter
+#
+# `open`'s path resolves against the CURRENT DIRECTORY at run time, exactly
+# like files.butter's own example — so this assumes it's run from the repo
+# root, reading examples/data.json (and, later, writing examples/dump.json).
+
+int[256] buf
+int f := open("examples/data.json", read)
+int n := read(f, buf)
+close f
+
+# `map`/`list` are genuine first-class runtime values here (unlike a
+# fixed-size array): `doc`'s own shape depends entirely on what the file's
+# bytes said, not on anything declared in this source.
+map doc := json(buf, n)
+print doc["name"]
+print doc["age"]
+print doc["active"]
+
+# Bracket-indexing chains straight through nested values.
+list tags := doc["tags"]
+for i in 0..len(tags) {
+    print tags[i]
+}
+
+# `has` answers a missing key without the error a bracket-read would raise.
+print has(doc, "active")
+print has(doc, "missing")
+
+# `keys` hands back every key as an ordinary list, in insertion order — how
+# a program iterates a map's contents rather than a dedicated foreach form.
+list ks := keys(doc)
+for i in 0..len(ks) {
+    print ks[i]
+}
+
+# `stringify` is `json`'s reverse: it renders ANY value back into JSON
+# text, as a genuine `string` — properly escaped (GRAMMAR.bnf design note
+# 3o), unlike `print`'s own JSON-*shaped* rendering of a map/list, which
+# never escapes a string's contents since it's meant for a person to read,
+# not to be parsed back.
+string text := stringify(doc)
+print text
+
+# `write`'s two-argument form renders a value the same way `print` does
+# (GRAMMAR.bnf design note 3k) — but `text` is already a `string`, so this
+# writes it out byte-for-byte with no quoting added around it. Reading it
+# back through `json(...)` recovers the same document, proving the round
+# trip.
+int out := open("examples/dump.json", write)
+write(out, text)
+close out
+
+int back := open("examples/dump.json", read)
+int[256] dumpBuf
+int dumpLen := read(back, dumpBuf)
+close back
+map redoc := json(dumpBuf, dumpLen)
+print redoc["name"]

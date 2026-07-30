@@ -75,6 +75,29 @@ pub const OpCode = enum(u8) {
     open,
     close,
 
+    // Maps, lists, and the heap (ISA.bnf section 11). MAKE_LIST/MAKE_MAP's
+    // operand is an element/pair count — the compiler already knows exactly
+    // how many values it just pushed for the literal/no-initializer case.
+    // INDEX_GET/INDEX_SET take no operand: unlike LOAD_INDEX/STORE_INDEX,
+    // the container they act on is an ordinary popped `Value` (so that
+    // indexing can chain — `doc["a"]["b"]` — off any expression, not just a
+    // bare local), not a compile-time-known slot. LIST_PUSH/MAP_HAS/
+    // MAP_DELETE/MAP_KEYS/LEN_VALUE likewise take their operand(s) as
+    // ordinary popped expression results.
+    make_list,
+    make_map,
+    index_get,
+    index_set,
+    list_push,
+    map_has,
+    map_delete,
+    map_keys,
+    len_value,
+
+    // JSON (ISA.bnf sections 12 and 13).
+    json_parse,
+    json_stringify,
+
     halt,
 };
 
@@ -154,7 +177,7 @@ pub const Chunk = struct {
                     try writer.print(" slot={d} len={d}\n", .{ idx.slot, idx.length });
                 },
                 .jump, .jump_if_false => try writer.print(" -> {d}\n", .{instr.operand}),
-                .call => try writer.print(" #{d}\n", .{instr.operand}),
+                .call, .make_list, .make_map => try writer.print(" #{d}\n", .{instr.operand}),
                 .open => {
                     const mode: value_mod.OpenMode = @enumFromInt(instr.operand);
                     try writer.print(" {s}\n", .{mode.name()});
@@ -362,6 +385,49 @@ test "a stream constant renders as the stream it names" {
     try chunk.disassemble(&writer);
 
     try std.testing.expectEqualStrings("0000 push_const #0 (<stdout>)\n", writer.buffered());
+}
+
+test "disassemble renders make_list and make_map with their element/pair count" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emitWithOperand(allocator, .make_list, 3);
+    _ = try chunk.emitWithOperand(allocator, .make_map, 2);
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings(
+        "0000 make_list #3\n0001 make_map #2\n",
+        writer.buffered(),
+    );
+}
+
+test "disassemble renders the operand-less map/list/json instructions" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .index_get);
+    _ = try chunk.emit(allocator, .index_set);
+    _ = try chunk.emit(allocator, .list_push);
+    _ = try chunk.emit(allocator, .map_has);
+    _ = try chunk.emit(allocator, .map_delete);
+    _ = try chunk.emit(allocator, .map_keys);
+    _ = try chunk.emit(allocator, .len_value);
+    _ = try chunk.emit(allocator, .json_parse);
+
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings(
+        "0000 index_get\n0001 index_set\n0002 list_push\n0003 map_has\n" ++
+            "0004 map_delete\n0005 map_keys\n0006 len_value\n0007 json_parse\n",
+        writer.buffered(),
+    );
 }
 
 test "Program.deinit frees the main chunk and every function's chunk" {

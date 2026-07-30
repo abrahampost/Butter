@@ -25,7 +25,13 @@ pub const SemanticError = error{
     ArrayUsedAsScalar,
     ArrayLengthMismatch,
     InvalidArrayInitializer,
-    UnexpectedArrayLiteral,
+    /// Bracket-indexing (or `len`'s relaxed position) on a bare local that's
+    /// statically known to be neither an array, a list, nor a map (ISA.bnf
+    /// section 11) — e.g. `x[0]` where `x` is a plain `int`. A non-
+    /// identifier base that turns out to be a scalar only at RUNTIME (e.g.
+    /// chaining off a fixed-array element) is `RuntimeError.TypeMismatch`
+    /// instead; this is only for the case the compiler can already rule out.
+    NotIndexable,
     FunctionNotVisible,
     InvalidArrayArgument,
     InvalidArrayReturn,
@@ -57,7 +63,17 @@ const Local = struct {
     /// LOAD_INDEX_REF/STORE_INDEX_REF/LOAD_REF_LEN instead (ISA.bnf
     /// section 6's generic-array addendum).
     array: ?ast.ArraySpec = null,
+    /// A separate, orthogonal axis from `array`: null for anything that
+    /// isn't a map/list, `.map`/`.list` otherwise (ISA.bnf section 11). Kept
+    /// distinct from `array` rather than folded into `ArraySpec` because
+    /// `map`/`list` are entirely new `<type>` keywords that never take the
+    /// `[N]`/`[]` suffix `ArraySpec` represents — they're always exactly one
+    /// heap-reference slot, addressed via INDEX_GET/INDEX_SET instead of any
+    /// of the array opcodes.
+    collection: ?CollectionKind = null,
 };
+
+const CollectionKind = enum { map, list };
 
 /// A local/parameter's width in stack slots: 1 for a plain scalar OR a
 /// generic array reference (both are exactly one `Value`), `n` for a
@@ -66,6 +82,16 @@ fn arraySpecWidth(spec: ?ast.ArraySpec) u32 {
     return switch (spec orelse return 1) {
         .fixed => |n| n,
         .generic => 1,
+    };
+}
+
+/// `Local.collection`/`FunctionInfo` registration for a declared `<type>` —
+/// null for the four scalar types, `.map`/`.list` for the two heap types.
+fn collectionKind(value_type: ast.ValueType) ?CollectionKind {
+    return switch (value_type) {
+        .map => .map,
+        .list => .list,
+        .int, .float, .bool, .string => null,
     };
 }
 
@@ -287,7 +313,13 @@ pub const Compiler = struct {
         defer self.current_return_array_size = null;
 
         for (f.params) |p| {
-            try self.locals.append(self.allocator, .{ .name = p.name, .depth = 0, .slot = self.next_slot, .array = p.array_size });
+            try self.locals.append(self.allocator, .{
+                .name = p.name,
+                .depth = 0,
+                .slot = self.next_slot,
+                .array = p.array_size,
+                .collection = collectionKind(p.type),
+            });
             self.next_slot += arraySpecWidth(p.array_size);
         }
         for (f.body) |*s| try self.compileStmt(s);
@@ -308,9 +340,16 @@ pub const Compiler = struct {
                 const idx = try self.chunk.addConstant(self.allocator, .{ .array_ref = .{ .base = 0, .len = 0 } });
                 _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             },
-        } else {
-            const idx = try self.chunk.addConstant(self.allocator, defaultValue(f.return_type));
-            _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+        } else switch (f.return_type) {
+            // An empty map/list isn't a compile-time constant (it's a
+            // genuine heap allocation), so it can't route through
+            // `defaultValue`+PUSH_CONST the way every scalar zero value can.
+            .map => _ = try self.chunk.emitWithOperand(self.allocator, .make_map, 0),
+            .list => _ = try self.chunk.emitWithOperand(self.allocator, .make_list, 0),
+            else => {
+                const idx = try self.chunk.addConstant(self.allocator, defaultValue(f.return_type));
+                _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+            },
         }
         _ = try self.chunk.emit(self.allocator, .ret);
 
@@ -362,12 +401,16 @@ pub const Compiler = struct {
         }
     }
 
+    /// Never actually called with `.map`/`.list` — every call site checks
+    /// for those first and emits MAKE_MAP/MAKE_LIST instead, since an empty
+    /// map/list isn't a compile-time constant `PUSH_CONST` could hold.
     fn defaultValue(value_type: ast.ValueType) Value {
         return switch (value_type) {
             .int => .{ .int = 0 },
             .float => .{ .float = 0.0 },
             .bool => .{ .boolean = false },
             .string => .{ .string = "" },
+            .map, .list => unreachable,
         };
     }
 
@@ -376,6 +419,25 @@ pub const Compiler = struct {
     /// separate store step at declaration time (ISA.bnf section 5).
     fn compileVarDecl(self: *Compiler, d: ast.Stmt.VarDecl) CompileError!void {
         const slot = self.next_slot;
+        if (collectionKind(d.type)) |kind| {
+            // Always exactly one heap-reference slot — an initializer, if
+            // present, is just an ordinary expression (a map/list literal
+            // compiles to MAKE_MAP/MAKE_LIST via compileExpr, same as any
+            // other expression that happens to evaluate to one); with none,
+            // a fresh empty map/list is what a bare `map m`/`list xs`
+            // declaration means, and (like the function-return case above)
+            // can't route through `defaultValue`+PUSH_CONST since it isn't a
+            // compile-time constant.
+            if (d.initializer) |init_expr| {
+                try self.compileExpr(init_expr);
+            } else switch (kind) {
+                .map => _ = try self.chunk.emitWithOperand(self.allocator, .make_map, 0),
+                .list => _ = try self.chunk.emitWithOperand(self.allocator, .make_list, 0),
+            }
+            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .collection = kind });
+            self.next_slot += 1;
+            return;
+        }
         if (d.array_len) |len| {
             if (d.initializer) |init_expr| {
                 switch (init_expr.*) {
@@ -530,10 +592,29 @@ pub const Compiler = struct {
                 _ = try self.emitLocalOp(a.name, .store_local);
             },
             .call => |c| try self.compileCall(c),
-            .array_literal => return self.fail(SemanticError.UnexpectedArrayLiteral, "", "an array literal may only initialize a matching array declaration"),
+            // Reached only when a bracketed literal ISN'T a fixed-array
+            // initializer (compileVarDecl/the array/generic-array value
+            // helpers all intercept `.array_literal` themselves before ever
+            // calling generic compileExpr on it) — which means it's always
+            // safe, from here, to treat it as "build a list" (GRAMMAR.bnf
+            // design note 3m). This is what makes `list xs := [1, 2, 3]`'s
+            // initializer, and a bare `[1, 2, 3]` anywhere else, both work
+            // via the exact same production.
+            .array_literal => |elems| {
+                for (elems) |elem| try self.compileExpr(elem);
+                _ = try self.chunk.emitWithOperand(self.allocator, .make_list, @intCast(elems.len));
+            },
+            .map_literal => |entries| {
+                for (entries) |entry| {
+                    const idx = try self.chunk.addConstant(self.allocator, .{ .string = entry.key });
+                    _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+                    try self.compileExpr(entry.value);
+                }
+                _ = try self.chunk.emitWithOperand(self.allocator, .make_map, @intCast(entries.len));
+            },
             .index => |ix| try self.compileIndex(ix),
             .index_assign => |ia| try self.compileIndexAssign(ia),
-            .len_of => |name| try self.compileLenOf(name),
+            .len_of => |e| try self.compileLenOf(e),
             .stream_literal => |s| {
                 const idx = try self.chunk.addConstant(self.allocator, .{ .stream = .ofStandard(s) });
                 _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
@@ -542,6 +623,34 @@ pub const Compiler = struct {
             .write_value => |w| try self.compileWriteValue(w),
             .write_bytes => |w| try self.compileWriteBytes(w),
             .open_file => |o| try self.compileOpenFile(o),
+            .list_push => |p| {
+                try self.compileExpr(p.list);
+                try self.compileExpr(p.value);
+                _ = try self.chunk.emit(self.allocator, .list_push);
+            },
+            .map_has => |h| {
+                try self.compileExpr(h.map);
+                try self.compileExpr(h.key);
+                _ = try self.chunk.emit(self.allocator, .map_has);
+            },
+            .map_delete => |d| {
+                try self.compileExpr(d.map);
+                try self.compileExpr(d.key);
+                _ = try self.chunk.emit(self.allocator, .map_delete);
+            },
+            .map_keys => |m| {
+                try self.compileExpr(m);
+                _ = try self.chunk.emit(self.allocator, .map_keys);
+            },
+            .json_parse => |j| {
+                try self.emitArrayRef(j.buffer, SemanticError.NotAnArray, "json's buffer must be an array");
+                try self.compileExpr(j.count);
+                _ = try self.chunk.emit(self.allocator, .json_parse);
+            },
+            .json_stringify => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .json_stringify);
+            },
         }
     }
 
@@ -745,6 +854,7 @@ pub const Compiler = struct {
             .int => |v| .{ .int = v },
             .float => |v| .{ .float = v },
             .string => |v| .{ .string = v },
+            .null_value => .null_value,
             .boolean => unreachable,
         };
         const idx = try self.chunk.addConstant(self.allocator, value);
@@ -769,56 +879,104 @@ pub const Compiler = struct {
         return self.chunk.emitWithOperand(self.allocator, op, local.slot);
     }
 
-    /// `arr[i]` reads. For a FIXED-size local: LOAD_INDEX with the array's
-    /// compile-time-known base slot and length packed into the operand
-    /// (ISA.bnf section 3) so the VM can bounds-check at runtime. For a
-    /// GENERIC local: LOAD_INDEX_REF instead, whose operand is just the
-    /// slot holding the reference itself — the base and length aren't
-    /// known until runtime, read out of the reference value there (ISA.bnf
-    /// section 6's generic-array addendum).
+    /// `<base>[i]` reads. For a FIXED-size array local: LOAD_INDEX with the
+    /// array's compile-time-known base slot and length packed into the
+    /// operand (ISA.bnf section 3) so the VM can bounds-check at runtime.
+    /// For a GENERIC array local: LOAD_INDEX_REF instead, whose operand is
+    /// just the slot holding the reference itself. Both only ever apply
+    /// when `base` is a bare identifier naming such a local — a fixed/
+    /// generic array element is always scalar (GRAMMAR.bnf design note 3e),
+    /// so there's no way to reach this case with a non-identifier base (a
+    /// chained `.index` node), and none is attempted.
+    ///
+    /// Everything else — a map/list local (bare name or not), or ANY
+    /// non-identifier base, including a chained `doc["a"]["b"]` — falls
+    /// through to the generic INDEX_GET path: `base` compiles as an
+    /// ordinary expression (LOAD_LOCAL for a bare collection name, or
+    /// recursively for a nested index/call/whatever else), and INDEX_GET
+    /// dispatches on whatever kind of value that turns out to be at
+    /// runtime (ISA.bnf section 11) — including rejecting it, the same
+    /// "checked, not trusted" way an out-of-bounds array index already is.
     fn compileIndex(self: *Compiler, ix: ast.Expr.Index) CompileError!void {
-        const local = self.resolveLocal(ix.name) orelse return self.fail(SemanticError.UndefinedVariable, ix.name, "undefined variable");
-        const spec = local.array orelse return self.fail(SemanticError.NotAnArray, ix.name, "not an array");
-        try self.compileExpr(ix.index);
-        switch (spec) {
-            .fixed => |len| _ = try self.chunk.emitWithOperand(self.allocator, .load_index, chunk_mod.packIndexOperand(local.slot, len)),
-            .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_index_ref, local.slot),
+        if (ix.base.* == .variable) {
+            const local = self.resolveLocal(ix.base.variable) orelse return self.fail(SemanticError.UndefinedVariable, ix.base.variable, "undefined variable");
+            if (local.array) |spec| {
+                try self.compileExpr(ix.index);
+                switch (spec) {
+                    .fixed => |len| _ = try self.chunk.emitWithOperand(self.allocator, .load_index, chunk_mod.packIndexOperand(local.slot, len)),
+                    .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_index_ref, local.slot),
+                }
+                return;
+            }
+            if (local.collection == null) {
+                return self.fail(SemanticError.NotIndexable, ix.base.variable, "not indexable — expected an array, list, or map");
+            }
         }
+        try self.compileExpr(ix.base);
+        try self.compileExpr(ix.index);
+        _ = try self.chunk.emit(self.allocator, .index_get);
     }
 
-    /// `arr[i] := value`: the index must be compiled before the value so
-    /// the runtime stack order matches STORE_INDEX/STORE_INDEX_REF's stack
-    /// effect `( index v -- v )` (ISA.bnf section 3). Fixed vs. generic
-    /// dispatch mirrors `compileIndex`.
+    /// `<base>[i] := value`. Dispatch mirrors `compileIndex` exactly; the
+    /// generic INDEX_SET path pushes `base`, `index`, then `value`, matching
+    /// its `( container index v -- v )` stack effect (ISA.bnf section 11) —
+    /// the fixed/generic-array path keeps STORE_INDEX/STORE_INDEX_REF's
+    /// existing `( index v -- v )` order unchanged.
     fn compileIndexAssign(self: *Compiler, ia: ast.Expr.IndexAssign) CompileError!void {
-        const local = self.resolveLocal(ia.name) orelse return self.fail(SemanticError.UndefinedVariable, ia.name, "undefined variable");
-        const spec = local.array orelse return self.fail(SemanticError.NotAnArray, ia.name, "not an array");
+        if (ia.base.* == .variable) {
+            const local = self.resolveLocal(ia.base.variable) orelse return self.fail(SemanticError.UndefinedVariable, ia.base.variable, "undefined variable");
+            if (local.array) |spec| {
+                try self.compileExpr(ia.index);
+                try self.compileExpr(ia.value);
+                switch (spec) {
+                    .fixed => |len| _ = try self.chunk.emitWithOperand(self.allocator, .store_index, chunk_mod.packIndexOperand(local.slot, len)),
+                    .generic => _ = try self.chunk.emitWithOperand(self.allocator, .store_index_ref, local.slot),
+                }
+                return;
+            }
+            if (local.collection == null) {
+                return self.fail(SemanticError.NotIndexable, ia.base.variable, "not indexable — expected an array, list, or map");
+            }
+        }
+        try self.compileExpr(ia.base);
         try self.compileExpr(ia.index);
         try self.compileExpr(ia.value);
-        switch (spec) {
-            .fixed => |len| _ = try self.chunk.emitWithOperand(self.allocator, .store_index, chunk_mod.packIndexOperand(local.slot, len)),
-            .generic => _ = try self.chunk.emitWithOperand(self.allocator, .store_index_ref, local.slot),
-        }
+        _ = try self.chunk.emit(self.allocator, .index_set);
     }
 
-    /// `len(arr)` on a FIXED-size local compiles to a plain PUSH_CONST of
-    /// its declared size — no runtime check at all, since that length is
-    /// fixed at compile time and never changes (GRAMMAR.bnf design note
-    /// 3e). On a GENERIC local, the length genuinely isn't known until
-    /// runtime (it depends on whatever array the caller actually passed),
-    /// so this instead emits LOAD_REF_LEN, which reads it out of the
+    /// `len(<expression>)`. A bare identifier naming a FIXED-size array
+    /// local compiles to a plain PUSH_CONST of its declared size — no
+    /// runtime check at all, since that length is fixed at compile time and
+    /// never changes (GRAMMAR.bnf design note 3e). A bare GENERIC array
+    /// local instead emits LOAD_REF_LEN, reading the length out of the
     /// reference value at runtime (ISA.bnf section 6's generic-array
-    /// addendum).
-    fn compileLenOf(self: *Compiler, name: []const u8) CompileError!void {
-        const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
-        const spec = local.array orelse return self.fail(SemanticError.NotAnArray, name, "not an array");
-        switch (spec) {
-            .fixed => |len| {
-                const idx = try self.chunk.addConstant(self.allocator, .{ .int = @intCast(len) });
-                _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
-            },
-            .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_ref_len, local.slot),
+    /// addendum). Anything else — a map/list (bare name or not), or any
+    /// other expression entirely — compiles as an ordinary expression
+    /// followed by LEN_VALUE, a genuine runtime operation
+    /// (`RuntimeError.TypeMismatch` if the value it's handed turns out not
+    /// to be a list or a map): unlike bracket-indexing, `len` on a
+    /// statically-known plain scalar local is deliberately NOT a compile
+    /// error here, matching design note 3m's framing of this as a runtime
+    /// question once anything past a bare fixed/generic array is involved.
+    fn compileLenOf(self: *Compiler, expr: *const ast.Expr) CompileError!void {
+        if (expr.* == .variable) {
+            if (self.resolveLocal(expr.variable)) |local| {
+                if (local.array) |spec| {
+                    switch (spec) {
+                        .fixed => |len| {
+                            const idx = try self.chunk.addConstant(self.allocator, .{ .int = @intCast(len) });
+                            _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+                        },
+                        .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_ref_len, local.slot),
+                    }
+                    return;
+                }
+            } else {
+                return self.fail(SemanticError.UndefinedVariable, expr.variable, "undefined variable");
+            }
         }
+        try self.compileExpr(expr);
+        _ = try self.chunk.emit(self.allocator, .len_value);
     }
 
     /// Compiles the stream an I/O operation acts on, and — where the answer
@@ -969,7 +1127,7 @@ fn runProgram(allocator: std.mem.Allocator, source: []const u8, buf: []u8) ![]co
     var compiled = try compile(allocator, program);
     defer compiled.deinit(allocator);
 
-    var vm = vm_mod.Vm.init();
+    var vm = vm_mod.Vm.init(allocator);
     var writer = std.Io.Writer.fixed(buf);
     try vm.run(&compiled, .{ .out = &writer });
     return writer.buffered();
@@ -998,7 +1156,7 @@ fn runProgramWithIo(
     var compiled = try compile(allocator, program);
     defer compiled.deinit(allocator);
 
-    var vm = vm_mod.Vm.init();
+    var vm = vm_mod.Vm.init(allocator);
     var out = std.Io.Writer.fixed(out_buf);
     var err = std.Io.Writer.fixed(err_buf);
     var in = std.Io.Reader.fixed(input);
@@ -1352,7 +1510,7 @@ test "initializing an array declaration with a non-array-literal expression is a
     try std.testing.expectError(CompileError.InvalidArrayInitializer, compiler.compileProgram(program));
 }
 
-test "indexing a non-array local is a compile error" {
+test "indexing a non-array, non-collection local is a compile error" {
     const allocator = std.testing.allocator;
     var lex = lexer_mod.Lexer.init("int x := 1\nprint x[0]\n");
     const tokens = try lex.tokenizeAll(allocator);
@@ -1364,7 +1522,7 @@ test "indexing a non-array local is a compile error" {
 
     var compiler = Compiler.init(allocator);
     defer compiler.deinit();
-    try std.testing.expectError(CompileError.NotAnArray, compiler.compileProgram(program));
+    try std.testing.expectError(CompileError.NotIndexable, compiler.compileProgram(program));
 }
 
 test "using an array's bare name as a scalar value is a compile error" {
@@ -1406,19 +1564,14 @@ test "len(arr) can drive a for-loop's bound instead of a hardcoded size" {
     try std.testing.expectEqualStrings("10\n", output);
 }
 
-test "len() on a non-array local is a compile error" {
+test "len() on a non-array, non-collection local compiles fine but is a runtime TypeMismatch" {
+    // Relaxed from a compile error (design note 3m): a bare scalar local is
+    // no longer statically rejected here the way bracket-indexing rejects
+    // one — `len` on anything but a fixed/generic array is now a genuine
+    // runtime question, same as `len` on any other non-array expression.
     const allocator = std.testing.allocator;
-    var lex = lexer_mod.Lexer.init("int x := 1\nprint len(x)\n");
-    const tokens = try lex.tokenizeAll(allocator);
-    defer allocator.free(tokens);
-
-    var parser = parser_mod.Parser.init(allocator, tokens);
-    defer parser.deinit();
-    const program = try parser.parseProgram();
-
-    var compiler = Compiler.init(allocator);
-    defer compiler.deinit();
-    try std.testing.expectError(CompileError.NotAnArray, compiler.compileProgram(program));
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator, "int x := 1\nprint len(x)\n", &buf));
 }
 
 test "len() on an undeclared name is a compile error" {
@@ -1436,19 +1589,14 @@ test "len() on an undeclared name is a compile error" {
     try std.testing.expectError(CompileError.UndefinedVariable, compiler.compileProgram(program));
 }
 
-test "an array literal outside a matching array declaration is a compile error" {
+test "a bracketed literal outside a matching array declaration builds a list (design note 3m)" {
+    // This used to be `CompileError.UnexpectedArrayLiteral` — now that a
+    // bracketed literal reaching general expression position always means
+    // "build a list" instead, it runs and prints one.
     const allocator = std.testing.allocator;
-    var lex = lexer_mod.Lexer.init("print [1, 2, 3]\n");
-    const tokens = try lex.tokenizeAll(allocator);
-    defer allocator.free(tokens);
-
-    var parser = parser_mod.Parser.init(allocator, tokens);
-    defer parser.deinit();
-    const program = try parser.parseProgram();
-
-    var compiler = Compiler.init(allocator);
-    defer compiler.deinit();
-    try std.testing.expectError(CompileError.UnexpectedArrayLiteral, compiler.compileProgram(program));
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator, "print [1, 2, 3]\n", &buf);
+    try std.testing.expectEqualStrings("[1, 2, 3]\n", output);
 }
 
 test "indexing out of bounds is a runtime error" {
@@ -1928,7 +2076,7 @@ test "compileModules: a module may call an exported function from a directly imp
     var compiled = try compiler.compileModules(0, &units);
     defer compiled.deinit(allocator);
 
-    var vm = vm_mod.Vm.init();
+    var vm = vm_mod.Vm.init(allocator);
     var writer = std.Io.Writer.fixed(&buf);
     try vm.run(&compiled, .{ .out = &writer });
     try std.testing.expectEqualStrings("42\n", writer.buffered());
@@ -2025,7 +2173,7 @@ test "compileModules: two modules importing the same module both see one compile
     // is for.
     try std.testing.expectEqual(@as(usize, 3), compiled.functions.len);
 
-    var vm = vm_mod.Vm.init();
+    var vm = vm_mod.Vm.init(allocator);
     var writer = std.Io.Writer.fixed(&buf);
     try vm.run(&compiled, .{ .out = &writer });
     try std.testing.expectEqualStrings("20\n", writer.buffered());
@@ -2203,7 +2351,7 @@ fn runProgramWithFs(
     var compiled = try compile(allocator, program);
     defer compiled.deinit(allocator);
 
-    var vm = vm_mod.Vm.init();
+    var vm = vm_mod.Vm.init(allocator);
     var out = std.Io.Writer.fixed(out_buf);
     var err = std.Io.Writer.fixed(err_buf);
     try vm.run(&compiled, .{
@@ -2355,4 +2503,202 @@ test "an opened file's direction is checked at runtime, not compile time" {
         \\int[4] buf
         \\read(f, buf)
     , tmp.dir, &out_buf, &err_buf));
+}
+
+// ---- Maps, lists, and JSON (GRAMMAR.bnf design notes 3m/3n) -------------
+
+test "a map/list literal compiles and prints" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\list xs := [1, 2, 3]
+        \\print xs
+        \\map m := {"a": 1, "b": 2}
+        \\print m
+    , &buf);
+    try std.testing.expectEqualStrings("[1, 2, 3]\n{\"a\": 1, \"b\": 2}\n", output);
+}
+
+test "a bare map/list declaration with no initializer starts empty" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\map m
+        \\list xs
+        \\print len(m)
+        \\print len(xs)
+    , &buf);
+    try std.testing.expectEqualStrings("0\n0\n", output);
+}
+
+test "bracket read/write work on both list and map" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\list xs := [1, 2, 3]
+        \\xs[1] := 20
+        \\print xs[1]
+        \\map m := {"a": 1}
+        \\m["a"] := 10
+        \\m["b"] := 2
+        \\print m["a"]
+        \\print m["b"]
+    , &buf);
+    try std.testing.expectEqualStrings("20\n10\n2\n", output);
+}
+
+test "bracket indexing chains through nested maps/lists, for both reads and writes" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\map doc := {"tags": ["math", "logic"], "meta": {"count": 1}}
+        \\print doc["tags"][0]
+        \\print doc["meta"]["count"]
+        \\doc["meta"]["count"] := 2
+        \\print doc["meta"]["count"]
+    , &buf);
+    try std.testing.expectEqualStrings("math\n1\n2\n", output);
+}
+
+test "indexing a plain scalar local is a compile-time NotIndexable error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int x := 1\nprint x[0]\n", SemanticError.NotIndexable);
+}
+
+test "map[3] (or list[]) is a parse error: neither ever takes an array suffix" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init("map[3] m\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    try std.testing.expectError(parser_mod.Error.UnexpectedToken, parser.parseProgram());
+}
+
+test "push grows a list across a loop, and keys()/has()/delete() round-trip a map" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\list xs
+        \\for i in 0..3 {
+        \\    push(xs, i * 10)
+        \\}
+        \\for i in 0..len(xs) {
+        \\    print xs[i]
+        \\}
+        \\
+        \\map m := {"a": 1, "b": 2}
+        \\list ks := keys(m)
+        \\for i in 0..len(ks) {
+        \\    print ks[i]
+        \\}
+        \\print has(m, "a")
+        \\print delete(m, "a")
+        \\print has(m, "a")
+        \\print delete(m, "a")
+    , &buf);
+    try std.testing.expectEqualStrings("0\n10\n20\na\nb\ntrue\ntrue\nfalse\nfalse\n", output);
+}
+
+test "a list/map value is a shared reference, not a copy" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\list a := [1]
+        \\list b := a
+        \\push(b, 2)
+        \\print len(a)
+        \\
+        \\map m := {"x": 1}
+        \\map n := m
+        \\n["x"] := 99
+        \\print m["x"]
+    , &buf);
+    try std.testing.expectEqualStrings("2\n99\n", output);
+}
+
+test "a map/list may be nested inside another and passed to/returned from a function" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func wrap(list xs) -> map {
+        \\    map m := {}
+        \\    m["items"] := xs
+        \\    return m
+        \\}
+        \\list nested := [1, 2]
+        \\map result := wrap(nested)
+        \\list items := result["items"]
+        \\print items[1]
+    , &buf);
+    try std.testing.expectEqualStrings("2\n", output);
+}
+
+test "json(...) parses stdin bytes into a map/list tree" {
+    const allocator = std.testing.allocator;
+    var out_buf: [256]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithIo(allocator,
+        \\int[128] buf
+        \\int n := read(stdin, buf)
+        \\map doc := json(buf, n)
+        \\print doc["name"]
+        \\list tags := doc["tags"]
+        \\print len(tags)
+        \\print tags[0]
+        \\print has(doc, "missing")
+    ,
+        \\{"name": "Ada", "tags": ["math", "logic"]}
+    , &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("Ada\n2\nmath\nfalse\n", result.out);
+}
+
+test "json(...) on malformed input is a runtime error" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.JsonParseFailed, runProgramWithIo(allocator,
+        \\int[32] buf
+        \\int n := read(stdin, buf)
+        \\map doc := json(buf, n)
+    , "{not valid json", &out_buf, &err_buf));
+}
+
+test "stringify(...) renders a map/list value as JSON text" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\map doc := {"name": "Ada", "tags": [1, 2]}
+        \\print stringify(doc)
+    , &buf);
+    try std.testing.expectEqualStrings("{\"name\":\"Ada\",\"tags\":[1,2]}\n", output);
+}
+
+// Butter's own string literals have no escape sequences at all (a string
+// just reads to the next literal '"' — lexer.zig's `string()`), so the only
+// way a runtime string value ever contains a `"` or `\` is heap-built, e.g.
+// by `json(...)` unescaping one out of parsed input (json.zig's `convert`).
+// This chains json(...) -> stringify(...) to exercise escaping through a
+// path an actual Butter program can express, rather than a source literal.
+test "stringify(...) round-trips a json(...)-parsed string's escapes" {
+    const allocator = std.testing.allocator;
+    var out_buf: [128]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithIo(allocator,
+        \\int[64] buf
+        \\int n := read(stdin, buf)
+        \\map doc := json(buf, n)
+        \\print stringify(doc["name"])
+    ,
+        \\{"name": "Ada \"the\" great\n"}
+    , &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("\"Ada \\\"the\\\" great\\n\"\n", result.out);
+}
+
+test "stringify(...) on a stream is a runtime TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\print stringify(stdout)
+    , &buf));
 }

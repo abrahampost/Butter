@@ -12,6 +12,7 @@ pub const vm = @import("vm.zig");
 pub const compiler = @import("compiler.zig");
 pub const module = @import("module.zig");
 pub const stdlib = @import("stdlib.zig");
+pub const json = @import("json.zig");
 
 test {
     std.testing.refAllDecls(@This());

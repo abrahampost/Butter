@@ -72,7 +72,7 @@
    2. VALUE REPRESENTATION
    -------------------------------------------------------------------------- *)
 
-<value>    ::= INT | FLOAT | BOOL | STRING | ARRAY_REF | STREAM
+<value>    ::= INT | FLOAT | BOOL | STRING | ARRAY_REF | STREAM | NULL | OBJECT
 
 (* INT and FLOAT are i64 / f64. STRING values are borrowed slices into a
    Chunk's constant pool (which in turn borrows from the original source
@@ -117,6 +117,16 @@
    underlying resource — which is what keeps the VM's "no heap, no
    allocator at run time" property intact even though `open`'s result is
    now a genuine runtime value. *)
+
+(* NULL (GRAMMAR.bnf design note 3n) is JSON's `null` — `value.Value`'s
+   `null_value` variant, carrying no payload. There is exactly one null
+   value; copying or discarding it is as free as any other scalar.
+
+   OBJECT (GRAMMAR.bnf design note 3m) is `*value.Object`, a refcounted
+   heap allocation — the VM's first and only heap-managed value, and the
+   one genuine exception to every "no heap, no allocator at run time" claim
+   elsewhere in this document. See section 11 for its representation and
+   the refcounting rules that manage its lifetime. *)
 
 (* A compiled program is one main Chunk (the top-level code, run as an
    implicit frame 0 — see section 6) plus one Chunk per declared function,
@@ -356,6 +366,97 @@
                                                pushed AFTER the reference,
                                                which is why the stack effect
                                                reads ref-then-count.
+
+   MAKE_LIST    #n        ( v1..vn -- list )  moves the top n values into a
+                                               fresh list Object (a pure
+                                               move — neither the moved
+                                               values nor the fresh list
+                                               need an incref). #0 is what a
+                                               bare `list xs` (no
+                                               initializer), or a
+                                               `list`-returning function
+                                               falling off the end, compiles
+                                               to. See section 11.
+   MAKE_MAP     #n        ( k1 v1 .. kn vn -- map )
+                                               builds a fresh map Object
+                                               from n key/value pairs, in
+                                               order (a repeated key is
+                                               last-wins). TypeMismatch if a
+                                               key isn't string-shaped
+                                               (defense in depth — the
+                                               compiler only ever emits a
+                                               string-literal key here).
+                                               See section 11.
+   INDEX_GET               ( container index -- v )
+                                               pops index, then container;
+                                               dispatches on container's
+                                               kind (list: index must be
+                                               INT, bounds-checked; map:
+                                               index must be string-shaped,
+                                               KeyNotFound if absent; else
+                                               TypeMismatch). Pushes the
+                                               found value, increffed. What
+                                               bracket-indexing compiles to
+                                               whenever the indexed thing
+                                               isn't a bare local resolving
+                                               to a fixed/generic array
+                                               (section 11).
+   INDEX_SET               ( container index v -- v )
+                                               same dispatch as INDEX_GET,
+                                               mutating instead: a map
+                                               insert-or-updates (never
+                                               errors on a missing key); a
+                                               list requires an in-bounds
+                                               index. Decrefs whatever
+                                               value it replaces. Peek-
+                                               shaped like STORE_INDEX: v is
+                                               still on the stack afterward.
+   LIST_PUSH               ( list v -- newlen )
+                                               appends v to list (a pure
+                                               move) and pushes its new
+                                               length. TypeMismatch if the
+                                               first operand isn't a list.
+   MAP_HAS                 ( map key -- bool ) whether key is present, with
+                                               no error for a missing one
+                                               (unlike INDEX_GET).
+   MAP_DELETE               ( map key -- bool )
+                                               removes key if present
+                                               (freeing its owned key copy,
+                                               decreffing its value);
+                                               pushes whether it existed.
+   MAP_KEYS                ( map -- list )     a fresh list of fresh
+                                               heap-string COPIES of map's
+                                               own keys (never borrowed from
+                                               the map's own storage), in
+                                               insertion order.
+   LEN_VALUE                ( v -- int )       what the relaxed
+                                               `len(<expression>)` compiles
+                                               to whenever the argument
+                                               isn't a bare fixed/generic-
+                                               array identifier: list ->
+                                               element count, map -> entry
+                                               count, else TypeMismatch.
+   JSON_PARSE               ( ref count -- v )  gathers `count` bytes from
+                                               the buffer ref points at
+                                               (reusing WRITE_BYTES's own
+                                               `gatherBytes`/`io_buffer`
+                                               staging area unchanged) and
+                                               parses them as JSON, pushing
+                                               whatever the document's root
+                                               turns out to be.
+                                               JsonParseFailed (with a
+                                               `Vm.diagnostic`) if the bytes
+                                               aren't well-formed JSON. See
+                                               section 12.
+   JSON_STRINGIFY           ( v -- string )    renders v as JSON text and
+                                               pushes it as a fresh heap
+                                               `string`. TypeMismatch if v
+                                               is (or contains, nested
+                                               inside a list/map) a stream
+                                               or an array reference —
+                                               neither has a JSON
+                                               representation. See
+                                               section 13.
 
    HALT                                       stop execution (only ever
                                                appears in the main chunk,
@@ -1000,4 +1101,293 @@
    diagnostic when printing a runtime error to the user, falling back to
    the bare `@errorName(err)` for every `RuntimeError` — file-related or
    not — that doesn't set one.
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   11. MAPS, LISTS, AND THE HEAP (the VM's first, and only, heap-managed
+       value; nine of the ten new opcodes below — JSON_PARSE, the tenth,
+       is section 12's)
+   -------------------------------------------------------------------------- *)
+
+   `map`/`list` (GRAMMAR.bnf design note 3m) add one new runtime value kind
+   — OBJECT (section 2) — and, with it, the one thing every prior section
+   of this document was careful to say the VM didn't need: a real heap and
+   a real allocator. `Vm` now carries a `std.mem.Allocator`
+   (`Vm.init(allocator)`, a breaking signature change from the old
+   zero-argument `Vm.init()`); a program that never touches a map, a list,
+   or `json(...)` never calls into it.
+
+   `value.Object` IS A REFCOUNTED HEAP HEADER, NOT A TRACED ONE.
+   ```
+   Object = struct {
+       refcount: usize = 1,
+       payload: union(enum) {
+           string: []const u8,                       // heap-owned bytes
+           list: std.ArrayList(Value),
+           map: std.StringArrayHashMapUnmanaged(Value),
+       },
+   }
+   ```
+   `refcount` starts at 1 (the reference returned by whatever created it)
+   and is adjusted by `Value.incref`/`Value.decref` (below); reaching 0
+   frees the object, recursively decreffing every child `Value` it holds
+   (each list element, each map value) and freeing every map key it owns —
+   a plain recursive free, not a mark/sweep collector. A self-referential
+   structure (`m["self"] := m`) never reaches refcount 0 and leaks for the
+   life of the `Vm.run` call that built it; this is a known, accepted
+   limitation (GRAMMAR.bnf design note 3m), not a bug this VM tries to
+   catch — `print`ing one is separately guarded by a hard recursion-depth
+   cap (64), so walking a cycle to render it fails cheaply instead of
+   overflowing the native stack.
+
+   ONE `object` TAG, NOT THREE. A heap-owned STRING (e.g. a JSON string
+   leaf) shares the same `Object`/refcount machinery as a list/map rather
+   than being its own `Value` variant — every incref/decref site only ever
+   has to ask "is this an OBJECT?" once. `Value.asStringBytes` is what lets
+   a heap string and the ordinary borrowed `.string` variant (section 2)
+   compare equal and substitute for each other by content anywhere a STRING
+   is expected; `Value.eql` uses it for exactly that. A list/map, by
+   contrast, compares by POINTER IDENTITY ONLY, never deep — no other
+   `<value>` does deep comparison either (ARRAY_REF/STREAM compare cheap
+   tuples), and a deep comparison could hang on the accepted cycle above.
+
+   A MAP IS ORDER-PRESERVING, NOT A PLAIN HASH TABLE. Its entries iterate
+   in insertion order (`std.StringArrayHashMapUnmanaged`, not a plain
+   `HashMap`) so `keys(...)`, `print`, and a document's own JSON structure
+   all see deterministic output. Every map KEY is a fresh, map-owned copy
+   (`allocator.dupe`'d on first insertion, freed on removal/overwrite/
+   destroy) — never a borrowed slice into whatever expression produced the
+   key — which is what lets `MAP_KEYS` (below) hand back independent,
+   freshly-owned values with no lifetime tie back to the map they came
+   from.
+
+   `Local.collection` IS A SEPARATE AXIS FROM `Local.array`. The compiler's
+   per-local bookkeeping (section 5) gains a second, independent optional
+   field — null for anything that isn't a map/list, `.map`/`.list`
+   otherwise — checked BEFORE `Local.array` wherever a bare name is
+   resolved. It's kept separate rather than folded into `ArraySpec` because
+   `map`/`list` are new `<type>` entries that never take the `[N]`/`[]`
+   array suffix `ArraySpec` represents at all; they're always exactly one
+   heap-reference slot, addressed via INDEX_GET/INDEX_SET below rather than
+   any array opcode. Whatever `Local.collection` says at compile time, the
+   VM still re-checks the actual runtime tag before every INDEX_GET/
+   INDEX_SET/LIST_PUSH/MAP_HAS/MAP_DELETE/MAP_KEYS/LEN_VALUE (`TypeMismatch`
+   if it doesn't match) — the same "declared type isn't checked against
+   what's actually stored" latitude every other variable already has
+   (section 1), applied here too.
+
+   BRACKET INDEXING IS GENERIC, NOT SLOT-BASED, BECAUSE IT HAS TO CHAIN.
+   Unlike LOAD_INDEX/STORE_INDEX (fixed array) and LOAD_INDEX_REF/
+   STORE_INDEX_REF/LOAD_REF_LEN (generic array), which all take a
+   compile-time-known SLOT as their operand, INDEX_GET/INDEX_SET take NO
+   slot operand at all — they pop their container off the stack as an
+   ordinary `Value`, however it got there. This is what a chained
+   `doc["a"]["b"]` needs: the base `doc["a"]` is a value already sitting on
+   the stack, not a named local, so a slot-taking opcode literally couldn't
+   express it. The compiler's dispatch (`compileIndex`/`compileIndexAssign`)
+   reflects this directly: a bare identifier resolving to a FIXED/GENERIC
+   array local still goes through the existing slot-based opcodes
+   unchanged, with no chaining possible (an array element is always
+   scalar, GRAMMAR.bnf design note 3e, so there is structurally no way to
+   reach this case with a non-identifier base); a bare identifier resolving
+   to a `.map`/`.list` local, or ANY non-identifier base at all (a nested
+   index, a call, a literal), compiles `base` as an ordinary expression
+   (LOAD_LOCAL, or recursively through another INDEX_GET) and falls through
+   to INDEX_GET/INDEX_SET. Indexing into a value that turns out to be
+   scalar at runtime — including one produced by chaining off a fixed-array
+   element — is `RuntimeError.TypeMismatch`, not a special chaining-depth
+   check; this is how "a fixed/generic array element is never itself
+   indexable" stays enforced without the compiler needing to reason about
+   chains at all. A bare identifier resolving to neither an array nor a
+   `.map`/`.list` local is instead a COMPILE-time `SemanticError.
+   NotIndexable` — the one case the compiler can already rule out
+   statically.
+
+   REFCOUNTING: INCREF ON DUPLICATION, DECREF ON DISCARD-WITHOUT-MOVING.
+   `Value.incref`/`Value.decref` are no-ops for every non-OBJECT value,
+   which is what keeps them cheap to call unconditionally. The general
+   rule: incref happens exactly when a `Value` is duplicated into a second
+   live location while the first stays live; decref happens exactly when a
+   live location's `Value` is permanently destroyed or overwritten without
+   moving. A pure MOVE (temporarily on the expression stack, then relocated
+   to a new permanent home with nothing left behind referencing it) needs
+   neither — this covers every var-decl initializer, MAKE_LIST/MAKE_MAP's
+   element transplant, LIST_PUSH's appended value, and RET's copied-down
+   return value. Concretely:
+     - LOAD_LOCAL, LOAD_INDEX, LOAD_INDEX_REF: the pushed copy is increffed
+       (an array CAN hold a heap-backed `.string` element even though it
+       can never hold a `.map`/`.list` one, so these needed updating too,
+       not just the new opcodes).
+     - STORE_LOCAL, STORE_INDEX, STORE_INDEX_REF: the new value is
+       increffed BEFORE the old slot value is decreffed — in that order,
+       so `x := x` (old and new the same object) can never free the only
+       live copy before the incref meant to preserve it runs — then the old
+       value is decreffed.
+     - POP: decrefs the popped value. PRINT and WRITE (section 9) likewise
+       decref the value they render before discarding it — printing/
+       writing a list/map/heap-string is a real possibility now, and both
+       are otherwise exactly this same "read then discard" shape as POP.
+     - EQ/NEQ (section 3) decref BOTH operands after comparing them — the
+       one case where a non-numeric pair (e.g. two lists, by identity)
+       reaches a SUCCESSFUL comparison rather than `TypeMismatch`, so
+       there's a decref to do on the ordinary success path, not only on an
+       error path.
+     - ADD/SUB/MUL/DIV/MOD/POW/comparison (via `popNumericPair`) and
+       NEG/NOT decref their operand(s) on the `TypeMismatch` path (a
+       non-numeric/non-boolean operand might be a heap object) — the
+       success path never needs to, since succeeding requires the operands
+       to be non-refcounted scalars in the first place.
+     - RET decrefs every value in `stack[bp .. sp-return_width)` — the
+       departing frame's own locals/arguments/temporaries — BEFORE the
+       existing copy-down loop moves the return value(s) into place. Safe
+       even though this range can overlap the copy destination: the decref
+       pass only ever READS a slot strictly below `sp-return_width`, and
+       the copy loop only ever WRITES into `[bp, bp+return_width)`, and
+       `bp <= sp-return_width` always — so nothing is ever double-decreffed
+       or read after being overwritten.
+     - `Vm.run`'s two exit paths (the `errdefer` for any propagated error,
+       and the ordinary HALT path) each decref every value still in
+       `stack[0..sp)` in one pass, generalizing `closeAllFiles`'s own
+       exit-path cleanup (section 10) to the heap — needed because
+       top-level code (frame 0) never runs a RET of its own, so without
+       this its own locals would never get decreffed at all.
+   No change is needed for PUSH_CONST (a compile-time constant is never an
+   OBJECT), MAKE_ARRAY_REF/LOAD_REF_LEN (an ARRAY_REF is never refcounted),
+   or CALL (it copies nothing — every argument was already increffed by
+   whatever expression produced it).
+
+   NEW OPCODES: see section 3 (MAKE_LIST, MAKE_MAP, INDEX_GET, INDEX_SET,
+   LIST_PUSH, MAP_HAS, MAP_DELETE, MAP_KEYS, LEN_VALUE) for exact stack
+   effects; JSON_PARSE is covered in section 12.
+
+   A MAP/LIST VALUE NEEDS NONE OF THE GENERIC-ARRAY-REFERENCE ESCAPE
+   ANALYSIS SECTION 6 DESCRIBES. `compileGenericArrayReturn`'s soundness
+   rule (a reference synthesized from THIS frame's own locals can't be
+   returned, only one already received as a parameter) exists because an
+   ARRAY_REF points into the VM's STACK, which the returning frame is about
+   to reuse. An OBJECT reference points into the HEAP instead, with its own
+   refcounted lifetime completely independent of any stack frame — so a
+   map/list can be returned from a function, stored inside another map/
+   list, or handed to a function and returned back, with no restriction at
+   all. `compileCallCommon`'s ordinary argument-compiling path already
+   handles a map/list-typed parameter correctly with no changes: since
+   `param.array_size` is always null for one, it falls through to the same
+   `compileExpr(arg)` any scalar argument already used, and a map/list
+   return likewise falls through to the ordinary (non-array) `return`
+   compilation path — in both cases what's being passed around is simply
+   one more ordinary `Value` that happens to be an OBJECT reference.
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   12. JSON (one opcode, no new heap concept beyond section 11's)
+   -------------------------------------------------------------------------- *)
+
+   `json(buffer, count)` (GRAMMAR.bnf design note 3n) adds one instruction —
+   JSON_PARSE (section 3) — and, on its own, nothing else: no new value
+   kind (a parsed document is built entirely out of section 11's ordinary
+   OBJECT/NULL/scalar values) and no new VM state.
+
+   THE BUFFER ARRIVES EXACTLY LIKE READ/WRITE_BYTES'S DOES. JSON_PARSE
+   gathers its `count` bytes via the SAME `Vm.gatherBytes`/`io_buffer`
+   staging area WRITE_BYTES already uses (section 9), reusing that
+   mechanism unchanged rather than inventing a second way to flatten a
+   Butter buffer into a flat `[]u8` — exactly the same reuse `emitArrayRef`
+   already gets between generic call arguments and I/O buffers (section 6).
+
+   PARSING ITSELF IS `std.json`'S JOB, NOT A HAND-WRITTEN ONE. `src/json.zig`
+   parses the gathered bytes via `std.json.parseFromSlice` into a
+   `std.json.Value` tree (in a throwaway scratch arena, freed immediately
+   after conversion — entirely separate from, and never sharing storage
+   with, the Butter heap objects the conversion below builds), then walks
+   it: a JSON object becomes a map, a JSON array becomes a list, a JSON
+   string becomes a fresh heap-owned `Object{.string}`, a JSON number
+   becomes an INT or FLOAT (matching whichever `std.json` produced), a JSON
+   boolean becomes BOOL, and JSON `null` becomes NULL. Every heap object
+   the conversion builds already has the refcount (1) a fresh owner
+   expects, exactly as if it had been built by ordinary MAKE_LIST/MAKE_MAP/
+   `mapSet` calls — JSON_PARSE itself needs no incref for the value it
+   pushes.
+
+   `json` IS A SPECIAL FORM, NOT AN ORDINARY CALL, BECAUSE ITS RESULT TYPE
+   ISN'T KNOWABLE UNTIL THE BYTES ARE READ. A `func`'s return type is fixed
+   and declared once (GRAMMAR.bnf design note 3c); a parsed document's root
+   could be any `<value>` kind depending on what the bytes actually say.
+   `json` is parsed like `len`/`read`/`write`/`open` — a keyword the parser
+   recognizes directly in `<atom>` position — precisely so it can hand back
+   a value whose kind isn't fixed at compile time, something an ordinary
+   CALL (section 6), with its one fixed `return_width`, has no way to do.
+
+   MALFORMED INPUT IS `RuntimeError.JsonParseFailed`, diagnosed via
+   `Vm.diagnostic` (`operation = "json"`, `path` left empty, `cause` a
+   fixed description) — the same side-channel files established (section
+   10) for an error whose bare tag can't carry enough detail on its own.
+   Unlike `FileOpenFailed`'s `cause` (the underlying OS error's own name),
+   JSON's `cause` is a fixed string rather than `@errorName` of some
+   specific underlying error: `src/json.zig` collapses every parse failure
+   (a syntax error, a truncated document, and so on) to one
+   `error.JsonParseFailed` before it ever reaches the VM, so there's no
+   more specific name left to report by the time `Vm.diagnostic` is set.
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   13. JSON STRINGIFY (one opcode, section 12's reverse — still no new heap
+       concept, still no new VM state)
+   -------------------------------------------------------------------------- *)
+
+   `stringify(value)` (GRAMMAR.bnf design note 3o) adds one instruction —
+   JSON_STRINGIFY (section 3) — the reverse of JSON_PARSE: instead of
+   consuming bytes to build a value, it consumes a value to build bytes,
+   handing them back as a fresh heap `Object{.string}` (section 11) rather
+   than through the buffer convention READ/WRITE_BYTES and JSON_PARSE share,
+   since there's no destination buffer here for it to fill.
+
+   THE ENCODER IS A RECURSIVE WALK OVER `Value`, THE MIRROR IMAGE OF
+   `convert`'s WALK OVER `std.json.Value` (section 12). `src/json.zig`'s
+   `stringify` walks `v` directly — INT/FLOAT print as JSON numbers, BOOL as
+   `true`/`false`, NULL as `null`, and OBJECT's `.list`/`.map` payloads
+   recurse with `[...]`/`{"k":v,...}` punctuation — needing no intermediate
+   `std.json.Value` tree the way `parse` needs one on the way in, since
+   JSON_STRINGIFY only ever produces text, never Butter heap objects, as it
+   goes.
+
+   STRING ESCAPING IS `std.json`'S JOB, NOT A HAND-WRITTEN ONE — THE SAME
+   SPLIT `parse` ALREADY MAKES. Both `Value.string` (borrowed) and
+   `Object{.string}` (heap) leaves go through `std.json.Stringify.
+   encodeJsonString`, which handles quote/backslash/control-character
+   escaping (and surrounds the result in quotes) exactly as any other
+   `std.json` consumer gets it, rather than JSON_STRINGIFY reimplementing
+   that escaping table itself.
+
+   NOT THE SAME RENDERING `PRINT` USES, ON PURPOSE. `Value.print` (section
+   2) already renders a list/map in JSON-*shaped* syntax for human-readable
+   output, but writes a string element as bare `"{s}"` with no escaping at
+   all — correct only because `print`'s own job is producing text for a
+   person to read, never text meant to be re-parsed. JSON_STRINGIFY exists
+   specifically to produce text a `json(...)` call elsewhere can read back,
+   so it cannot share `print`'s implementation; `src/json.zig`'s `write`
+   helper is a second, independent renderer that happens to agree with
+   `print` on every value kind's *shape* while differing on every string
+   leaf's *content*.
+
+   A STREAM OR ARRAY REFERENCE IS `RuntimeError.TypeMismatch`, THE SAME
+   BARE-TAG CONVENTION MAP_HAS/LIST_PUSH ALREADY USE FOR A WRONG-KIND
+   OPERAND (section 11) — no `Vm.diagnostic`, since "value has no JSON
+   representation" is everything there is to say. `src/json.zig` reports
+   this to the VM as `error.Unstringifiable`, collapsed to `TypeMismatch` at
+   the JSON_STRINGIFY handler exactly as `error.JsonParseFailed` collapses
+   to `JsonParseFailed` at JSON_PARSE's.
+
+   `stringify` IS A SPECIAL FORM FOR A DIFFERENT REASON THAN `json` IS.
+   `json`'s result type isn't knowable until its bytes are read (section 12)
+   — that's what rules out an ordinary `func`. `stringify`'s result type
+   is always `string`, exactly as fixed as any `func`'s declared return
+   type (GRAMMAR.bnf design note 3c); what rules out an ordinary `func`
+   here instead is that nothing in this language lets a `func` body build a
+   `string` a piece at a time — no concatenation, no formatting primitive —
+   the way JSON_STRINGIFY's own recursive walk needs. So it's parsed like
+   `json`/`len`/`read`/`write`/`open` regardless — a keyword `<atom>`
+   recognizes directly, not a CALL.
    ========================================================================== *)
