@@ -1,0 +1,19 @@
+string s := "name=Ada;age=36;lang=Zig"
+int start := 0
+for i in 0..24 {
+    if s[i] == "=" {
+        print s[start..i]
+        start := i + 1
+    }
+    if s[i] == ";" {
+        print s[start..i]
+        start := i + 1
+    }
+}
+print s[start..24]
+
+string greeting := "hello"
+print greeting[0]
+print greeting[4]
+print greeting[1..4]
+print greeting[0..0]

@@ -93,6 +93,10 @@ test "quadratic_formula: roots via the bundled math stdlib's sqrt/pow" {
     try expectCaseOutput("quadratic_formula");
 }
 
+test "string_indexing: hand-rolled key=value;... parsing via s[i]/s[a..b]" {
+    try expectCaseOutput("string_indexing");
+}
+
 // ---- Error-path cases ------------------------------------------------
 //
 // Programs that are expected to fail: no .expected file (there is nothing
@@ -106,4 +110,19 @@ test "division by zero is a runtime error" {
 test "indexing past an array's length is a runtime error" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.IndexOutOfBounds, run(allocator, "int[3] a\nprint a[5]\n"));
+}
+
+test "indexing past a string's length is a runtime error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.IndexOutOfBounds, run(allocator, "string s := \"hi\"\nprint s[5]\n"));
+}
+
+test "slicing a string with start > end is a runtime error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.IndexOutOfBounds, run(allocator, "string s := \"hi\"\nprint s[2..0]\n"));
+}
+
+test "assigning through a string index is a runtime error (strings are read-only)" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.TypeMismatch, run(allocator, "string s := \"hi\"\ns[0] := \"X\"\n"));
 }

@@ -102,6 +102,14 @@ pub const Expr = union(enum) {
     array_literal: []*Expr,
     index: Index,
     index_assign: IndexAssign,
+    /// `<base>[start..end]` (GRAMMAR.bnf's Strings design notes) — a
+    /// read-only substring, end exclusive, same convention as the
+    /// for-loop's own range. Never produced as an assignment target: unlike
+    /// `.index`, there is no `.slice_assign` counterpart — `assignment`
+    /// only ever turns a `.variable` or `.index` shape into an lvalue, so
+    /// `s[a..b] := v` falls through to its "invalid assignment target"
+    /// error same as any other non-lvalue expression would.
+    slice: Slice,
     /// `len(<expression>)`. Relaxed from a bare array name to an arbitrary
     /// expression (GRAMMAR.bnf design note 3m) now that a map/list is a
     /// genuine first-class runtime value — the compiler still special-cases
@@ -184,6 +192,12 @@ pub const Expr = union(enum) {
         base: *Expr,
         index: *Expr,
         value: *Expr,
+    };
+
+    pub const Slice = struct {
+        base: *Expr,
+        start: *Expr,
+        end: *Expr,
     };
 
     pub const MapEntry = struct {
@@ -397,6 +411,15 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try printExpr(writer, ia.index);
             try writer.writeAll(") ");
             try printExpr(writer, ia.value);
+            try writer.writeAll(")");
+        },
+        .slice => |s| {
+            try writer.writeAll("(slice ");
+            try printExpr(writer, s.base);
+            try writer.writeAll(" ");
+            try printExpr(writer, s.start);
+            try writer.writeAll(" ");
+            try printExpr(writer, s.end);
             try writer.writeAll(")");
         },
         .len_of => |e| {

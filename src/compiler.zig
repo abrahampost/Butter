@@ -26,8 +26,12 @@ pub const SemanticError = error{
     ArrayLengthMismatch,
     InvalidArrayInitializer,
     /// Bracket-indexing (or `len`'s relaxed position) on a bare local that's
-    /// statically known to be neither an array, a list, nor a map (ISA.bnf
-    /// section 11) — e.g. `x[0]` where `x` is a plain `int`. A non-
+    /// statically known to be neither an array, a list, a map, nor a string
+    /// (ISA.bnf section 11) — e.g. `x[0]` where `x` is a plain `int`. Also
+    /// covers slicing (`x[a..b]`) a bare ARRAY-typed local specifically,
+    /// which `compileIndex`'s single-element read would otherwise allow but
+    /// `compileSlice` never does (a raw array still isn't a first-class
+    /// value to slice into a new one, GRAMMAR.bnf design note 3e). A non-
     /// identifier base that turns out to be a scalar only at RUNTIME (e.g.
     /// chaining off a fixed-array element) is `RuntimeError.TypeMismatch`
     /// instead; this is only for the case the compiler can already rule out.
@@ -71,6 +75,13 @@ const Local = struct {
     /// heap-reference slot, addressed via INDEX_GET/INDEX_SET instead of any
     /// of the array opcodes.
     collection: ?CollectionKind = null,
+    /// A third, independent axis from `array`/`collection`: true for a
+    /// plain `string` local (GRAMMAR.bnf's Strings design notes). Also
+    /// always exactly one heap-reference slot, but kept separate from
+    /// `CollectionKind` rather than folded in — a string is indexable/
+    /// sliceable (INDEX_GET/INDEX_SLICE) but, unlike a map/list, never
+    /// assignable through a bracket (no INDEX_SET case for it).
+    is_string: bool = false,
 };
 
 const CollectionKind = enum { map, list };
@@ -319,6 +330,7 @@ pub const Compiler = struct {
                 .slot = self.next_slot,
                 .array = p.array_size,
                 .collection = collectionKind(p.type),
+                .is_string = p.type == .string,
             });
             self.next_slot += arraySpecWidth(p.array_size);
         }
@@ -472,7 +484,7 @@ pub const Compiler = struct {
                 const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, d.type));
                 _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             }
-            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot });
+            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .is_string = d.type == .string });
             self.next_slot += 1;
         }
     }
@@ -614,6 +626,7 @@ pub const Compiler = struct {
             },
             .index => |ix| try self.compileIndex(ix),
             .index_assign => |ia| try self.compileIndexAssign(ia),
+            .slice => |sl| try self.compileSlice(sl),
             .len_of => |e| try self.compileLenOf(e),
             .stream_literal => |s| {
                 const idx = try self.chunk.addConstant(self.allocator, .{ .stream = .ofStandard(s) });
@@ -889,10 +902,10 @@ pub const Compiler = struct {
     /// so there's no way to reach this case with a non-identifier base (a
     /// chained `.index` node), and none is attempted.
     ///
-    /// Everything else — a map/list local (bare name or not), or ANY
+    /// Everything else — a map/list/string local (bare name or not), or ANY
     /// non-identifier base, including a chained `doc["a"]["b"]` — falls
     /// through to the generic INDEX_GET path: `base` compiles as an
-    /// ordinary expression (LOAD_LOCAL for a bare collection name, or
+    /// ordinary expression (LOAD_LOCAL for a bare collection/string name, or
     /// recursively for a nested index/call/whatever else), and INDEX_GET
     /// dispatches on whatever kind of value that turns out to be at
     /// runtime (ISA.bnf section 11) — including rejecting it, the same
@@ -908,8 +921,8 @@ pub const Compiler = struct {
                 }
                 return;
             }
-            if (local.collection == null) {
-                return self.fail(SemanticError.NotIndexable, ix.base.variable, "not indexable — expected an array, list, or map");
+            if (local.collection == null and !local.is_string) {
+                return self.fail(SemanticError.NotIndexable, ix.base.variable, "not indexable — expected an array, list, map, or string");
             }
         }
         try self.compileExpr(ix.base);
@@ -934,14 +947,47 @@ pub const Compiler = struct {
                 }
                 return;
             }
-            if (local.collection == null) {
-                return self.fail(SemanticError.NotIndexable, ia.base.variable, "not indexable — expected an array, list, or map");
+            if (local.collection == null and !local.is_string) {
+                return self.fail(SemanticError.NotIndexable, ia.base.variable, "not indexable — expected an array, list, map, or string");
             }
+            // A bare string local compiles through to INDEX_SET like any
+            // other collection would; strings are read-only via bracket
+            // syntax (GRAMMAR.bnf's Strings design notes), so this is
+            // deliberately left a `RuntimeError.TypeMismatch` (indexSet's
+            // `.string` case) rather than rejected here at compile time —
+            // the same "checked, not trusted" stance every other
+            // container/operation mismatch already gets.
         }
         try self.compileExpr(ia.base);
         try self.compileExpr(ia.index);
         try self.compileExpr(ia.value);
         _ = try self.chunk.emit(self.allocator, .index_set);
+    }
+
+    /// `<base>[start..end]` (GRAMMAR.bnf's Strings design notes) — always a
+    /// read; there is no slice-assign counterpart, so unlike `compileIndex`
+    /// there's no `local.array` branch that could ever emit a STORE. A bare
+    /// ARRAY-typed local is rejected here even though `compileIndex` would
+    /// happily emit LOAD_INDEX for a single-element read of one: a raw
+    /// fixed/generic array still isn't a first-class value (GRAMMAR.bnf
+    /// design note 3e), so there is no array-shaped VALUE here to slice into
+    /// a new one, unlike a single scalar element. A bare non-string,
+    /// non-collection local (a plain int/float/bool) is rejected the same
+    /// way `compileIndex` rejects one. Everything else — a string (bare or
+    /// not), a map/list, or any non-identifier base — compiles through to
+    /// INDEX_SLICE, which TypeMismatches at runtime for anything but a
+    /// string container (map/list slicing isn't supported in this pass).
+    fn compileSlice(self: *Compiler, sl: ast.Expr.Slice) CompileError!void {
+        if (sl.base.* == .variable) {
+            const local = self.resolveLocal(sl.base.variable) orelse return self.fail(SemanticError.UndefinedVariable, sl.base.variable, "undefined variable");
+            if (local.array != null or (local.collection == null and !local.is_string)) {
+                return self.fail(SemanticError.NotIndexable, sl.base.variable, "not sliceable — expected a string");
+            }
+        }
+        try self.compileExpr(sl.base);
+        try self.compileExpr(sl.start);
+        try self.compileExpr(sl.end);
+        _ = try self.chunk.emit(self.allocator, .index_slice);
     }
 
     /// `len(<expression>)`. A bare identifier naming a FIXED-size array
@@ -1523,6 +1569,41 @@ test "indexing a non-array, non-collection local is a compile error" {
     var compiler = Compiler.init(allocator);
     defer compiler.deinit();
     try std.testing.expectError(CompileError.NotIndexable, compiler.compileProgram(program));
+}
+
+test "a bare string local can be indexed and sliced" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\string s := "hello"
+        \\print s[1]
+        \\print s[1..4]
+    , &buf);
+    try std.testing.expectEqualStrings("e\nell\n", output);
+}
+
+test "assigning through a bare string local's index compiles fine but is a runtime TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init("string s := \"hi\"\ns[0] := \"X\"\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileProgram(program); // must not raise NotIndexable
+    defer compiled.deinit(allocator);
+}
+
+test "slicing a plain scalar local is a compile-time NotIndexable error" {
+    try expectCompileError(std.testing.allocator, "int x := 1\nprint x[0..1]\n", SemanticError.NotIndexable);
+}
+
+test "slicing a bare fixed-array local is a compile-time NotIndexable error" {
+    try expectCompileError(std.testing.allocator, "int[3] arr\nprint arr[0..2]\n", SemanticError.NotIndexable);
 }
 
 test "using an array's bare name as a scalar value is a compile error" {

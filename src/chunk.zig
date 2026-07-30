@@ -78,16 +78,19 @@ pub const OpCode = enum(u8) {
     // Maps, lists, and the heap (ISA.bnf section 11). MAKE_LIST/MAKE_MAP's
     // operand is an element/pair count — the compiler already knows exactly
     // how many values it just pushed for the literal/no-initializer case.
-    // INDEX_GET/INDEX_SET take no operand: unlike LOAD_INDEX/STORE_INDEX,
-    // the container they act on is an ordinary popped `Value` (so that
-    // indexing can chain — `doc["a"]["b"]` — off any expression, not just a
-    // bare local), not a compile-time-known slot. LIST_PUSH/MAP_HAS/
-    // MAP_DELETE/MAP_KEYS/LEN_VALUE likewise take their operand(s) as
-    // ordinary popped expression results.
+    // INDEX_GET/INDEX_SET/INDEX_SLICE take no operand: unlike LOAD_INDEX/
+    // STORE_INDEX, the container they act on is an ordinary popped `Value`
+    // (so that indexing can chain — `doc["a"]["b"]` — off any expression,
+    // not just a bare local), not a compile-time-known slot. LIST_PUSH/
+    // MAP_HAS/MAP_DELETE/MAP_KEYS/LEN_VALUE likewise take their operand(s)
+    // as ordinary popped expression results.
     make_list,
     make_map,
     index_get,
     index_set,
+    // `s[a..b]` (ISA.bnf section 11's Strings addendum) — read-only, string
+    // only; there is no INDEX_SLICE_SET.
+    index_slice,
     list_push,
     map_has,
     map_delete,

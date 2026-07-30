@@ -251,15 +251,47 @@
                                                pops index, then container;
                                                dispatches on container's kind
                                                (list: index must be INT,
-                                               bounds-checked; map: index must
-                                               be string-shaped, KeyNotFound
-                                               if absent; else TypeMismatch).
-                                               Pushes the found value,
-                                               increffed. What bracket-
+                                               bounds-checked, pushes the
+                                               found element increffed
+                                               (still owned by the list too);
+                                               map: index must be
+                                               string-shaped, KeyNotFound if
+                                               absent, pushes the found value
+                                               increffed (still owned by the
+                                               map too); string: index must
+                                               be INT, bounds-checked against
+                                               the string's byte length,
+                                               pushes a FRESH length-1 string
+                                               (`Value.newString`) — already
+                                               owned outright by this push,
+                                               so unlike the list/map cases
+                                               there is nothing else to
+                                               incref against; else
+                                               TypeMismatch). What bracket-
                                                indexing compiles to whenever
                                                the indexed thing isn't a bare
                                                local resolving to a fixed/
                                                generic array.
+   INDEX_SLICE             ( container start end -- v )
+                                               pops end, start, then
+                                               container (start/end must be
+                                               INT, else TypeMismatch);
+                                               container must be a string,
+                                               else TypeMismatch.
+                                               IndexOutOfBounds unless
+                                               0 <= start <= end <= len(s).
+                                               Pushes a fresh string
+                                               (`Value.newString`) of the
+                                               bytes `[start, end)` — end
+                                               exclusive, `start == end`
+                                               legal and yields `""`. What
+                                               `s[a..b]` compiles to
+                                               (GRAMMAR.bnf's Strings design
+                                               notes); there is no slice
+                                               counterpart for list/map in
+                                               this pass. Read-only like
+                                               INDEX_GET's string case: no
+                                               STORE form exists.
    INDEX_SET               ( container index v -- v )
                                                same dispatch as INDEX_GET,
                                                mutating instead: a map
@@ -725,15 +757,24 @@
    INDEX_GET/INDEX_SET/LIST_PUSH/MAP_HAS/MAP_DELETE/MAP_KEYS/LEN_VALUE, and
    the VM re-checks the actual runtime tag before every one of those
    (`TypeMismatch` if it doesn't match what the compiler expected).
+   `Local.is_string` is a third, independent axis for the same reason: a
+   string local is likewise always one heap-reference slot, but addressed
+   via INDEX_GET/INDEX_SLICE only — never INDEX_SET (GRAMMAR.bnf's Strings
+   design notes), which is why it isn't just folded into `CollectionKind`.
 
    BRACKET INDEXING IS GENERIC, NOT SLOT-BASED, BECAUSE IT HAS TO CHAIN.
    Unlike LOAD_INDEX/LOAD_INDEX_REF (which take a compile-time-known slot),
-   INDEX_GET/INDEX_SET pop their container off the stack as an ordinary
-   `Value`, however it got there — necessary for a chained `doc["a"]["b"]`,
-   where the base `doc["a"]` is already a value on the stack, not a named
-   local. A bare identifier resolving to neither an array nor a map/list
-   local is a compile-time `SemanticError.NotIndexable`; indexing into a
-   value that turns out scalar at runtime is `RuntimeError.TypeMismatch`.
+   INDEX_GET/INDEX_SET/INDEX_SLICE pop their container off the stack as an
+   ordinary `Value`, however it got there — necessary for a chained
+   `doc["a"]["b"]`, where the base `doc["a"]` is already a value on the
+   stack, not a named local. A bare identifier resolving to neither an
+   array, a map/list, nor a string local is a compile-time
+   `SemanticError.NotIndexable`; indexing into a value that turns out scalar
+   at runtime is `RuntimeError.TypeMismatch`. A bare ARRAY-typed local is
+   additionally rejected at compile time for `INDEX_SLICE` specifically (raw
+   arrays aren't first-class values to slice — design note 3e), even though
+   a single INDEX_GET-style read isn't how a fixed/generic array is indexed
+   at all (that's still LOAD_INDEX/LOAD_INDEX_REF, section 6).
 
    REFCOUNTING: INCREF ON DUPLICATION, DECREF ON DISCARD-WITHOUT-MOVING.
    Both are no-ops for every non-OBJECT value. The rule: incref when a

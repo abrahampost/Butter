@@ -148,8 +148,13 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 (* The postfix '[' <expression> ']' suffix applies after any <atom>, which
    is what lets indexing chain (`doc["a"]["b"]`). A shape that isn't
-   actually indexable (`5[0]`) is rejected by the compiler or VM, not here. *)
-<primary>           ::= <atom> { '[' <expression> ']' }
+   actually indexable (`5[0]`) is rejected by the compiler or VM, not here.
+   The '..' form is a SLICE (strings only, see the Strings design notes
+   below) — `s[a..b]`, end exclusive, same convention as the for-loop's own
+   range. A slice is never itself an assignment target: <assignment> below
+   only ever recognizes the single-index shape, so `s[a..b] := v` is a
+   parse-time "invalid assignment target" like any other non-lvalue. *)
+<primary>           ::= <atom> { '[' <expression> [ '..' <expression> ] ']' }
 
 <atom>              ::= INT
                       | FLOAT
@@ -280,6 +285,29 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      `for i in 0..len(ks) { ks[i] ... }` covers both).
    - `has(m, k)` / `delete(m, k)` check/remove without the error a bracket
      read/write would otherwise raise. *)
+
+(* --- Strings ---
+   - A string is BYTE-indexed, not codepoint-indexed — consistent with the
+     rest of the language treating text as raw bytes (`read`/`write`'s `int`
+     buffers, above): a multi-byte UTF-8 character occupies more than one
+     index, same as it would in one of those buffers.
+   - `s[i]` reuses the same postfix `[...]` bracket syntax as list/map
+     indexing (above), but evaluates to a fresh length-1 STRING (there is no
+     separate "char" type), not an int — chosen so a parser can compare
+     `s[i] == "{"` directly against an ordinary string literal.
+     `RuntimeError.IndexOutOfBounds` unless `0 <= i < len(s)`.
+   - `s[a..b]` is a SLICE: a fresh string of the bytes `[a, b)` (end
+     exclusive, matching the for-loop's own `start..end` convention).
+     `RuntimeError.IndexOutOfBounds` unless `0 <= a <= b <= len(s)`; `a == b`
+     is legal and yields `""`.
+   - READ-ONLY: unlike list/map, there is no `s[i] := v`. A string's `eql`
+     already compares by content rather than identity (ISA.bnf section 2),
+     and assignment (`b := a`) increfs the same heap object rather than
+     copying its bytes (ISA.bnf section 11) — so a mutable index would let
+     writing through one alias silently change every other variable that
+     happens to hold "the same" string. Reusing the bracket syntax for a
+     read while leaving it a `RuntimeError.TypeMismatch` for a write avoids
+     that surprise without needing a separate copy-on-write story. *)
 
 (* --- JSON ---
    - `json(buf, count)` parses `count` bytes of an `int` buffer as JSON text

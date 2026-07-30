@@ -480,7 +480,7 @@ pub const Parser = struct {
         return self.primary();
     }
 
-    /// <primary> ::= <atom> { '[' <expression> ']' }
+    /// <primary> ::= <atom> { '[' <expression> [ '..' <expression> ] ']' }
     ///
     /// The postfix `'[' <expression> ']'` suffix is what lets bracket-
     /// indexing CHAIN (`doc["a"]["b"]`, GRAMMAR.bnf design note 3m) — it's
@@ -489,7 +489,9 @@ pub const Parser = struct {
     /// later, by the compiler (a statically-known non-array/collection bare
     /// local) or the VM (`RuntimeError.TypeMismatch` for anything else),
     /// the same "checked, not trusted" stance the rest of this VM already
-    /// takes rather than trying to reject it here in the grammar.
+    /// takes rather than trying to reject it here in the grammar. The `..`
+    /// form is a SLICE (GRAMMAR.bnf's Strings design notes) — read-only, so
+    /// unlike the single-index form it never becomes an assignment target.
     fn primary(self: *Parser) Error!*ast.Expr {
         var expr = try self.atom();
         while (self.check(.lbracket)) expr = try self.finishIndex(expr);
@@ -590,17 +592,25 @@ pub const Parser = struct {
         return self.createExpr(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.allocator()) } });
     }
 
-    /// `'[' <expression> ']'` postfix suffix — see `primary`'s doc comment.
-    /// Called with `base` already parsed and '[' as the next token.
-    /// Produces an `.index` node regardless of whether it ends up being
-    /// read or assigned to — `assignment` is what turns a trailing
-    /// `':=' <expr>` into an `.index_assign` instead (matching how a bare
-    /// `.variable` becomes `.assign`).
+    /// `'[' <expression> [ '..' <expression> ] ']'` postfix suffix — see
+    /// `primary`'s doc comment. Called with `base` already parsed and '['
+    /// as the next token. Without a `..`, produces an `.index` node
+    /// regardless of whether it ends up being read or assigned to —
+    /// `assignment` is what turns a trailing `':=' <expr>` into an
+    /// `.index_assign` instead (matching how a bare `.variable` becomes
+    /// `.assign`). With a `..`, produces a `.slice` node instead — always a
+    /// read: `assignment` has no slice-assign case, so a trailing `':='`
+    /// after one falls through to its "invalid assignment target" error.
     fn finishIndex(self: *Parser, base: *ast.Expr) Error!*ast.Expr {
         _ = self.advance(); // '['
-        const index_expr = try self.expression();
+        const start_expr = try self.expression();
+        if (self.match(.dot_dot)) {
+            const end_expr = try self.expression();
+            _ = try self.expect(.rbracket, "expected ']' after slice range");
+            return self.createExpr(.{ .slice = .{ .base = base, .start = start_expr, .end = end_expr } });
+        }
         _ = try self.expect(.rbracket, "expected ']' after array index");
-        return self.createExpr(.{ .index = .{ .base = base, .index = index_expr } });
+        return self.createExpr(.{ .index = .{ .base = base, .index = start_expr } });
     }
 
     /// <len-expr> ::= 'len' '(' <expression> ')'
@@ -1183,6 +1193,29 @@ test "parses an empty array literal" {
 
 test "parses indexed assignment" {
     try expectExprSexpr("arr[0] := 9", "(:= (index arr 0) 9)");
+}
+
+test "parses a string slice" {
+    try expectExprSexpr("s[1..4]", "(slice s 1 4)");
+}
+
+test "a slice's bounds may be arbitrary expressions" {
+    try expectExprSexpr("s[i..i + 1]", "(slice s i (+ i 1))");
+}
+
+test "slicing chains off any expression, not just a bare identifier" {
+    try expectExprSexpr("s[0..2][0..1]", "(slice (slice s 0 2) 0 1)");
+}
+
+test "a slice is not a valid assignment target" {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init("s[0..1] := \"x\"\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
 }
 
 // ---- Maps, lists, and JSON (GRAMMAR.bnf design notes 3m/3n) -------------

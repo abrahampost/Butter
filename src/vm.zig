@@ -213,27 +213,63 @@ pub const Vm = struct {
     /// What bracket-indexing (INDEX_GET/INDEX_SET, ISA.bnf section 11)
     /// compiles to whenever the indexed thing isn't a bare local resolving
     /// to a fixed/generic array (that case still goes through LOAD_INDEX/
-    /// STORE_INDEX unchanged) — a map/list value already sitting on the
-    /// stack, produced by any expression, including another INDEX_GET
+    /// STORE_INDEX unchanged) — a map/list/string value already sitting on
+    /// the stack, produced by any expression, including another INDEX_GET
     /// (chaining, e.g. `doc["a"]["b"]`). Read-only; never mutates
-    /// `container` or takes ownership of anything.
-    fn indexGet(container: Value, index: Value) RuntimeError!Value {
+    /// `container`.
+    ///
+    /// Ownership differs by branch, which is why each one increfs (or not)
+    /// itself rather than leaving a single blanket incref to the caller: the
+    /// list/map cases return a value BORROWED from the container (still also
+    /// owned by it), so the returned copy needs its own incref; the string
+    /// case returns a FRESH `Value.newString` that already starts owned
+    /// outright by this call, so increffing it too would leak it (nothing
+    /// else would ever decref that extra reference).
+    fn indexGet(allocator: std.mem.Allocator, container: Value, index: Value) !Value {
         if (container != .object) return RuntimeError.TypeMismatch;
         switch (container.object.payload) {
             .list => |list| {
                 if (index != .int) return RuntimeError.TypeMismatch;
                 if (index.int < 0 or index.int >= list.items.len) return RuntimeError.IndexOutOfBounds;
-                return list.items[@as(usize, @intCast(index.int))];
+                const v = list.items[@as(usize, @intCast(index.int))];
+                v.incref();
+                return v;
             },
             .map => |map| {
                 const key = index.asStringBytes() orelse return RuntimeError.TypeMismatch;
-                return map.get(key) orelse return RuntimeError.KeyNotFound;
+                const v = map.get(key) orelse return RuntimeError.KeyNotFound;
+                v.incref();
+                return v;
             },
-            // A heap STRING isn't indexable either — there is still no
-            // per-character access in this language (GRAMMAR.bnf design
-            // note 3n), borrowed or heap-owned alike.
-            .string => return RuntimeError.TypeMismatch,
+            // `s[i]` (GRAMMAR.bnf's Strings design notes): byte-indexed,
+            // bounds-checked, evaluates to a fresh length-1 string rather
+            // than an int — there is no separate "char" type in this
+            // language, and this lets a parser compare `s[i] == "{"`
+            // directly against an ordinary string literal.
+            .string => |bytes| {
+                if (index != .int) return RuntimeError.TypeMismatch;
+                if (index.int < 0 or index.int >= bytes.len) return RuntimeError.IndexOutOfBounds;
+                const i: usize = @intCast(index.int);
+                return Value.newString(allocator, bytes[i .. i + 1]);
+            },
         }
+    }
+
+    /// `s[a..b]` (ISA.bnf section 11's Strings addendum): a fresh substring
+    /// of the bytes `[start, end)` — end exclusive, matching the for-loop's
+    /// own range convention. String only, unlike `indexGet`/`indexSet` —
+    /// there is no list/map slice in this pass. Like the string branch of
+    /// `indexGet`, the result is a fresh, already-owned `Value.newString`;
+    /// the caller must not incref it again.
+    fn indexSlice(allocator: std.mem.Allocator, container: Value, start: Value, end: Value) !Value {
+        if (container != .object or container.object.payload != .string) return RuntimeError.TypeMismatch;
+        if (start != .int or end != .int) return RuntimeError.TypeMismatch;
+        const bytes = container.object.payload.string;
+        const len: i64 = @intCast(bytes.len);
+        if (start.int < 0 or start.int > end.int or end.int > len) return RuntimeError.IndexOutOfBounds;
+        const s: usize = @intCast(start.int);
+        const e: usize = @intCast(end.int);
+        return Value.newString(allocator, bytes[s..e]);
     }
 
     /// The mutating counterpart to `indexGet`. Always inserts-or-updates for
@@ -765,15 +801,24 @@ pub const Vm = struct {
                     defer index_val.decref(self.allocator);
                     const container = try self.pop();
                     defer container.decref(self.allocator);
-                    const result = try indexGet(container, index_val);
-                    result.incref();
+                    const result = try indexGet(self.allocator, container, index_val);
+                    try self.push(result);
+                },
+                .index_slice => {
+                    const end_val = try self.pop();
+                    defer end_val.decref(self.allocator);
+                    const start_val = try self.pop();
+                    defer start_val.decref(self.allocator);
+                    const container = try self.pop();
+                    defer container.decref(self.allocator);
+                    const result = try indexSlice(self.allocator, container, start_val, end_val);
                     try self.push(result);
                 },
                 .index_set => {
-                    const v = try self.peek(0);
+                    const v = try self.pop();
+                    errdefer v.decref(self.allocator); // undo the stack's own claim if we never restore it below
                     v.incref();
-                    errdefer v.decref(self.allocator); // undo if we never actually store it below
-                    _ = try self.pop();
+                    errdefer v.decref(self.allocator); // undo the copy indexSet would store, if it fails first
                     const index_val = try self.pop();
                     defer index_val.decref(self.allocator);
                     const container = try self.pop();
@@ -1944,6 +1989,160 @@ test "index_get on a list out of bounds is IndexOutOfBounds, not memory corrupti
     _ = try chunk.emit(allocator, .halt);
 
     try expectRuntimeError(&chunk, RuntimeError.IndexOutOfBounds);
+}
+
+test "index_set on a list out of bounds with a heap-typed replacement value does not leak" {
+    // Regression test: INDEX_SET used to incref the replacement value once
+    // (for the copy it'd store) but silently rely on the stack's OWN
+    // pre-existing claim on that value being "reused" by the final push —
+    // which only happens on success. On failure the function returns
+    // before that push, so the stack's claim was never released, leaking
+    // one reference whenever the replacement value was heap-allocated.
+    // std.testing.allocator (via expectRuntimeError/Vm.init) catches the
+    // leak if this regresses.
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    _ = try chunk.emitWithOperand(allocator, .make_list, 1);
+    const five = try chunk.addConstant(allocator, .{ .int = 5 });
+    const replacement = try chunk.addConstant(allocator, try Value.newString(allocator, "replacement"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, five);
+    _ = try chunk.emitWithOperand(allocator, .push_const, replacement);
+    _ = try chunk.emit(allocator, .index_set);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.IndexOutOfBounds);
+}
+
+test "index_get on a string produces a fresh length-1 string, not a leak or a double-free" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const hello = try chunk.addConstant(allocator, try Value.newString(allocator, "hello"));
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, hello);
+    _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    _ = try chunk.emit(allocator, .index_get);
+    _ = try chunk.emit(allocator, .print); // "e"
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    // std.testing.allocator (via runSource/Vm.init) also catches a leak or
+    // double-free here if the fresh string's refcount were ever wrong.
+    try std.testing.expectEqualStrings("e\n", buf[0..len]);
+}
+
+test "index_get on a string out of bounds is IndexOutOfBounds" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const hi = try chunk.addConstant(allocator, try Value.newString(allocator, "hi"));
+    const five = try chunk.addConstant(allocator, .{ .int = 5 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, hi);
+    _ = try chunk.emitWithOperand(allocator, .push_const, five);
+    _ = try chunk.emit(allocator, .index_get);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.IndexOutOfBounds);
+}
+
+test "index_set on a string is TypeMismatch (strings are read-only)" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const hi = try chunk.addConstant(allocator, try Value.newString(allocator, "hi"));
+    const zero = try chunk.addConstant(allocator, .{ .int = 0 });
+    // The replacement value is itself heap-allocated (a string), so this
+    // also covers INDEX_SET's failure path releasing it cleanly instead of
+    // leaking — std.testing.allocator catches it if it doesn't.
+    const x = try chunk.addConstant(allocator, try Value.newString(allocator, "X"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, hi);
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero);
+    _ = try chunk.emitWithOperand(allocator, .push_const, x);
+    _ = try chunk.emit(allocator, .index_set);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "index_slice extracts a substring, end exclusive" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "hello world"));
+    const six = try chunk.addConstant(allocator, .{ .int = 6 });
+    const eleven = try chunk.addConstant(allocator, .{ .int = 11 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emitWithOperand(allocator, .push_const, six);
+    _ = try chunk.emitWithOperand(allocator, .push_const, eleven);
+    _ = try chunk.emit(allocator, .index_slice);
+    _ = try chunk.emit(allocator, .print); // "world"
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("world\n", buf[0..len]);
+}
+
+test "index_slice with start == end yields an empty string" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "hi"));
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    _ = try chunk.emit(allocator, .index_slice);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("\n", buf[0..len]);
+}
+
+test "index_slice with start > end is IndexOutOfBounds" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "hi"));
+    const two = try chunk.addConstant(allocator, .{ .int = 2 });
+    const zero = try chunk.addConstant(allocator, .{ .int = 0 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emitWithOperand(allocator, .push_const, two);
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero);
+    _ = try chunk.emit(allocator, .index_slice);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.IndexOutOfBounds);
+}
+
+test "index_slice on a non-string container is TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    const zero = try chunk.addConstant(allocator, .{ .int = 0 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    _ = try chunk.emitWithOperand(allocator, .make_list, 1);
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero);
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero);
+    _ = try chunk.emit(allocator, .index_slice);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
 }
 
 test "make_map and index_get/index_set: insert-then-update round-trips through a local slot" {
