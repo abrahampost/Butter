@@ -332,7 +332,7 @@ pub const Compiler = struct {
         // since any index into it immediately bounds-checks out.
         if (self.current_return_array_size) |spec| switch (spec) {
             .fixed => |n| {
-                const idx = try self.chunk.addConstant(self.allocator, defaultValue(f.return_type));
+                const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, f.return_type));
                 var i: u32 = 0;
                 while (i < n) : (i += 1) _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             },
@@ -347,7 +347,7 @@ pub const Compiler = struct {
             .map => _ = try self.chunk.emitWithOperand(self.allocator, .make_map, 0),
             .list => _ = try self.chunk.emitWithOperand(self.allocator, .make_list, 0),
             else => {
-                const idx = try self.chunk.addConstant(self.allocator, defaultValue(f.return_type));
+                const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, f.return_type));
                 _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             },
         }
@@ -404,12 +404,12 @@ pub const Compiler = struct {
     /// Never actually called with `.map`/`.list` — every call site checks
     /// for those first and emits MAKE_MAP/MAKE_LIST instead, since an empty
     /// map/list isn't a compile-time constant `PUSH_CONST` could hold.
-    fn defaultValue(value_type: ast.ValueType) Value {
+    fn defaultValue(allocator: std.mem.Allocator, value_type: ast.ValueType) !Value {
         return switch (value_type) {
             .int => .{ .int = 0 },
             .float => .{ .float = 0.0 },
             .bool => .{ .boolean = false },
-            .string => .{ .string = "" },
+            .string => try Value.newString(allocator, ""),
             .map, .list => unreachable,
         };
     }
@@ -459,7 +459,7 @@ pub const Compiler = struct {
                     else => return self.fail(SemanticError.InvalidArrayInitializer, d.name, "an array declaration's initializer must be an array literal or a call to an array-returning function"),
                 }
             } else {
-                const idx = try self.chunk.addConstant(self.allocator, defaultValue(d.type));
+                const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, d.type));
                 var i: u32 = 0;
                 while (i < len) : (i += 1) _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             }
@@ -469,7 +469,7 @@ pub const Compiler = struct {
             if (d.initializer) |init_expr| {
                 try self.compileExpr(init_expr);
             } else {
-                const idx = try self.chunk.addConstant(self.allocator, defaultValue(d.type));
+                const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, d.type));
                 _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             }
             try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot });
@@ -606,7 +606,7 @@ pub const Compiler = struct {
             },
             .map_literal => |entries| {
                 for (entries) |entry| {
-                    const idx = try self.chunk.addConstant(self.allocator, .{ .string = entry.key });
+                    const idx = try self.chunk.addConstant(self.allocator, try Value.newString(self.allocator, entry.key));
                     _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
                     try self.compileExpr(entry.value);
                 }
@@ -853,7 +853,7 @@ pub const Compiler = struct {
         const value: Value = switch (lit) {
             .int => |v| .{ .int = v },
             .float => |v| .{ .float = v },
-            .string => |v| .{ .string = v },
+            .string => |v| try Value.newString(self.allocator, v),
             .null_value => .null_value,
             .boolean => unreachable,
         };

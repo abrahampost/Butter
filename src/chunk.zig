@@ -127,12 +127,16 @@ pub fn unpackIndexOperand(operand: u32) IndexOperand {
 }
 
 /// A compiled program: its instructions plus the pool of constants they
-/// reference by index (PUSH_CONST's operand).
+/// reference by index (PUSH_CONST's operand). Any heap-object constant
+/// (a string literal, a map-literal key — see `Value.newString`) is owned
+/// by its pool entry: that's one permanent reference, incref'd by PUSH_CONST
+/// on every push and released only by `deinit`, below.
 pub const Chunk = struct {
     code: std.ArrayList(Instruction) = .empty,
     constants: std.ArrayList(Value) = .empty,
 
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
+        for (self.constants.items) |v| v.decref(allocator);
         self.code.deinit(allocator);
         self.constants.deinit(allocator);
     }

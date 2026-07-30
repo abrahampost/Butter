@@ -1,14 +1,14 @@
 //! Runtime value representation for the Butter VM (ISA.bnf, section 2).
 //!
-//! Every value is either a plain scalar, a string slice borrowed from a
-//! Chunk's constant pool, an `array_ref` — a reference to a generic (unsized)
-//! array parameter's underlying slots, still living somewhere else on the
-//! VM's own value stack (ISA.bnf section 6's generic-array addendum), never
-//! on a heap — or, since maps/lists (ISA.bnf section 11), a refcounted
-//! `object` pointing at real heap storage. Scalars, borrowed strings, and
-//! array references still need no allocator and no destructor; `object` is
-//! the one exception, and its lifetime is managed by a plain refcount, not a
-//! tracing collector (see `Object.destroy`).
+//! Every value is either a plain scalar, an `array_ref` — a reference to a
+//! generic (unsized) array parameter's underlying slots, still living
+//! somewhere else on the VM's own value stack (ISA.bnf section 6's
+//! generic-array addendum), never on a heap — or a refcounted `object`
+//! pointing at real heap storage: strings, maps, and lists (ISA.bnf section
+//! 11) all live there. Scalars and array references still need no allocator
+//! and no destructor; `object` is the one exception, and its lifetime is
+//! managed by a plain refcount, not a tracing collector (see
+//! `Object.destroy`).
 
 const std = @import("std");
 
@@ -84,14 +84,12 @@ pub const OpenMode = enum(u32) {
 pub const ArrayRef = struct { base: u32, len: u32 };
 
 /// A refcounted heap allocation (GRAMMAR.bnf design note 3m; ISA.bnf section
-/// 11) — the VM's first and only heap-managed runtime object. `map`/`list`
-/// values, and any STRING a program produces that didn't already exist as a
-/// compile-time literal (namely, one read out of parsed JSON — ISA.bnf
-/// section 12), all live here instead of in a borrowed slice or a stack
-/// slot. `refcount` starts at 1 (the reference returned by whatever created
-/// it) and is adjusted by `Value.incref`/`Value.decref`; reaching 0 frees
-/// this object and recursively decrefs everything it holds (`destroy`,
-/// below) — a plain recursive free, not a tracing collector. A
+/// 11) — the VM's first and only heap-managed runtime object. Every
+/// string, map, and list value lives here — never in a borrowed slice or a
+/// stack slot. `refcount` starts at 1 (the reference returned by whatever
+/// created it) and is adjusted by `Value.incref`/`Value.decref`; reaching 0
+/// frees this object and recursively decrefs everything it holds
+/// (`destroy`, below) — a plain recursive free, not a tracing collector. A
 /// self-referential structure (`m["self"] := m`) never reaches refcount 0
 /// and leaks for the life of the `Vm.run` call it was created in; this is a
 /// known, accepted limitation (GRAMMAR.bnf design note 3m), not a bug to fix
@@ -101,10 +99,10 @@ pub const Object = struct {
     payload: Payload,
 
     pub const Payload = union(enum) {
-        /// Heap-owned bytes — e.g. a JSON string leaf. Distinct from
-        /// `Value.string`, which is always a borrowed compile-time slice;
-        /// `Value.asStringBytes` is what lets code elsewhere treat the two
-        /// interchangeably by content.
+        /// Heap-owned bytes — the runtime representation of every string
+        /// value, compile-time literal or dynamically produced alike
+        /// (`Value.newString`). `Value.asStringBytes` is the seam other code
+        /// uses to read a string's bytes without caring how it was made.
         string: []const u8,
         list: std.ArrayList(Value),
         /// Order-preserving (not a plain hash map) so `keys()`, `print`, and
@@ -180,7 +178,6 @@ pub const Value = union(enum) {
     int: i64,
     float: f64,
     boolean: bool,
-    string: []const u8,
     array_ref: ArrayRef,
     stream: Stream,
     /// JSON's `null` (ISA.bnf section 12). Carries no payload — there is
@@ -189,12 +186,22 @@ pub const Value = union(enum) {
     null_value,
     object: *Object,
 
+    /// Allocates a new heap string value: dupes `bytes` into an
+    /// owner-tracked buffer and wraps it in a fresh, refcount-1 `Object`.
+    /// The single choke point every Butter string value — literal or
+    /// dynamic — is created through, so no code elsewhere hand-rolls the
+    /// dupe+create+wrap sequence.
+    pub fn newString(allocator: std.mem.Allocator, bytes: []const u8) !Value {
+        const owned = try allocator.dupe(u8, bytes);
+        const obj = try Object.create(allocator, .{ .string = owned });
+        return .{ .object = obj };
+    }
+
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
             .int => "int",
             .float => "float",
             .boolean => "bool",
-            .string => "string",
             .array_ref => "array",
             .stream => "stream",
             .null_value => "null",
@@ -219,14 +226,10 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Returns this value's bytes if it's string-shaped — either the
-    /// borrowed compile-time `.string` variant or a heap `object{.string}`
-    /// (ISA.bnf section 11) — or `null` otherwise. This is what lets a
-    /// runtime-constructed heap string (e.g. from parsed JSON) compare
-    /// equal to, and be used anywhere as, an ordinary borrowed STRING.
+    /// Returns this value's bytes if it's string-shaped — a heap
+    /// `object{.string}` (ISA.bnf section 11) — or `null` otherwise.
     pub fn asStringBytes(self: Value) ?[]const u8 {
         return switch (self) {
-            .string => |s| s,
             .object => |o| if (o.payload == .string) o.payload.string else null,
             else => null,
         };
@@ -278,7 +281,6 @@ pub const Value = union(enum) {
         return switch (a) {
             .int, .float => false, // one operand numeric, the other not
             .boolean => |av| b == .boolean and av == b.boolean,
-            .string => unreachable, // asStringBytes above already handled this
             // Never reachable from surfaceable Butter syntax (a generic
             // array reference can only ever be indexed, measured with
             // `len`, or forwarded — never compared) but Value must still
@@ -315,7 +317,6 @@ pub const Value = union(enum) {
             .int => |v| try writer.print("{d}", .{v}),
             .float => |v| try writer.print("{d}", .{v}),
             .boolean => |v| try writer.print("{}", .{v}),
-            .string => |v| if (quoted) try writer.print("\"{s}\"", .{v}) else try writer.writeAll(v),
             // Not reachable from surfaceable Butter syntax either (see the
             // `eql` note above) — kept only so this switch stays exhaustive.
             .array_ref => try writer.writeAll("<array>"),
@@ -366,7 +367,12 @@ test "print renders each value kind" {
     try expectPrint(.{ .int = 42 }, "42");
     try expectPrint(.{ .float = 3.5 }, "3.5");
     try expectPrint(.{ .boolean = true }, "true");
-    try expectPrint(.{ .string = "hi" }, "hi");
+
+    const allocator = std.testing.allocator;
+    const hi = try Value.newString(allocator, "hi");
+    defer hi.decref(allocator);
+    try expectPrint(hi, "hi");
+
     try expectPrint(.null_value, "null");
 }
 
@@ -376,14 +382,26 @@ test "eql compares numerics across int/float" {
 }
 
 test "eql compares same-type non-numeric values structurally" {
-    try std.testing.expect(Value.eql(.{ .string = "hi" }, .{ .string = "hi" }));
-    try std.testing.expect(!Value.eql(.{ .string = "hi" }, .{ .string = "bye" }));
+    const allocator = std.testing.allocator;
+    const hi1 = try Value.newString(allocator, "hi");
+    defer hi1.decref(allocator);
+    const hi2 = try Value.newString(allocator, "hi");
+    defer hi2.decref(allocator);
+    const bye = try Value.newString(allocator, "bye");
+    defer bye.decref(allocator);
+
+    try std.testing.expect(Value.eql(hi1, hi2));
+    try std.testing.expect(!Value.eql(hi1, bye));
     try std.testing.expect(Value.eql(.{ .boolean = true }, .{ .boolean = true }));
 }
 
 test "eql returns false (not an error) across incompatible types" {
     try std.testing.expect(!Value.eql(.{ .boolean = true }, .{ .int = 1 }));
-    try std.testing.expect(!Value.eql(.{ .string = "1" }, .{ .int = 1 }));
+
+    const allocator = std.testing.allocator;
+    const one = try Value.newString(allocator, "1");
+    defer one.decref(allocator);
+    try std.testing.expect(!Value.eql(one, .{ .int = 1 }));
 }
 
 test "eql treats null_value as equal only to itself" {
@@ -459,14 +477,15 @@ test "eql compares list/map objects by pointer identity, never deep" {
     try std.testing.expect(!Value.eql(.{ .object = a }, .{ .object = b }));
 }
 
-test "asStringBytes unifies borrowed and heap strings for content equality" {
+test "asStringBytes reads a heap string's bytes; eql compares heap strings by content" {
     const allocator = std.testing.allocator;
-    const heap_bytes = try allocator.dupe(u8, "hi");
-    const obj = try Object.create(allocator, .{ .string = heap_bytes });
-    defer (Value{ .object = obj }).decref(allocator);
+    const a = try Value.newString(allocator, "hi");
+    defer a.decref(allocator);
+    const b = try Value.newString(allocator, "hi");
+    defer b.decref(allocator);
 
-    try std.testing.expect(Value.eql(.{ .string = "hi" }, .{ .object = obj }));
-    try std.testing.expectEqualStrings("hi", (Value{ .object = obj }).asStringBytes().?);
+    try std.testing.expect(Value.eql(a, b));
+    try std.testing.expectEqualStrings("hi", a.asStringBytes().?);
 }
 
 test "print renders a list with quoted string elements and a map as key: value pairs" {
@@ -474,7 +493,7 @@ test "print renders a list with quoted string elements and a map as key: value p
     const list_obj = try Object.create(allocator, .{ .list = .empty });
     defer (Value{ .object = list_obj }).decref(allocator);
     try list_obj.payload.list.append(allocator, .{ .int = 1 });
-    try list_obj.payload.list.append(allocator, .{ .string = "a" });
+    try list_obj.payload.list.append(allocator, try Value.newString(allocator, "a"));
 
     try expectPrint(.{ .object = list_obj }, "[1, \"a\"]");
 

@@ -630,7 +630,11 @@ pub const Vm = struct {
             const instr = chunk.code.items[ip];
             ip += 1;
             switch (instr.op) {
-                .push_const => try self.push(chunk.constants.items[instr.operand]),
+                .push_const => {
+                    const v = chunk.constants.items[instr.operand];
+                    v.incref();
+                    try self.push(v);
+                },
                 .push_true => try self.push(.{ .boolean = true }),
                 .push_false => try self.push(.{ .boolean = false }),
                 .pop => {
@@ -819,9 +823,7 @@ pub const Vm = struct {
                         // Always a fresh copy — never a slice into the map's
                         // own storage — so the returned list's lifetime is
                         // fully independent of the map it came from.
-                        const key_copy = try self.allocator.dupe(u8, entry.key_ptr.*);
-                        const key_obj = try Object.create(self.allocator, .{ .string = key_copy });
-                        try list.append(self.allocator, .{ .object = key_obj });
+                        try list.append(self.allocator, try Value.newString(self.allocator, entry.key_ptr.*));
                     }
                     const result_obj = try Object.create(self.allocator, .{ .list = list });
                     try self.push(.{ .object = result_obj });
@@ -1021,12 +1023,9 @@ pub const Vm = struct {
 
                 .open => {
                     const path_val = try self.pop();
-                    // A no-op unless path_val turns out not to be `.string`
-                    // (in which case it's rejected below anyway) — a path
-                    // that IS `.string` is always borrowed, never refcounted.
                     defer path_val.decref(self.allocator);
-                    if (path_val != .string) return RuntimeError.TypeMismatch;
-                    const stream = try self.openFile(host, path_val.string, @enumFromInt(instr.operand));
+                    const path = path_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                    const stream = try self.openFile(host, path, @enumFromInt(instr.operand));
                     try self.push(stream);
                 },
                 .close => {
@@ -1653,8 +1652,8 @@ test "write sends stdout to out and stderr to err, never the other way" {
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
 
-    const to_out = try chunk.addConstant(allocator, .{ .string = "out" });
-    const to_err = try chunk.addConstant(allocator, .{ .string = "err" });
+    const to_out = try chunk.addConstant(allocator, try Value.newString(allocator, "out"));
+    const to_err = try chunk.addConstant(allocator, try Value.newString(allocator, "err"));
     try emitStream(&chunk, allocator, .stdout);
     _ = try chunk.emitWithOperand(allocator, .push_const, to_out);
     _ = try chunk.emit(allocator, .write);
@@ -1697,7 +1696,7 @@ test "an unsupplied stderr still counts what was written, like /dev/null" {
     defer chunk.deinit(allocator);
 
     try emitStream(&chunk, allocator, .stderr);
-    const value = try chunk.addConstant(allocator, .{ .string = "abc" });
+    const value = try chunk.addConstant(allocator, try Value.newString(allocator, "abc"));
     _ = try chunk.emitWithOperand(allocator, .push_const, value);
     _ = try chunk.emit(allocator, .write);
     _ = try chunk.emit(allocator, .print);
@@ -1834,7 +1833,7 @@ test "open without filesystem access fails rather than reaching for one" {
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
 
-    const path = try chunk.addConstant(allocator, .{ .string = "nope.txt" });
+    const path = try chunk.addConstant(allocator, try Value.newString(allocator, "nope.txt"));
     _ = try chunk.emitWithOperand(allocator, .push_const, path);
     _ = try chunk.emitWithOperand(allocator, .open, @intFromEnum(value_mod.OpenMode.read));
     _ = try chunk.emit(allocator, .halt);
@@ -1952,13 +1951,13 @@ test "make_map and index_get/index_set: insert-then-update round-trips through a
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
 
-    const name = try chunk.addConstant(allocator, .{ .string = "name" });
-    const ada = try chunk.addConstant(allocator, .{ .string = "Ada" });
+    const name = try chunk.addConstant(allocator, try Value.newString(allocator, "name"));
+    const ada = try chunk.addConstant(allocator, try Value.newString(allocator, "Ada"));
     _ = try chunk.emitWithOperand(allocator, .push_const, name);
     _ = try chunk.emitWithOperand(allocator, .push_const, ada);
     _ = try chunk.emitWithOperand(allocator, .make_map, 1); // slot 0 = {name: "Ada"}
 
-    const grace = try chunk.addConstant(allocator, .{ .string = "Grace" });
+    const grace = try chunk.addConstant(allocator, try Value.newString(allocator, "Grace"));
     _ = try chunk.emitWithOperand(allocator, .load_local, 0);
     _ = try chunk.emitWithOperand(allocator, .push_const, name);
     _ = try chunk.emitWithOperand(allocator, .push_const, grace);
@@ -1981,13 +1980,13 @@ test "index_get on a missing map key is KeyNotFound" {
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
 
-    const name = try chunk.addConstant(allocator, .{ .string = "name" });
-    const ada = try chunk.addConstant(allocator, .{ .string = "Ada" });
+    const name = try chunk.addConstant(allocator, try Value.newString(allocator, "name"));
+    const ada = try chunk.addConstant(allocator, try Value.newString(allocator, "Ada"));
     _ = try chunk.emitWithOperand(allocator, .push_const, name);
     _ = try chunk.emitWithOperand(allocator, .push_const, ada);
     _ = try chunk.emitWithOperand(allocator, .make_map, 1);
 
-    const missing = try chunk.addConstant(allocator, .{ .string = "missing" });
+    const missing = try chunk.addConstant(allocator, try Value.newString(allocator, "missing"));
     _ = try chunk.emitWithOperand(allocator, .push_const, missing);
     _ = try chunk.emit(allocator, .index_get);
     _ = try chunk.emit(allocator, .halt);
@@ -2000,8 +1999,8 @@ test "map_has reports presence without erroring on a missing key" {
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
 
-    const name = try chunk.addConstant(allocator, .{ .string = "name" });
-    const ada = try chunk.addConstant(allocator, .{ .string = "Ada" });
+    const name = try chunk.addConstant(allocator, try Value.newString(allocator, "name"));
+    const ada = try chunk.addConstant(allocator, try Value.newString(allocator, "Ada"));
     _ = try chunk.emitWithOperand(allocator, .push_const, name);
     _ = try chunk.emitWithOperand(allocator, .push_const, ada);
     _ = try chunk.emitWithOperand(allocator, .make_map, 1); // slot 0
@@ -2011,7 +2010,7 @@ test "map_has reports presence without erroring on a missing key" {
     _ = try chunk.emit(allocator, .map_has);
     _ = try chunk.emit(allocator, .print); // true
 
-    const missing = try chunk.addConstant(allocator, .{ .string = "missing" });
+    const missing = try chunk.addConstant(allocator, try Value.newString(allocator, "missing"));
     _ = try chunk.emitWithOperand(allocator, .load_local, 0);
     _ = try chunk.emitWithOperand(allocator, .push_const, missing);
     _ = try chunk.emit(allocator, .map_has);
@@ -2028,8 +2027,8 @@ test "map_delete removes an entry once, then reports it's already gone" {
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
 
-    const name = try chunk.addConstant(allocator, .{ .string = "name" });
-    const ada = try chunk.addConstant(allocator, .{ .string = "Ada" });
+    const name = try chunk.addConstant(allocator, try Value.newString(allocator, "name"));
+    const ada = try chunk.addConstant(allocator, try Value.newString(allocator, "Ada"));
     _ = try chunk.emitWithOperand(allocator, .push_const, name);
     _ = try chunk.emitWithOperand(allocator, .push_const, ada);
     _ = try chunk.emitWithOperand(allocator, .make_map, 1); // slot 0
@@ -2055,9 +2054,9 @@ test "map_keys preserves insertion order" {
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
 
-    const a = try chunk.addConstant(allocator, .{ .string = "a" });
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
     const one = try chunk.addConstant(allocator, .{ .int = 1 });
-    const b = try chunk.addConstant(allocator, .{ .string = "b" });
+    const b = try chunk.addConstant(allocator, try Value.newString(allocator, "b"));
     const two = try chunk.addConstant(allocator, .{ .int = 2 });
     _ = try chunk.emitWithOperand(allocator, .push_const, a);
     _ = try chunk.emitWithOperand(allocator, .push_const, one);
@@ -2099,7 +2098,7 @@ test "len_value reads a list's and a map's length" {
     _ = try chunk.emit(allocator, .len_value);
     _ = try chunk.emit(allocator, .print); // 3
 
-    const x = try chunk.addConstant(allocator, .{ .string = "x" });
+    const x = try chunk.addConstant(allocator, try Value.newString(allocator, "x"));
     _ = try chunk.emitWithOperand(allocator, .push_const, x);
     _ = try chunk.emitWithOperand(allocator, .push_const, one);
     _ = try chunk.emitWithOperand(allocator, .make_map, 1);
@@ -2185,7 +2184,7 @@ test "chained index_get reaches through a list-of-maps two levels deep" {
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
 
-    const a = try chunk.addConstant(allocator, .{ .string = "a" });
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
     const one = try chunk.addConstant(allocator, .{ .int = 1 });
     _ = try chunk.emitWithOperand(allocator, .push_const, a);
     _ = try chunk.emitWithOperand(allocator, .push_const, one);
@@ -2319,7 +2318,7 @@ test "a self-referential map is an accepted, documented leak (GRAMMAR.bnf design
 
     _ = try chunk.emitWithOperand(allocator, .make_map, 0); // slot 0 = {}
 
-    const self_key = try chunk.addConstant(allocator, .{ .string = "self" });
+    const self_key = try chunk.addConstant(allocator, try Value.newString(allocator, "self"));
     _ = try chunk.emitWithOperand(allocator, .load_local, 0); // container
     _ = try chunk.emitWithOperand(allocator, .push_const, self_key);
     _ = try chunk.emitWithOperand(allocator, .load_local, 0); // value: m itself
@@ -2380,7 +2379,7 @@ test "json_stringify renders a string value with proper JSON escaping" {
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
 
-    const str = try chunk.addConstant(allocator, .{ .string = "a\"b" });
+    const str = try chunk.addConstant(allocator, try Value.newString(allocator, "a\"b"));
     _ = try chunk.emitWithOperand(allocator, .push_const, str);
     _ = try chunk.emit(allocator, .json_stringify);
     _ = try chunk.emit(allocator, .print);

@@ -54,8 +54,7 @@ pub fn stringify(allocator: std.mem.Allocator, v: Value) StringifyError!Value {
         error.Unstringifiable => return error.Unstringifiable,
     };
     const owned = try out.toOwnedSlice();
-    const obj = try Object.create(allocator, .{ .string = owned });
-    return .{ .object = obj };
+    return .{ .object = try Object.create(allocator, .{ .string = owned }) };
 }
 
 fn write(v: Value, writer: *std.Io.Writer) (std.Io.Writer.Error || error{Unstringifiable})!void {
@@ -64,7 +63,6 @@ fn write(v: Value, writer: *std.Io.Writer) (std.Io.Writer.Error || error{Unstrin
         .float => |f| try writer.print("{d}", .{f}),
         .boolean => |b| try writer.print("{}", .{b}),
         .null_value => try writer.writeAll("null"),
-        .string => |s| try std.json.Stringify.encodeJsonString(s, .{}, writer),
         // Reachable from surfaceable Butter syntax (`print stdout` is legal,
         // so `stringify(stdout)` parses too) but JSON has no value for
         // either — unlike `Value.print`'s `<stdout>`/`<array>` placeholders,
@@ -111,11 +109,7 @@ fn convert(allocator: std.mem.Allocator, v: std.json.Value) JsonError!Value {
             const f = std.fmt.parseFloat(f64, s) catch return error.JsonParseFailed;
             return .{ .float = f };
         },
-        .string => |s| {
-            const owned = try allocator.dupe(u8, s);
-            const obj = try Object.create(allocator, .{ .string = owned });
-            return .{ .object = obj };
-        },
+        .string => |s| return Value.newString(allocator, s),
         .array => |arr| {
             var list: std.ArrayList(Value) = .empty;
             errdefer {
@@ -223,15 +217,21 @@ fn expectStringified(v: Value, expected: []const u8) !void {
 }
 
 test "stringify renders each scalar kind" {
+    const allocator = std.testing.allocator;
     try expectStringified(.{ .int = 42 }, "42");
     try expectStringified(.{ .float = 1.5 }, "1.5");
     try expectStringified(.{ .boolean = true }, "true");
     try expectStringified(.null_value, "null");
-    try expectStringified(.{ .string = "hi" }, "\"hi\"");
+    const hi = try Value.newString(allocator, "hi");
+    defer hi.decref(allocator);
+    try expectStringified(hi, "\"hi\"");
 }
 
 test "stringify escapes special characters, unlike Value.print's bare quoting" {
-    try expectStringified(.{ .string = "a\"b\\c\nd\te" }, "\"a\\\"b\\\\c\\nd\\te\"");
+    const allocator = std.testing.allocator;
+    const s = try Value.newString(allocator, "a\"b\\c\nd\te");
+    defer s.decref(allocator);
+    try expectStringified(s, "\"a\\\"b\\\\c\\nd\\te\"");
 }
 
 test "stringify renders a list and a map with proper JSON punctuation" {
@@ -239,7 +239,7 @@ test "stringify renders a list and a map with proper JSON punctuation" {
 
     var list: std.ArrayList(Value) = .empty;
     try list.append(allocator, .{ .int = 1 });
-    try list.append(allocator, .{ .string = "a" });
+    try list.append(allocator, try Value.newString(allocator, "a"));
     const list_obj = try Object.create(allocator, .{ .list = list });
     try expectStringified(.{ .object = list_obj }, "[1,\"a\"]");
     (Value{ .object = list_obj }).decref(allocator);

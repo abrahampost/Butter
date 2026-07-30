@@ -10,151 +10,86 @@
    1. DESIGN GOALS ("RISC applied to a stack machine")
    -------------------------------------------------------------------------- *)
 
-(* A classic RISC ISA gets its simplicity from three commitments: every
-   instruction is the same width and decodes the same way, instructions
-   are load/store only (arithmetic never touches memory directly, only
-   registers), and the instruction set is small and orthogonal (one job
-   per instruction, compose the rest in software). This VM applies the
-   same three commitments to a stack machine instead of a register machine:
+(* a) FIXED-WIDTH INSTRUCTIONS. Every instruction is the same
+      `struct { op: OpCode, operand: u32 }` (src/chunk.zig) regardless of
+      `op`; an unused operand is simply zero. LOAD_INDEX/STORE_INDEX (section
+      3) pack two compile-time constants (an array's base slot and its
+      length) into that one operand, 16 bits each, rather than growing
+      Instruction a second field (`chunk.packIndexOperand`).
 
-   a) FIXED-WIDTH INSTRUCTIONS. Every instruction is the same
-      `struct { op: OpCode, operand: u32 }` (see src/chunk.zig), regardless
-      of what `op` is. There is no variable-length encoding and no
-      instruction that carries more than one operand. Unused operands are
-      simply zero. This trades code density (a real byte-packed encoding
-      would be smaller) for a trivial, uniform decode step — appropriate
-      for a teaching/target VM where correctness and simplicity dominate.
-      LOAD_INDEX/STORE_INDEX (section 3) need two compile-time constants
-      (an array's base slot and its length) but keep to this same one-u32
-      shape by packing both into the one operand (16 bits each) rather
-      than growing Instruction a second field — see `chunk.packIndexOperand`.
+   b) LOAD/STORE ONLY. Arithmetic, comparison, and logical instructions take
+      zero operands and work purely on values already on the stack; only the
+      LOAD/STORE family (PUSH_CONST, LOAD_LOCAL, STORE_LOCAL, ...) names a
+      location. READ/WRITE_BYTES (section 9) are the one exception — they
+      move a whole run of bytes directly — but even they don't name slots
+      themselves: they're handed an ARRAY_REF already produced by an
+      ordinary LOAD/STORE-family instruction.
 
-   b) LOAD/STORE ONLY. Arithmetic, comparison, and logical instructions
-      (ADD, LT, NOT, ...) take zero operands and work purely on values
-      already on the stack; the only instructions that name a location
-      (a constant-pool slot or a local-variable slot) are the LOAD/STORE
-      family (PUSH_CONST, LOAD_LOCAL, STORE_LOCAL). Nothing else reaches
-      into the constant pool or a variable slot.
+   c) ORTHOGONAL AND MINIMAL. Exactly one conditional branch (JUMP_IF_FALSE)
+      and one unconditional one (JUMP); there is no JUMP_IF_TRUE because
+      'or' is expressible as JUMP_IF_FALSE + JUMP (section 4).
 
-      The two byte-buffer I/O instructions (READ and WRITE_BYTES, section
-      9) are the one deliberate exception: they read and write a whole
-      run of slots directly. That is unavoidable for I/O — the entire
-      point is to move bytes between a stream and storage the program
-      already declared — but note they still don't *name* those slots
-      themselves: they're handed an ARRAY_REF on the stack, produced by
-      the ordinary LOAD/STORE-family instructions, so the "which memory"
-      decision stays where this goal wants it.
-
-   c) ORTHOGONAL AND MINIMAL. There is exactly one conditional-branch
-      instruction (JUMP_IF_FALSE) and one unconditional one (JUMP); a
-      JUMP_IF_TRUE was deliberately omitted because 'or' is expressible as
-      JUMP_IF_FALSE + JUMP (see section 4), the same way real RISC ISAs
-      favor a minimal set of branch primitives that software sequences
-      into everything else.
-
-   Now that the source language has functions (GRAMMAR.bnf, design notes
-   3b-d), the VM has a call stack: every function's LOAD_LOCAL/STORE_LOCAL
-   operands are slot indices *relative to the current call frame's base
-   pointer*, not absolute (see sections 5 and 6). Top-level code is simply
-   frame 0, with its base pointer fixed at 0 for the program's whole
-   lifetime — which is why nothing about existing top-level compilation
-   changed when functions were added.
-
-   There is also no type-checking pass: the compiler resolves variable
-   *names* to slots at compile time but does not check that a variable's
-   declared type agrees with what's stored into it, and the VM checks
-   *runtime* value types operation-by-operation (section 3). Static type
-   checking would be a separate semantic-analysis pass layered on top of
-   the existing parser output; it isn't attempted here. *)
+   Every LOAD_LOCAL/STORE_LOCAL operand is a slot index relative to the
+   current call frame's base pointer, not absolute (sections 5-6). Top-level
+   code is frame 0, with its base pointer fixed at 0 for the program's whole
+   lifetime. There is no type-checking pass: the compiler resolves variable
+   *names* to slots but never checks a variable's declared type against what
+   it holds; the VM checks *runtime* value types operation-by-operation
+   (section 3). *)
 
 
 (* --------------------------------------------------------------------------
    2. VALUE REPRESENTATION
    -------------------------------------------------------------------------- *)
 
-<value>    ::= INT | FLOAT | BOOL | STRING | ARRAY_REF | STREAM | NULL | OBJECT
+<value>    ::= INT | FLOAT | BOOL | ARRAY_REF | STREAM | NULL | OBJECT
 
-(* INT and FLOAT are i64 / f64. STRING values are borrowed slices into a
-   Chunk's constant pool (which in turn borrows from the original source
-   text) — never separately allocated, copied, or freed at run time.
-   Because GRAMMAR.bnf defines no string-concatenation operator and no
-   growable/heap-allocated collections, every string a running program can
-   ever produce already exists as a literal fixed at compile time. That
-   means the VM needs no heap and no garbage collector: every `Value` is
-   either a plain scalar, a slice it never owns, or (ARRAY_REF) a
-   reference to storage that lives elsewhere on this same value stack —
-   see the addendum below and section 6's generic-array addendum. *)
+(* INT and FLOAT are i64/f64.
 
-(* ARRAY_REF (GRAMMAR.bnf design note 3j) is `{ base: u32, len: u32 }` —
-   `base` an ABSOLUTE index into the VM's `stack` array (not frame-relative:
-   it's computed once, at MAKE_ARRAY_REF time, from whichever frame's `bp`
-   the referenced array actually lives in — section 6), `len` its length.
-   It is the runtime representation of a GENERIC (unsized, `int[]`-style)
-   array parameter or return value ONLY; a fixed-size array (design note
-   3e) never produces one — see the addendum right below this one for why
-   those two remain deliberately different runtime representations. There
-   is no way to construct an ARRAY_REF from Butter source directly (no
-   syntax makes one appear as a literal); the only way one comes into
-   being is MAKE_ARRAY_REF, always compiler-generated where a fixed-size
-   local has to be handed over by reference — at a call site passing it
-   into a generic parameter (`compiler.zig`'s
-   `compileGenericArrayArgument`), or as the buffer of a READ/WRITE_BYTES
-   (section 9). Both routes go through the same `compiler.zig` helper,
-   `emitArrayRef`, which is exactly why the I/O instructions need no
-   fixed-vs-generic variants of their own. *)
+   ARRAY_REF (GRAMMAR.bnf, arrays) is `{ base: u32, len: u32 }` — `base` an
+   ABSOLUTE index into the VM's `stack` array (computed once, at
+   MAKE_ARRAY_REF time, from whichever frame's `bp` the referenced array
+   lives in — section 6), `len` its length. It is the runtime representation
+   of a GENERIC (unsized, `int[]`-style) array parameter or return value
+   ONLY — a fixed-size array never produces one. There is no Butter syntax
+   that constructs an ARRAY_REF directly; the only source is MAKE_ARRAY_REF,
+   compiler-generated wherever a fixed-size local is handed over by
+   reference (a call argument matching a generic parameter, or an I/O
+   buffer — section 9).
 
-(* STREAM (GRAMMAR.bnf design notes 3k and 3l) is `value.Stream`, a tagged
-   union: `{ .standard: Standard }` naming one of the three fixed keywords
-   stdin/stdout/stderr, or `{ .file: u32 }` naming a slot in the VM's own
-   open-file table (section 10) — never a raw OS file handle or
-   descriptor. There is no way to construct a `.file` stream from Butter
-   source except through OPEN (section 10); a literal `stdin`/`stdout`/
-   `stderr` keyword use instead compiles to a PUSH_CONST of a `.standard`
-   stream constant, exactly like any other literal. A stream is a small,
-   trivially-copyable value with no ownership semantics of its own — it
-   never needs to be freed, and copying one (assigning it to a variable,
-   passing it as an argument) copies only which stream it names, never any
-   underlying resource — which is what keeps the VM's "no heap, no
-   allocator at run time" property intact even though `open`'s result is
-   now a genuine runtime value. *)
+   STREAM (GRAMMAR.bnf, files) is `value.Stream`: `{ .standard: Standard }`
+   naming stdin/stdout/stderr, or `{ .file: u32 }` naming a slot in the VM's
+   own open-file table (section 10) — never a raw OS handle. A literal
+   `stdin`/`stdout`/`stderr` keyword use compiles to a PUSH_CONST of a
+   `.standard` stream constant; a `.file` stream is only ever produced by
+   OPEN. A stream is trivially copyable and owns no resource itself —
+   copying one copies only which stream it names.
 
-(* NULL (GRAMMAR.bnf design note 3n) is JSON's `null` — `value.Value`'s
-   `null_value` variant, carrying no payload. There is exactly one null
-   value; copying or discarding it is as free as any other scalar.
+   NULL is JSON's `null` — `value.Value`'s `null_value` variant, carrying no
+   payload; there is exactly one null value.
 
-   OBJECT (GRAMMAR.bnf design note 3m) is `*value.Object`, a refcounted
-   heap allocation — the VM's first and only heap-managed value, and the
-   one genuine exception to every "no heap, no allocator at run time" claim
-   elsewhere in this document. See section 11 for its representation and
-   the refcounting rules that manage its lifetime. *)
+   OBJECT is `*value.Object`, a refcounted heap allocation — the VM's only
+   heap-managed value kind. It holds a STRING, a list, or a map (section 11).
+   Every string value is one of these: a compile-time literal, a map-literal
+   key, a `MAP_KEYS` result, and a JSON-parsed string are all built the same
+   way, via `Value.newString(allocator, bytes)` — there is no separate
+   borrowed/unowned string representation. A Chunk's constant pool
+   (`Chunk.constants`) holds one permanent owning reference to each
+   OBJECT-backed constant, released on `Chunk.deinit`; PUSH_CONST increfs
+   before pushing a copy onto the stack (section 11).
 
-(* A compiled program is one main Chunk (the top-level code, run as an
-   implicit frame 0 — see section 6) plus one Chunk per declared function,
-   each with its OWN constant pool. Nothing is shared between them:
-   per GRAMMAR.bnf design note 3b, a function body can only ever reference
-   its own parameters/locals, never a top-level variable or another
-   function's locals, so there is no reason for their constant pools or
-   local-slot numbering to overlap or coordinate. *)
+   A compiled program is one main Chunk (top-level code, run as an implicit
+   frame 0 — section 6) plus one Chunk per declared function, each with its
+   own constant pool; nothing is shared between them, since a function body
+   can only ever reference its own parameters/locals (section 5).
 
-(* Arrays (GRAMMAR.bnf design note 3e) are NOT a `<value>` variant — there
-   is no runtime "array value" that gets pushed, popped, or passed around
-   as a single unit. An array is simply `<declared size>` consecutive
-   stack slots (section 5), and every individual slot still holds one
-   plain scalar `<value>` exactly as before. This is what lets arrays fit
-   into a VM with no heap and no garbage collector: the array itself isn't
-   a new kind of runtime object, just a compile-time-known grouping of the
-   same slots locals always lived in. *)
-
-(* `len(arr)` (GRAMMAR.bnf design note 3i) on a FIXED-size local compiles
-   straight to PUSH_CONST of the array's declared size — the compiler
-   already has that number in hand (it's `Local.array`'s `.fixed` payload
-   — section 5), so `len` needs no dedicated opcode there and does nothing
-   at runtime beyond what any other INT literal does; the constant folding
-   happens entirely at compile time. On a GENERIC local (design note 3j),
-   there IS no compile-time number to fold to — the actual length depends
-   on whatever array the caller passed — so `len(arr)` instead compiles to
-   LOAD_REF_LEN, a genuine runtime read of the reference's own `len` field
-   (section 3). *)
+   Arrays are NOT a `<value>` variant: a fixed-size array is simply
+   `<declared size>` consecutive stack slots (section 5), each holding one
+   plain scalar `<value>`. `len(arr)` on such a local compiles straight to
+   PUSH_CONST of its declared size (a compile-time fold, `Local.array`'s
+   `.fixed` payload — section 5); on a GENERIC local it compiles to
+   LOAD_REF_LEN, a runtime read of the reference's own `len` field, since
+   there's no compile-time number to fold to. *)
 
 
 (* --------------------------------------------------------------------------
@@ -163,107 +98,75 @@
 
 (* Stack effect notation: ( before -- after ), stack grows to the right. *)
 
-   PUSH_CONST   #idx     ( -- v )            push constants[idx]
+   PUSH_CONST   #idx     ( -- v )            increfs and pushes constants[idx]
    PUSH_TRUE              ( -- true )
    PUSH_FALSE             ( -- false )
-   POP                    ( v -- )            discard the top of stack
+   POP                    ( v -- )            decrefs and discards v
 
-   LOAD_LOCAL   #slot     ( -- v )            push stack[slot]
-   STORE_LOCAL  #slot     ( v -- v )          stack[slot] = v (peeks, does
-                                               not consume — this is what
-                                               lets 'x := 5' be used as an
-                                               expression, per GRAMMAR.bnf's
-                                               <assignment> production)
+   LOAD_LOCAL   #slot     ( -- v )            increfs and pushes stack[slot]
+   STORE_LOCAL  #slot     ( v -- v )          stack[slot] = v (peeks, does not
+                                               consume — this is what lets
+                                               'x := 5' be used as an
+                                               expression); increfs v, then
+                                               decrefs the old slot value
 
    LOAD_INDEX   #packed(slot,length)  ( index -- v )
-                                               pops index (must be INT);
-                                               TypeMismatch otherwise.
+                                               pops index (must be INT;
+                                               TypeMismatch otherwise,
                                                IndexOutOfBounds unless
-                                               0 <= index < length. Else
-                                               pushes stack[slot + index]
-                                               (slot/length both unpacked
-                                               from the one operand — see
-                                               section 1a).
+                                               0 <= index < length); pushes
+                                               stack[slot + index], increffed
    STORE_INDEX  #packed(slot,length)  ( index v -- v )
-                                               pops v, then index (same
-                                               Type/BoundsError checks as
-                                               LOAD_INDEX), sets
-                                               stack[slot + index] = v,
-                                               then pushes v back — the
-                                               same peek-not-consume shape
-                                               as STORE_LOCAL, so
-                                               'arr[i] := v' is usable as
-                                               an expression too. The
-                                               index must be compiled
-                                               (and therefore pushed)
-                                               BEFORE the value, which is
-                                               why the stack effect reads
-                                               index-then-v rather than
-                                               v-then-index.
+                                               same checks as LOAD_INDEX;
+                                               sets stack[slot + index] = v
+                                               (increfs v, decrefs the old
+                                               value), pushes v back
 
    MAKE_ARRAY_REF #packed(slot,length)  ( -- ref )
-                                               pushes a fresh
-                                               ARRAY_REF{ base = bp + slot,
-                                               len = length } (slot/length
-                                               both compile-time constants,
-                                               unpacked the same way
-                                               LOAD_INDEX/STORE_INDEX's
-                                               operand is). Synthesizes a
-                                               reference to a FIXED-size
-                                               local at `slot` — GRAMMAR.bnf
-                                               design note 3j — only ever
-                                               emitted when passing such a
-                                               local into a generic (`[]`)
-                                               parameter.
-   LOAD_INDEX_REF #slot   ( index -- v )      pops index (must be INT);
-                                               reads ref = stack[bp+slot]
-                                               (must be ARRAY_REF —
-                                               TypeMismatch otherwise);
-                                               IndexOutOfBounds unless
-                                               0 <= index < ref.len; else
-                                               pushes stack[ref.base+index].
-                                               The generic-array counterpart
-                                               to LOAD_INDEX: `slot` names
-                                               where the REFERENCE lives,
-                                               not the array itself — its
-                                               base/length come from the
-                                               reference at runtime instead
-                                               of the operand.
+                                               pushes ARRAY_REF{ base = bp +
+                                               slot, len = length }. Only
+                                               ever emitted when passing a
+                                               fixed-size local into a
+                                               generic (`[]`) parameter or
+                                               I/O buffer position.
+   LOAD_INDEX_REF #slot   ( index -- v )      pops index (must be INT); reads
+                                               ref = stack[bp+slot] (must be
+                                               ARRAY_REF); IndexOutOfBounds
+                                               unless 0 <= index < ref.len;
+                                               pushes stack[ref.base+index],
+                                               increffed. The generic-array
+                                               counterpart to LOAD_INDEX:
+                                               `slot` names where the
+                                               REFERENCE lives, not the array.
    STORE_INDEX_REF #slot  ( index v -- v )    generic-array counterpart to
-                                               STORE_INDEX, same reference
-                                               indirection and peek-not-
-                                               consume shape as
-                                               LOAD_INDEX_REF/STORE_INDEX.
+                                               STORE_INDEX.
    LOAD_REF_LEN  #slot    ( -- int )          reads ref = stack[bp+slot]
                                                (must be ARRAY_REF); pushes
-                                               ref.len as an INT. What
-                                               `len(arr)` compiles to for a
-                                               GENERIC array, since (unlike
-                                               a fixed-size one) its length
-                                               isn't a compile-time constant
-                                               to fold to.
+                                               ref.len as an INT.
 
    ADD, SUB, MUL, DIV, MOD, POW
-                          ( a b -- r )        both operands must be numeric
-                                               (INT or FLOAT); INT op INT
-                                               stays INT (overflow-checked);
-                                               any FLOAT operand promotes
-                                               both to FLOAT. DIV/MOD by
-                                               zero and INT overflow are
+                          ( a b -- r )        both operands numeric (INT or
+                                               FLOAT); INT op INT stays INT
+                                               (overflow-checked); any FLOAT
+                                               operand promotes both. DIV/MOD
+                                               by zero and INT overflow are
                                                runtime errors, not traps.
+                                               Decref both operands on a
+                                               TypeMismatch path.
 
    NEG                    ( a -- r )          numeric only
    NOT                    ( a -- r )          BOOL only
 
-   EQ, NEQ                ( a b -- bool )     defined for every pair of
-                                               value types: numeric operands
-                                               compare across INT/FLOAT by
-                                               value; any other mismatched
-                                               pair of types simply compares
-                                               unequal (this mirrors '=='
-                                               in most dynamically-checked
-                                               languages, rather than being
-                                               a type error)
+   EQ, NEQ                ( a b -- bool )     defined for every pair of value
+                                               types: numeric operands compare
+                                               across INT/FLOAT by value;
+                                               string-shaped values compare
+                                               by content; a list/map compares
+                                               by POINTER IDENTITY, never
+                                               deep; any other mismatched pair
+                                               of types simply compares
+                                               unequal. Decrefs both operands
+                                               after comparing.
    LT, LTE, GT, GTE        ( a b -- bool )    numeric operands only
 
    JUMP         #target               ip := target
@@ -271,203 +174,150 @@
                                                condition; if false, ip :=
                                                target. Every use site is
                                                responsible for POPping the
-                                               condition itself on both the
-                                               taken and fall-through paths
-                                               (section 4) — this is the one
-                                               instruction in the ISA with a
-                                               "conditional" stack effect,
-                                               and confining that to a single
-                                               well-tested opcode is the
-                                               payoff for keeping everything
-                                               else unconditional.
-                                               TypeMismatch if the peeked
-                                               value is not BOOL — this is
-                                               the sole place 'if'/'while'
-                                               conditions and 'and'/'or'
-                                               operands are checked to
-                                               actually be booleans.
+                                               condition itself on both paths
+                                               (section 4). TypeMismatch if
+                                               the peeked value isn't BOOL.
 
    CALL         #func_index  ( arg1 ... argN -- result )
                                                the N arguments (N = the
-                                               callee's arity) are already
-                                               on the stack, pushed by
-                                               ordinary expression codegen
-                                               before CALL executes; CALL
-                                               itself pushes nothing. It
-                                               suspends the current chunk
-                                               (saving its ip and base
-                                               pointer as a new frame — see
+                                               callee's arity) are already on
+                                               the stack; CALL pushes nothing
+                                               itself. Suspends the current
+                                               chunk (saving ip and base
+                                               pointer as a new frame —
                                                section 6) and jumps to
-                                               functions[func_index]'s own
-                                               chunk at instruction 0, with
-                                               the base pointer set so the
-                                               callee's LOAD_LOCAL/
-                                               STORE_LOCAL slot 0 is exactly
-                                               where arg1 already sits.
-                                               CallStackOverflow if the
-                                               frame stack is already at
-                                               capacity.
+                                               functions[func_index]'s chunk
+                                               at instruction 0, with the
+                                               base pointer set so slot 0 is
+                                               exactly where arg1 already
+                                               sits. CallStackOverflow if the
+                                               frame stack is already full.
    RET                     ( v -- v )          pops the current frame
-                                               (discarding every argument
-                                               and local it owns — see
-                                               section 6), then leaves v,
-                                               the value the returning
-                                               function computed, as the
-                                               sole result on the caller's
-                                               stack. Every function chunk
-                                               is guaranteed by the
-                                               compiler to end in a RET
-                                               (see GRAMMAR.bnf design note
-                                               3c) — this is the only way a
-                                               function chunk's execution
-                                               ever ends.
+                                               (decreffing every argument and
+                                               local it owned — section 6),
+                                               leaves v as the sole result on
+                                               the caller's stack. Every
+                                               function chunk is guaranteed by
+                                               the compiler to end in a RET.
 
-   PRINT                  ( v -- )            pop v, write it followed by
-                                               a newline, always to the
-                                               `out` stream (section 9)
+   PRINT                  ( v -- )            pops v, decrefs it, writes it
+                                               followed by a newline, always
+                                               to the `out` stream (section 9)
 
    READ         #stream   ( ref -- count )    pops an ARRAY_REF naming the
                                                destination buffer
-                                               (TypeMismatch if it isn't
-                                               one), reads at least 1 and
-                                               at most ref.len bytes from
-                                               `stream`, stores each as an
-                                               INT in 0..255 into
-                                               stack[ref.base + i], and
-                                               pushes how many were read.
-                                               Pushes 0, and only 0, at end
-                                               of input; slots past `count`
-                                               are left untouched. A SHORT
-                                               read, like POSIX read(2) —
-                                               see section 9 for why.
-                                               StreamReadFailed if the
-                                               underlying stream errors.
-   WRITE        #stream   ( v -- count )      pops v, writes it to `stream`
-                                               in exactly PRINT's rendering
-                                               but with NO trailing
-                                               newline, and pushes the
-                                               number of bytes that took.
-                                               StreamWriteFailed if the
+                                               (TypeMismatch if it isn't one),
+                                               reads at least 1 and at most
+                                               ref.len bytes from `stream`,
+                                               stores each as an INT in
+                                               0..255 into stack[ref.base+i],
+                                               pushes how many were read (0,
+                                               and only 0, at end of input).
+                                               A SHORT read, like POSIX
+                                               read(2). StreamReadFailed if
+                                               the underlying stream errors.
+   WRITE        #stream   ( v -- count )      pops v, decrefs it, writes it
+                                               to `stream` in exactly PRINT's
+                                               rendering but with no trailing
+                                               newline, pushes the byte
+                                               count. StreamWriteFailed if the
                                                underlying stream errors.
    WRITE_BYTES  #stream   ( ref count -- written )
-                                               pops count (must be INT),
-                                               then an ARRAY_REF; the exact
-                                               inverse of READ. Bounds- and
-                                               range-checked:
-                                               IndexOutOfBounds unless
-                                               0 <= count <= ref.len, and
+                                               pops count (must be INT), then
+                                               an ARRAY_REF; the inverse of
+                                               READ. IndexOutOfBounds unless
+                                               0 <= count <= ref.len,
                                                ByteOutOfRange if any of the
                                                first `count` elements isn't
-                                               an INT in 0..255 (TypeMismatch
-                                               if one isn't an INT at all).
-                                               Writes those bytes to
-                                               `stream` and pushes how many
-                                               were written. The count is
-                                               pushed AFTER the reference,
-                                               which is why the stack effect
-                                               reads ref-then-count.
+                                               an INT in 0..255. Writes those
+                                               bytes to `stream`, pushes how
+                                               many were written.
 
    MAKE_LIST    #n        ( v1..vn -- list )  moves the top n values into a
                                                fresh list Object (a pure
-                                               move — neither the moved
-                                               values nor the fresh list
-                                               need an incref). #0 is what a
-                                               bare `list xs` (no
-                                               initializer), or a
-                                               `list`-returning function
+                                               move — no incref/decref
+                                               needed). #0 is what a bare
+                                               `list xs` (no initializer), or
+                                               a `list`-returning function
                                                falling off the end, compiles
-                                               to. See section 11.
+                                               to.
    MAKE_MAP     #n        ( k1 v1 .. kn vn -- map )
-                                               builds a fresh map Object
-                                               from n key/value pairs, in
-                                               order (a repeated key is
-                                               last-wins). TypeMismatch if a
-                                               key isn't string-shaped
-                                               (defense in depth — the
-                                               compiler only ever emits a
-                                               string-literal key here).
-                                               See section 11.
+                                               builds a fresh map Object from
+                                               n key/value pairs in order (a
+                                               repeated key is last-wins).
+                                               TypeMismatch if a key isn't
+                                               string-shaped.
    INDEX_GET               ( container index -- v )
                                                pops index, then container;
-                                               dispatches on container's
-                                               kind (list: index must be
-                                               INT, bounds-checked; map:
-                                               index must be string-shaped,
-                                               KeyNotFound if absent; else
-                                               TypeMismatch). Pushes the
-                                               found value, increffed. What
-                                               bracket-indexing compiles to
-                                               whenever the indexed thing
-                                               isn't a bare local resolving
-                                               to a fixed/generic array
-                                               (section 11).
+                                               dispatches on container's kind
+                                               (list: index must be INT,
+                                               bounds-checked; map: index must
+                                               be string-shaped, KeyNotFound
+                                               if absent; else TypeMismatch).
+                                               Pushes the found value,
+                                               increffed. What bracket-
+                                               indexing compiles to whenever
+                                               the indexed thing isn't a bare
+                                               local resolving to a fixed/
+                                               generic array.
    INDEX_SET               ( container index v -- v )
                                                same dispatch as INDEX_GET,
                                                mutating instead: a map
-                                               insert-or-updates (never
-                                               errors on a missing key); a
-                                               list requires an in-bounds
-                                               index. Decrefs whatever
-                                               value it replaces. Peek-
-                                               shaped like STORE_INDEX: v is
-                                               still on the stack afterward.
+                                               insert-or-updates; a list
+                                               requires an in-bounds index.
+                                               Increfs v, decrefs whatever
+                                               value it replaces, pushes v
+                                               back (peek-shaped, like
+                                               STORE_INDEX).
    LIST_PUSH               ( list v -- newlen )
                                                appends v to list (a pure
                                                move) and pushes its new
                                                length. TypeMismatch if the
                                                first operand isn't a list.
    MAP_HAS                 ( map key -- bool ) whether key is present, with
-                                               no error for a missing one
-                                               (unlike INDEX_GET).
+                                               no error for a missing one.
    MAP_DELETE               ( map key -- bool )
                                                removes key if present
                                                (freeing its owned key copy,
-                                               decreffing its value);
-                                               pushes whether it existed.
+                                               decreffing its value); pushes
+                                               whether it existed.
    MAP_KEYS                ( map -- list )     a fresh list of fresh
-                                               heap-string COPIES of map's
-                                               own keys (never borrowed from
-                                               the map's own storage), in
+                                               string-value COPIES of map's
+                                               own keys (never aliasing the
+                                               map's own storage), in
                                                insertion order.
    LEN_VALUE                ( v -- int )       what the relaxed
                                                `len(<expression>)` compiles
-                                               to whenever the argument
-                                               isn't a bare fixed/generic-
-                                               array identifier: list ->
-                                               element count, map -> entry
-                                               count, else TypeMismatch.
+                                               to whenever the argument isn't
+                                               a bare fixed/generic-array
+                                               identifier: list -> element
+                                               count, map -> entry count,
+                                               else TypeMismatch.
    JSON_PARSE               ( ref count -- v )  gathers `count` bytes from
                                                the buffer ref points at
                                                (reusing WRITE_BYTES's own
-                                               `gatherBytes`/`io_buffer`
-                                               staging area unchanged) and
-                                               parses them as JSON, pushing
-                                               whatever the document's root
-                                               turns out to be.
-                                               JsonParseFailed (with a
+                                               staging area) and parses them
+                                               as JSON, pushing whatever the
+                                               document's root turns out to
+                                               be. JsonParseFailed (with a
                                                `Vm.diagnostic`) if the bytes
-                                               aren't well-formed JSON. See
-                                               section 12.
+                                               aren't well-formed JSON.
    JSON_STRINGIFY           ( v -- string )    renders v as JSON text and
-                                               pushes it as a fresh heap
-                                               `string`. TypeMismatch if v
-                                               is (or contains, nested
-                                               inside a list/map) a stream
-                                               or an array reference —
-                                               neither has a JSON
-                                               representation. See
-                                               section 13.
+                                               pushes it as a fresh string
+                                               value. TypeMismatch if v is
+                                               (or contains, nested inside a
+                                               list/map) a stream or an array
+                                               reference — neither has a
+                                               JSON representation.
 
    HALT                                       stop execution (only ever
-                                               appears in the main chunk,
-                                               at the very end — see
-                                               section 6)
+                                               appears in the main chunk, at
+                                               the very end)
 
 
 (* --------------------------------------------------------------------------
-   4. CODEGEN PATTERNS (how the compiler lowers control flow and short
-      circuiting onto the instructions above — the standard "backpatched
-      jump" technique)
+   4. CODEGEN PATTERNS (backpatched-jump lowering of control flow and
+      short-circuiting)
    -------------------------------------------------------------------------- *)
 
    if-stmt (condition, then, optional else):
@@ -478,10 +328,7 @@
        <then-branch>
        JUMP  end_target
      else_target:
-       POP                          (* discard a falsy condition — this pop
-                                        happens whether or not there is an
-                                        else-branch, which is what keeps the
-                                        stack balanced either way *)
+       POP                          (* discard a falsy condition either way *)
        [ <else-branch> ]
      end_target:
 
@@ -496,23 +343,20 @@
      exit_target:
        POP
 
-   'and' (short-circuits to a false left operand without evaluating right):
+   'and' (short-circuits a false left operand without evaluating right):
 
        <left>
-       JUMP_IF_FALSE  end_target    (* left false -> skip right, its false
-                                        value is the result *)
+       JUMP_IF_FALSE  end_target
        POP                          (* left true -> discard it *)
        <right>
      end_target:
 
-   'or' (short-circuits to a true left operand without evaluating right;
-   built from JUMP + JUMP_IF_FALSE rather than a dedicated JUMP_IF_TRUE,
-   per the minimality goal in section 1c):
+   'or' (short-circuits a true left operand; built from JUMP + JUMP_IF_FALSE
+   rather than a dedicated JUMP_IF_TRUE, per section 1c):
 
        <left>
        JUMP_IF_FALSE  else_target
-       JUMP  end_target             (* left true -> skip right, its true
-                                        value is the result *)
+       JUMP  end_target             (* left true -> skip right *)
      else_target:
        POP                          (* left false -> discard it *)
        <right>
@@ -523,219 +367,119 @@
    5. VARIABLE RESOLUTION (compile time, no runtime name lookup)
    -------------------------------------------------------------------------- *)
 
-   The compiler keeps a list of (name, scope_depth, slot, width) entries
-   in declaration order, separately per chunk being compiled (the main
-   chunk, and then each function's chunk in turn — see section 6). `slot`
-   is tracked explicitly (a running `next_slot` counter) rather than
-   implied by position in that list, because `width` isn't always 1: a
-   plain scalar local occupies exactly one slot, but an array local
-   (GRAMMAR.bnf design note 3e) occupies `<declared size>` consecutive
-   slots starting at `slot`, so slot numbers and list position diverge as
-   soon as any array is in scope. Entering a <block> increases
-   scope_depth; leaving it removes every local declared at that depth
-   from the compiler's list, decrements `next_slot` by each removed
-   local's width (so a later sibling scope reuses the same slots instead
-   of growing the frame unboundedly), and emits one POP per slot removed
-   (an array-local's whole width, not just one POP) so the runtime stack
-   shrinks back in step with the compile-time model. A reference to an
-   undeclared name, or an assignment to one, is a compile error
-   (`CompileError.UndefinedVariable`) — one of the few forms of semantic
-   checking this compiler does perform, since it is required just to
-   assign slots at all, not an optional extra. Shadowing an outer variable
-   in an inner block is allowed (lookup walks the locals list from the
-   end, so the innermost matching declaration wins); redeclaring the same
-   name twice *within one scope* is not rejected — it simply shadows the
-   earlier slot from that point on. This mirrors the Lox-family "locals
-   resolved to stack slots" design (as in Crafting Interpreters' clox).
+   The compiler keeps a list of (name, scope_depth, slot, width) entries in
+   declaration order, separately per chunk being compiled (the main chunk,
+   then each function's chunk). `slot` is tracked via a running `next_slot`
+   counter rather than implied by list position, since `width` isn't always
+   1: a scalar local occupies one slot, a fixed-size array local occupies
+   `<declared size>` consecutive slots. Entering a <block> increases
+   scope_depth; leaving it removes every local declared at that depth,
+   decrements `next_slot` by each removed local's width, and emits one POP
+   per slot removed. A reference to (or assignment to) an undeclared name is
+   `CompileError.UndefinedVariable`. Shadowing an outer variable in an inner
+   block is allowed (lookup walks the list from the end, innermost wins);
+   redeclaring a name within one scope simply shadows the earlier slot.
 
    An array-typed local's bare name resolves for LOAD_LOCAL/STORE_LOCAL
-   purposes exactly like a scalar's (same lookup, same list) but using it
-   that way is a compile error (`CompileError.ArrayUsedAsScalar`) — a
-   FIXED-size array is only ever accessed through LOAD_INDEX/STORE_INDEX
-   (section 3), which pack that same `slot` together with `width` (there
-   called `length`, for the bounds check) into one instruction operand.
+   exactly like a scalar's, but using it that way is
+   `CompileError.ArrayUsedAsScalar` — a fixed-size array is only ever
+   accessed through LOAD_INDEX/STORE_INDEX. `Local.array` distinguishes
+   `.fixed(n)` (width `n`, LOAD_INDEX/STORE_INDEX) from `.generic` (width 1
+   — a single ARRAY_REF value — LOAD_INDEX_REF/STORE_INDEX_REF/
+   LOAD_REF_LEN). `Local.collection` is a separate, independent optional
+   field (null / `.map` / `.list`, checked before `Local.array`) for a
+   map/list local, which is always exactly one heap-reference slot,
+   addressed via INDEX_GET/INDEX_SET rather than any array opcode.
 
-   `Local.array` (compiler.zig) distinguishes which of two array kinds a
-   local is, or `null` for a plain scalar: `.fixed(n)` (width `n`,
-   accessed via LOAD_INDEX/STORE_INDEX as above — GRAMMAR.bnf design note
-   3e) or `.generic` (width exactly 1 — it's a single ARRAY_REF value, not
-   raw slots — accessed via LOAD_INDEX_REF/STORE_INDEX_REF/LOAD_REF_LEN
-   instead, design note 3j). The bare-name-as-scalar restriction above
-   applies to BOTH kinds identically; a generic local's reference value
-   still can't be loaded/stored as a plain expression outside the narrow
-   contexts section 6's generic-array addendum describes (forwarding it as
-   a call argument or a return).
-
-   A function's parameters are simply its first locals, occupying slots
-   0..arity-1, added to that function's locals list before its body is
-   compiled at all — from the compiler's perspective a parameter is just a
-   local that already has a value by the time the body starts, the same
-   way a var-declaration's initializer already has a value on the stack
-   before the declaration finishes (section 2). A scalar parameter costs
-   one slot; a `.fixed(n)` array-typed parameter costs `n` consecutive
-   slots, exactly like a fixed-size array-typed local anywhere else (see
-   the array-typed-local paragraph just above); a `.generic` array-typed
-   parameter costs exactly one slot too (it's a single ARRAY_REF value,
-   design note 3j) — which is precisely why `arity` (the total slot width
-   CALL reserves, section 6) and the parameter *count* (what the
-   arity-mismatch check in GRAMMAR.bnf design note 3d actually compares)
-   are two different numbers once any parameter is fixed-size-array-typed. Locals lists are entirely separate per chunk: a
-   function's locals list starts fresh (containing only its own
-   parameters) and is discarded once that function's chunk is done
-   compiling, which is what makes it structurally impossible for a
-   function body to resolve a top-level variable's name — the compiler
-   never even has that name in scope while compiling the function (per
-   GRAMMAR.bnf design note 3b).
+   A function's parameters are its first locals, occupying slots
+   0..arity-1: a scalar parameter costs one slot, a `.fixed(n)` array
+   parameter costs `n`, a `.generic` array parameter costs exactly one (it's
+   a single ARRAY_REF value). Each function's locals list is entirely
+   separate and discarded once its chunk finishes compiling, which is what
+   makes it structurally impossible for a function body to resolve a
+   top-level or another function's variable.
 
 
 (* --------------------------------------------------------------------------
    6. FUNCTION CALLS & RECURSION
    -------------------------------------------------------------------------- *)
 
-   Each declared function compiles to its own `chunk_mod.Function` — a
-   name, an arity, a return_width, and a self-contained Chunk (own
-   instructions, own constant pool). A compiled `Program` is one main
-   Chunk (top-level code) plus a slice of these, indexed by the operand
-   CALL instructions use to name their target (resolved by name to that
-   index at compile time — see compiler.zig's function table, built before
-   any function body is compiled so that calls resolve regardless of
-   declaration order, including a function calling itself or two functions
-   calling each other).
+   Each declared function compiles to its own `chunk_mod.Function` — name,
+   arity, return_width, and a self-contained Chunk. A compiled `Program` is
+   one main Chunk plus a slice of these, indexed by the operand CALL
+   instructions use (resolved by name to index at compile time, before any
+   function body is compiled, so calls resolve regardless of declaration
+   order).
 
    ARITY AND RETURN_WIDTH ARE STACK-SLOT COUNTS, NOT VALUE COUNTS. `arity`
-   is the total number of stack slots every argument together occupies —
-   a scalar argument is 1 slot, an array argument is `<declared size>`
-   slots (GRAMMAR.bnf design note 3e) — and `return_width` is likewise how
-   many slots the return value occupies (1 for a scalar return, the
-   declared size for an array return). Neither is the same as counting
-   *values*: a call with one array-typed and one scalar parameter has an
-   arity of `<array size> + 1`, not 2.
+   is the total slots every argument occupies (a scalar is 1, a fixed-size
+   array argument is its declared size); `return_width` is likewise how many
+   slots the return value occupies. A call with one array-typed and one
+   scalar parameter has an arity of `<array size> + 1`, not 2 — though the
+   arity-MISMATCH check (GRAMMAR.bnf, functions) still counts declared
+   PARAMETERS one-for-one with arguments, a different number from `arity`
+   whenever any parameter is array-typed.
 
-   CALLING CONVENTION. A call expression's arguments compile left to
-   right onto the stack, in whatever shape each one needs: a scalar
-   argument is one ordinary expression (one value pushed), while an
-   array-typed argument (matched against the parameter it fills) is a
-   sequence of `<declared size>` LOAD_LOCALs copying that argument array's
-   slots on top of the stack, one by one, in order (GRAMMAR.bnf design
-   note 3e) — passing is always by VALUE, a fresh copy, never a reference
-   to the caller's own slots. Either way, by the time CALL executes, the
-   callee's entire argument list — `arity` slots' worth, whatever mix of
-   scalars and array copies produced them — is simply sitting on top of
-   the stack in order. CALL then:
+   CALLING CONVENTION. Arguments compile left to right onto the stack: a
+   scalar argument is one ordinary expression; an array-typed argument is a
+   sequence of LOAD_LOCALs copying that array's slots on top of the stack,
+   always a fresh copy, never a reference to the caller's own slots. By the
+   time CALL executes, the callee's entire `arity`-slot argument list is
+   sitting on top of the stack in order. CALL then:
 
-     1. Checks the frame stack isn't already at capacity
-        (CallStackOverflow if it is — this is what turns unbounded
-        recursion into a catchable runtime error instead of a native
-        stack overflow/crash).
-     2. Pushes a frame recording the CALLER's chunk, ip (already advanced
-        past the CALL instruction, so execution resumes right after it),
-        base pointer, and return_width — everything needed to resume the
-        caller once the callee returns, including how many slots the
-        CALLER's own eventual RET will need to copy (so a nested call's
-        RET can't clobber that number for the outer call still waiting on
-        the stack, e.g. `sum(doubleAll(nums))`).
-     3. Sets the new base pointer to `sp - arity`: since the callee's
-        arguments already occupy the top `arity` slots of the stack, this
-        makes them exactly the callee's LOAD_LOCAL/STORE_LOCAL slots
-        0..arity-1 without copying them anywhere else — an array-typed
-        parameter's slots are simply a contiguous sub-range of that same
-        span, addressed via LOAD_INDEX/STORE_INDEX like any other
-        array-typed local (section 5).
+     1. Checks the frame stack isn't already full (CallStackOverflow
+        otherwise).
+     2. Pushes a frame recording the caller's chunk, ip (already past the
+        CALL instruction), base pointer, and return_width.
+     3. Sets the new base pointer to `sp - arity`, so the already-pushed
+        arguments become exactly the callee's slots 0..arity-1 with no
+        copying.
      4. Switches to the callee's chunk, jumps to instruction 0, and sets
-        the active return_width to the callee's own (used by the RET that
-        eventually returns from THIS call, not the caller's).
+        the active return_width to the callee's own.
 
-   RET generalizes "pop the result, restore the frame, push the result
-   back" from exactly one value to `return_width` of them: a `return`
-   statement's expression already leaves exactly `return_width` values
-   sitting on top of the callee's stack region by the time RET executes
-   (one PUSH_CONST/expression for a scalar return, `<declared size>`
-   LOAD_LOCALs for an array return, mirroring how array arguments are
-   copied at the call site). RET then copies those top `return_width`
-   slots down onto the frame's own base pointer IN PLACE (slot-by-slot,
-   `stack[bp+i] = stack[bp_relative_top+i]`) rather than through a pop/push
-   pair, sets the stack pointer to `bp + return_width` (discarding every
-   argument, parameter-slot, and local the callee ever pushed in one step —
-   whether or not the compiler's own block-scope POP bookkeeping ran,
-   since a `return` can fire from arbitrarily deep inside nested
-   if/while/block bodies and always unwinds the whole frame directly),
-   pops the current frame, and restores the chunk/ip/base pointer/
-   return_width from it. For a scalar return (`return_width = 1`) this is
-   exactly the old pop-then-push behavior, just written as a single-slot
-   copy instead.
+   RET generalizes "pop the result, restore the frame, push it back" to
+   `return_width` values at once: it decrefs every value in
+   `stack[bp .. sp-return_width)` (the departing frame's own locals,
+   arguments, temporaries), copies the top `return_width` slots down onto
+   the frame's own base pointer in place, sets sp to `bp + return_width`,
+   pops the frame, and restores the caller's chunk/ip/base pointer/
+   return_width.
 
-   RECURSION FALLS OUT FOR FREE. Nothing about CALL or RET is aware of
-   whether the callee is the same function as the caller. Each call gets
-   its own frame and its own base pointer into a fresh region of the
-   *same* stack array, so a function calling itself (or two functions
-   calling each other) just works: fib(n-1) and fib(n-2) each get their
-   own base pointer, so their respective slot-0 values (their own `n`)
-   never collide, no matter how deep the recursion goes — until either the
-   frame stack (CallStackOverflow) or the value stack itself
-   (StackOverflow) runs out of room.
+   RECURSION FALLS OUT FOR FREE: each call gets its own frame and base
+   pointer into a fresh region of the same stack array, so a function
+   calling itself (or two functions calling each other) needs no special
+   handling — until either the frame stack (CallStackOverflow) or the value
+   stack (StackOverflow) runs out of room. TOP LEVEL IS FRAME 0: it never
+   gets a frame pushed for itself (nothing ever CALLs into it), which is why
+   `return` is restricted to inside a function body — there is no frame at
+   the top level for RET to pop.
 
-   TOP LEVEL IS FRAME 0. There's no special-casing anywhere for "not
-   inside a function": top-level code is simply the main chunk, executing
-   with base pointer 0 for the program's entire lifetime, and it never
-   needs a frame pushed for itself because nothing ever CALLs into it —
-   it's where `run` starts. This is also why `return` is restricted to
-   inside a function body (GRAMMAR.bnf design note 3c) rather than a
-   supported way to end the program early: RET always pops a frame that a
-   CALL pushed, and no CALL ever runs before the main chunk starts, so
-   there is no frame to pop at the top level.
+   GENERIC ARRAY ARGUMENTS. A generic (`int[]`) parameter costs exactly 1
+   slot, holding one ARRAY_REF. Passing a FIXED-size local emits
+   MAKE_ARRAY_REF at the call site (`base = bp + <local's slot>`, using the
+   CALLER's still-in-scope bp); passing an already-generic local simply
+   forwards its existing reference via LOAD_LOCAL.
 
-   GENERIC ARRAYS (GRAMMAR.bnf design note 3j) DON'T CHANGE ANY OF THE
-   ABOVE — they just change what a "value" is at one particular slot. A
-   generic (`int[]`) parameter costs exactly 1 slot for arity purposes,
-   same as a scalar, because at runtime it holds exactly one `Value`: an
-   ARRAY_REF (section 2). Where that reference comes FROM depends on what
-   the caller passed:
-     - a FIXED-size local (an array or a fixed-size parameter): the
-       compiler emits MAKE_ARRAY_REF at the call site, computing
-       `base = bp + <that local's slot>` using the CALLER's own bp (still
-       in scope — this runs before CALL switches frames) and pushing the
-       resulting reference as this one argument slot.
-     - a GENERIC local (already holding a reference): LOAD_LOCAL simply
-       copies the existing `ArrayRef` value onward, unchanged — its `base`
-       still points wherever it always did, since a reference's target
-       never moves.
-   Either way, by the time CALL executes, that argument is just one more
-   ordinary slot among the callee's `arity` — CALL/RET (above) don't know
-   or care that a slot holds a reference rather than an INT.
-
-   WHY A REFERENCE IS SAFE AS AN ARGUMENT BUT NOT ALWAYS SAFE AS A RETURN.
-   An argument's reference is only ever *read* during the callee's own
-   call, which is always fully nested inside (and therefore shorter-lived
-   than) whichever frame the reference points into — so it can never go
-   stale before the callee is done with it. A RETURN is different: the
-   reference has to remain valid AFTER this function's own frame is
-   discarded. A reference synthesized by THIS call's own MAKE_ARRAY_REF
-   points into THIS frame, which RET is about to pop — returning one would
-   hand the caller a reference to slots that are about to be reused by
-   whatever gets called next. Only a reference this function received
-   as-is (a generic parameter, or a nested call's own generic return,
-   forwarded transitively) is safe to return, because by induction it was
-   always ultimately synthesized as some ANCESTOR frame's call argument —
-   and an ancestor frame, by definition, outlives every frame nested
-   inside it. The compiler enforces this statically
-   (`compiler.zig`'s `compileGenericArrayReturn`,
-   `CompileError.EscapingArrayReference`) rather than leaving it as a
-   runtime footgun — no ARRAY_REF a running program ever holds can be
-   dangling, by construction, the same "checked at compile time, not
-   trusted at runtime" spirit as bounds-checking (section 3's
-   LOAD_INDEX/LOAD_INDEX_REF).
+   WHY A REFERENCE IS SAFE AS AN ARGUMENT BUT NOT ALWAYS SAFE AS A RETURN. An
+   argument's reference is only ever read during the callee's own call,
+   always shorter-lived than the frame it points into. A `return` is
+   different: the reference must remain valid after this function's own
+   frame is discarded. One synthesized by THIS call's own MAKE_ARRAY_REF
+   points into THIS frame, about to be popped; only a reference already
+   received as a parameter (or forwarded from a nested call, transitively) —
+   which by induction always points into some still-live ANCESTOR frame — is
+   safe to return. The compiler enforces this statically
+   (`compileGenericArrayReturn`, `CompileError.EscapingArrayReference`)
+   rather than leaving it a runtime footgun.
 
 
 (* --------------------------------------------------------------------------
    7. THE FOR-LOOP (desugars to section 4's while-stmt pattern)
    -------------------------------------------------------------------------- *)
 
-   `for v in start..end body` (GRAMMAR.bnf design note 3g) introduces its
-   own wrapper scope holding two hidden locals the compiler generates —
-   the range's end bound (evaluated once) and the loop variable itself —
-   then emits *exactly* the while-stmt pattern from section 4, just with
-   the condition/increment hardcoded to those two locals instead of
-   arbitrary compiled expressions:
+   `for v in start..end body` introduces a wrapper scope holding two hidden
+   locals — the range's end bound (evaluated once) and the loop variable —
+   then emits exactly the while-stmt pattern from section 4:
 
        <end-expr>                    (* hidden local: end_slot *)
        <start-expr>                  (* hidden local: var_slot, = v *)
@@ -754,371 +498,192 @@
        JUMP  loop_start
      exit_target:
        POP
-       (* both hidden locals popped as the wrapper scope closes,
-          section 5 *)
+       (* both hidden locals popped as the wrapper scope closes, section 5 *)
 
-   No new opcodes are involved — the same way 'and'/'or' (section 4) are
-   sugar over JUMP_IF_FALSE/JUMP rather than dedicated instructions, `for`
-   is sugar over the exact same LOAD_LOCAL/ADD/STORE_LOCAL/JUMP primitives
-   every other loop already uses. Because `end_slot`'s value is computed
-   once up front and never touched again, re-assigning whatever expression
-   produced `end` inside the loop body has no effect on how many
-   iterations run (see the "bounds evaluated once" behavior this
-   guarantees). The hidden end-bound local is given the empty string as
-   its name — never a legal IDENTIFIER lexeme (GRAMMAR.bnf section 1), so
-   it can never collide with, shadow, or be resolved by any name a user
-   actually writes.
+   No new opcodes are involved. The hidden end-bound local is given the
+   empty string as its name — never a legal IDENTIFIER lexeme — so it can
+   never collide with a name the program actually writes.
 
 
 (* --------------------------------------------------------------------------
-   8. IMPORT/EXPORT (compile-time only - no new opcodes, no runtime
-      concept of a "module")
+   8. IMPORT/EXPORT (compile-time only — no new opcodes, no runtime concept
+      of a "module")
    -------------------------------------------------------------------------- *)
 
-   import/export (GRAMMAR.bnf design note 3h) add precisely one new
-   compile-time concern - which names a given file may call - and touch
-   nothing at runtime: the VM has no notion of files or modules, CALL's
-   operand is still a single flat index into one program-wide function
-   table, exactly as it was before a program could span more than one
-   file (section 6). Everything described here lives in src/module.zig and
-   the multi-module entry point compiler.Compiler.compileModules
-   (compileProgram is now a thin wrapper that hands compileModules a
-   single module with an empty import list, so a plain one-file program's
-   behavior - every function visible to every other, export irrelevant -
-   is unchanged).
+   import/export add one compile-time concern — which names a given file may
+   call — and touch nothing at runtime: CALL's operand is still a single
+   flat index into one program-wide function table. Lives in src/module.zig
+   and `compiler.Compiler.compileModules` (`compileProgram` is a thin
+   wrapper handing it a single module with an empty import list).
 
-   THE MODULE LOADER RUNS BEFORE COMPILATION, NOT DURING IT. Given an
-   entry program, module.Loader recursively lexes and parses every file
-   it transitively imports, depth-first, BEFORE any compilation begins.
-   Each file is keyed by a lexically normalized path (resolved relative to
-   the *importing* file's own directory, GRAMMAR.bnf design note 3h) and
-   memoized in a hash map: the second time any import path resolves to a
-   key already in that map, the loader returns the already-parsed Module
-   immediately instead of re-reading/re-lexing/re-parsing the file. This
-   memoization is the entire mechanism behind "a shared dependency is
-   compiled exactly once" - by the time compileModules ever sees the
-   module list, a diamond-shaped import graph has already been collapsed
-   down to one entry per distinct file, appearing exactly once in
-   Loader.order. compileModules does not itself deduplicate anything; it
-   simply never gets asked to compile the same module twice.
-
-   A cycle (file A importing file B importing file A, however indirectly)
-   is caught during this same loading pass - the loader keeps a stack of
-   paths currently mid-load, and a path re-encountered while still on that
-   stack (not yet fully loaded, so not yet in the memoization map either)
-   is LoadError.CircularImport rather than infinite recursion.
+   THE MODULE LOADER RUNS BEFORE COMPILATION. Given an entry program,
+   `module.Loader` recursively lexes and parses every transitively imported
+   file, depth-first, before any compilation begins. Each file is keyed by a
+   normalized path (resolved relative to the *importing* file's directory)
+   and memoized — a path already loaded is returned instead of re-read,
+   which is the entire mechanism behind "a shared dependency is compiled
+   exactly once": a diamond-shaped import graph collapses to one entry per
+   distinct file. A cycle (A imports B imports A) is `LoadError.
+   CircularImport`, caught via a stack of paths currently mid-load.
 
    FUNCTION REGISTRATION IS GLOBAL, VISIBILITY IS PER-MODULE.
-   compileModules's first pass walks every module's function declarations
-   (in whatever order `modules` lists them - order doesn't matter here
-   since this pass only builds a name table, the same as single-file
-   compileProgram always has) and registers each one with its owning
-   module's index and `exported` flag alongside the name/arity/call-index
-   every function has always had. A name collision anywhere in this whole
-   table - even between two files that don't import each other at all -
-   is SemanticError.DuplicateFunction, the same error a single file's own
-   two `func f()`s already were (GRAMMAR.bnf design note 3h: this is what
-   keeps CALL's resolution a flat table rather than needing per-module
-   namespacing).
+   `compileModules`'s first pass registers every module's function
+   declarations into one flat name table (name, arity, call-index, owning
+   module, `exported` flag); a name collision anywhere in that table —
+   even between files that don't import each other — is
+   `SemanticError.DuplicateFunction`. Compiling a call to name `f` then
+   checks visibility: it belongs to the current module (always allowed), or
+   to a module in the current module's direct-import list AND is exported
+   (`SemanticError.FunctionNotVisible` otherwise) — deliberately NOT
+   transitive; importing B does not expose B's own imports.
 
-   Compiling each module's function *bodies* (and the entry module's
-   top-level statements) tracks which module is "current" and which other
-   modules' indices are directly reachable from it (that module's own
-   `imports` list). A call to name `f` resolves in two steps: first find
-   `f` in the global table (as always - SemanticError.UndefinedFunction if
-   no such name exists anywhere), then check it's *visible* from here -
-   either it belongs to the current module (always allowed, exported or
-   not: a module's own private helpers are always usable by itself), or
-   it belongs to a module in the current module's direct-import list AND
-   is exported (SemanticError.FunctionNotVisible otherwise). This is
-   deliberately NOT transitive: importing B does not make B's own
-   imports' exports visible here (GRAMMAR.bnf design note 3h) - there is
-   no automatic re-export.
-
-   A BUNDLED STANDARD LIBRARY IS RESOLVED BY NAME, NOT BY PATH. Before an
-   `import` path is resolved against the importing file's directory
-   (section 8's opening paragraph, GRAMMAR.bnf design note 3h), it's
-   checked against a small table of reserved `.std.butter` names -
-   currently just `"math.std.butter"` (src/stdlib.zig) - whose Butter
-   source is embedded into the `butter` binary itself at build time via
-   `@embedFile`. A hit resolves to that embedded source directly, keyed by
-   the bare reserved name rather than a filesystem path, so it imports
-   identically regardless of which directory or how many different files
-   import it (still collapsed to one loaded/compiled copy either way, by
-   the same memoization this section already describes) - and with no
-   file named `math.std.butter` needing to exist anywhere on disk. Past
-   that one lookup, a bundled module is loaded and compiled exactly like
-   any other: its functions still need `export` to be visible outside it,
-   it's still one graph node in `Loader.order`, and its own `import`s (if
-   it had any) would go through this same by-name-first check.
+   A BUNDLED STANDARD LIBRARY IS RESOLVED BY NAME, NOT PATH. Before an
+   `import` path is resolved against the importing file's directory, it's
+   checked against a small table of reserved `.std.butter` names (currently
+   just `"math.std.butter"`, `src/stdlib.zig`) whose source is embedded into
+   the `butter` binary at build time via `@embedFile`. A hit resolves to
+   that embedded source directly, with no file needing to exist on disk;
+   past that lookup it's loaded and compiled exactly like any other module.
 
 
 (* --------------------------------------------------------------------------
-   9. BYTE-STREAM I/O (three instructions, no new value kind, still no heap)
+   9. BYTE-STREAM I/O (READ, WRITE, WRITE_BYTES — section 3)
    -------------------------------------------------------------------------- *)
 
-   `read`/`write` (GRAMMAR.bnf design note 3k) add three instructions —
-   READ, WRITE, WRITE_BYTES (section 3) — and, on their own, nothing else:
-   no allocator, no runtime stream table of their own (files get one —
-   section 10, which also explains the STREAM value these three now
-   consume).
-
-   THE STREAM IS A VALUE ON THE STACK, NOT AN OPERAND. This is a change
-   from these three instructions' original design, where each carried
-   which of stdin/stdout/stderr it acted on as its own u32 operand — valid
-   only because a stream used to be nothing but a bare compile-time
-   keyword. Files (section 10) changed that: `open`'s result is inherently
-   a runtime value, and it has to be able to flow into READ/WRITE/
-   WRITE_BYTES exactly like a literal `stdin`/`stdout`/`stderr` does. So
-   all three now take ZERO operands and instead pop the STREAM they act on
-   off the top of the stack — pushed there by whatever expression named
-   it, a PUSH_CONST of a literal stream or the result of an OPEN — rather
-   than being told which stream via their operand. This is what lets a
-   file's stream reach `read`/`write` without needing three more
-   instructions just for "the stream happens to be a file" instead of
-   "the stream happens to be one of the three keywords": by the time READ
-   executes, it doesn't need to know or care which kind of STREAM it was
-   handed.
+   THE STREAM IS A VALUE ON THE STACK, NOT AN OPERAND: all three instructions
+   take zero operands and pop the STREAM they act on off the top of the
+   stack — pushed there by whatever expression named it (a PUSH_CONST of a
+   literal stream, or the result of OPEN) — rather than being told which
+   stream via their operand. This is what lets a file's stream reach
+   read/write without dedicated "it happens to be a file" instructions.
 
    DIRECTION IS CHECKED AT COMPILE TIME WHEN IT CAN BE, AT RUN TIME
-   OTHERWISE. `compiler.zig`'s `compileStreamOperand` statically checks
-   direction (`CompileError.WrongStreamDirection`) only when the stream
-   expression is a literal `stdin`/`stdout`/`stderr` keyword use — the one
-   case where which stream is meant, and therefore its direction, is truly
-   known at compile time. For any other stream expression (a variable, an
-   `open(...)` call, a parameter, ...) the compiler has no way to know, so
-   it emits the instruction unconditionally and the VM checks instead:
-   `readerFor`/`writerFor` (section 10) raise
-   `RuntimeError.StreamNotReadable`/`StreamNotWritable` if the stream
-   they're handed turns out to be opened in the wrong direction.
+   OTHERWISE. `compileStreamOperand` statically checks direction
+   (`CompileError.WrongStreamDirection`) only for a literal
+   `stdin`/`stdout`/`stderr` keyword use. For any other stream expression the
+   VM checks instead: `readerFor`/`writerFor` (section 10) raise
+   `RuntimeError.StreamNotReadable`/`StreamNotWritable` if the stream turns
+   out to be opened in the wrong direction.
 
-   THE BUFFER ARRIVES AS AN ARRAY_REF ON THE STACK. READ and WRITE_BYTES
-   don't take a packed (slot, length) operand the way LOAD_INDEX does —
-   now that their old operand is spent on nothing (the stream moved to the
-   stack, above), they simply take no operand at all. Instead the compiler
-   puts the buffer on the stack as a single ARRAY_REF first, reusing the
-   exact instructions a generic call argument already used (section 6's
-   generic-array addendum): MAKE_ARRAY_REF for a fixed-size local,
-   LOAD_LOCAL for a local that already holds a reference. That one decision
-   is what keeps this to three instructions instead of six — there is no
-   READ/READ_REF pair, because by the time READ executes it can no longer
-   tell which kind of array it was handed, and doesn't need to.
+   THE BUFFER ARRIVES AS AN ARRAY_REF ON THE STACK, produced the same way a
+   generic call argument is (MAKE_ARRAY_REF for a fixed-size local,
+   LOAD_LOCAL for one that already holds a reference) — which is why there
+   is no READ/READ_REF pair; by the time READ executes it can no longer tell
+   which kind of array it was handed, and doesn't need to. A reference
+   synthesized for an I/O buffer is trivially safe (section 6): it's created
+   and fully consumed by a single instruction inside the very frame it
+   points into.
 
-   A fresh reference synthesized for an I/O buffer is trivially safe in a
-   way a returned one isn't (section 6's "why a reference is safe as an
-   argument but not always safe as a return"): it is created and fully
-   consumed by a single instruction inside the very frame it points into, so
-   there is no window in which the frame could have been popped.
+   BYTES AND VALUES ARE TWO DIFFERENT TRANSLATIONS, both routed through
+   `Vm.io_buffer`, a fixed `[stack_max]u8` staging area (large enough by
+   construction to hold any buffer the value stack itself could contain):
+     - READ reads into `io_buffer`, then scatters each byte out as an INT
+       (`Vm.scatterBytes`).
+     - WRITE_BYTES gathers each slot back into `io_buffer`, checking each
+       one really names a byte (`Vm.gatherBytes`), then writes that flat
+       slice once.
+   WRITE (the value form) needs neither, since it's writing a rendering, not
+   bytes: it counts the rendered length with a discarding pass, then renders
+   again to the real stream.
 
-   BYTES AND VALUES ARE TWO DIFFERENT TRANSLATIONS. A Butter buffer holds
-   one `Value` per byte, so both directions need a translation step through
-   `Vm.io_buffer`, a fixed `[stack_max]u8` staging area — large enough by
-   construction to hold any buffer the value stack itself could contain, so
-   it never needs to grow and the VM stays allocator-free at run time
-   (section 2):
-     - READ reads into `io_buffer`, then scatters each byte out as an
-       `INT` (`Vm.scatterBytes`).
-     - WRITE_BYTES gathers each slot back down into `io_buffer`, checking
-       as it goes that every element really names a byte
-       (`Vm.gatherBytes`), then writes that flat slice once.
-   WRITE (the value form) needs neither, since it is writing a rendering
-   rather than bytes: it counts the rendered length with a discarding pass
-   and then renders again to the real stream, so the count it pushes is
-   exact for a value of any size without a staging buffer to overflow.
-
-   EVERYTHING OUTSIDE THE VM IS INJECTED, AND MOST OF IT IS OPTIONAL.
-   `Vm.run` takes a `Host { out, err, in, fs }` (section 10 covers `fs`,
-   added once files needed a fourth field — `Host` was called `Streams`
-   before that) rather than the single writer it took before I/O existed.
-   `out` is required (PRINT has nowhere else to go); `in`, `err`, and `fs`
-   are each optional, and an absent one behaves exactly like the shell
-   redirection or permission it stands in for — a missing `in` is
-   `< /dev/null` (every READ immediately reports 0 rather than failing), a
-   missing `err` is `2>/dev/null` (bytes are counted as written, then
-   dropped), and a missing `fs` is running with no filesystem access at all
-   (every OPEN fails with `RuntimeError.FilesUnavailable` — section 10).
-   This is what lets every test drive real I/O against in-memory buffers
-   and (for files) a temporary directory, and it's why nothing in the VM
-   ever reaches for a process-wide handle itself.
-   ========================================================================== *)
+   EVERYTHING OUTSIDE THE VM IS INJECTED. `Vm.run` takes a
+   `Host { out, err, in, fs }`. `out` is required; `in`, `err`, and `fs` are
+   each optional, and an absent one behaves like the shell redirection or
+   permission it stands in for: a missing `in` makes every READ report 0, a
+   missing `err` drops written bytes after counting them, and a missing `fs`
+   fails every OPEN with `RuntimeError.FilesUnavailable`.
 
 
 (* --------------------------------------------------------------------------
-   10. FILES (two instructions, one new runtime table, still no heap)
+   10. FILES (OPEN, CLOSE — section 3; one new runtime table)
    -------------------------------------------------------------------------- *)
 
-   `open`/`close` (GRAMMAR.bnf design note 3l) add two instructions — OPEN
-   and CLOSE (section 3) — and one new piece of VM state: a fixed-size
-   table of open files (`Vm.files`, `max_open_files = 8` slots of
-   `?OpenFile`). Nothing else about the "no heap, no allocator at run time"
-   goal (section 1) changes: the table is part of the `Vm` struct itself,
-   the same as the value stack, so it costs no allocation to have and none
-   to use.
+   `open`/`close` add one piece of VM state: a fixed table of open files
+   (`Vm.files`, `max_open_files = 8` slots of `?OpenFile`), part of the `Vm`
+   struct itself. `Value.stream`'s `.file` payload is a `u32` INDEX into
+   this table, never a raw OS handle — copying a stream value copies only
+   which slot it names. The real resource (an `std.Io.File`, a buffered
+   reader OR writer — a file is opened in exactly one direction — and its
+   own byte buffer) lives in the table entry, owned by the `Vm`. A `null`
+   slot is free; CLOSE always resets a slot to `null`, so using a closed
+   file is a clean `RuntimeError.StreamClosed` rather than a stale handle.
 
-   A STREAM NAMES A TABLE SLOT, NEVER A RAW OS HANDLE. `Value.stream`'s
-   `.file` payload (section 2) is a `u32` INDEX into `Vm.files`, not an
-   `std.Io.File` or file descriptor copied directly into the value. This
-   indirection is what keeps a stream small, trivially copyable, and free
-   of ownership semantics: copying a `Value.stream` (assigning it to
-   another variable, passing it as an argument) copies only which slot it
-   names, never the underlying OS resource, so there is no way for a
-   Butter program to observe two "independent" copies of the same open
-   file behaving differently, and no destructor/ownership-tracking
-   machinery is needed anywhere a `Value` is copied. The real resource —
-   an `std.Io.File`, a buffered reader OR writer (`OpenFile.Handle`, never
-   both: a file is opened in exactly one direction), and its own byte
-   buffer — lives entirely in the table entry, owned by the `Vm`, not by
-   any `Value` a program holds. A `null` slot is a free one; CLOSE (below)
-   sets a slot back to `null` unconditionally, which is what turns "using a
-   closed file" into a clean `RuntimeError.StreamClosed` rather than a
-   stale handle.
-
-   OPEN #mode   ( path -- stream )    pops path (must be STRING —
+   OPEN #mode   ( path -- stream )    pops path (must be string-shaped;
                                        TypeMismatch otherwise) and opens it
-                                       against `Host.fs` in the given
-                                       `mode` (`value.OpenMode` — the one
-                                       operand this instruction carries,
+                                       against `Host.fs` in the given `mode`
+                                       (`value.OpenMode` — the one operand,
                                        since the mode is always a bare
-                                       keyword and so is fixed at compile
-                                       time even though the resulting
-                                       stream isn't). On success, records
-                                       the opened file in the first free
-                                       table slot and pushes a STREAM
-                                       naming it.
-                                         - `RuntimeError.FilesUnavailable`
-                                           if `Host.fs` is null (the
-                                           embedder granted no filesystem
-                                           access at all).
-                                         - `RuntimeError.TooManyOpenFiles`
-                                           if every table slot is already
-                                           in use — a hard limit, since
-                                           there is no heap to grow the
-                                           table with.
+                                       keyword). On success, records the
+                                       file in the first free table slot and
+                                       pushes a STREAM naming it.
+                                         - `RuntimeError.FilesUnavailable` if
+                                           `Host.fs` is null.
+                                         - `RuntimeError.TooManyOpenFiles` if
+                                           every table slot is in use.
                                          - `RuntimeError.FileOpenFailed`
-                                           otherwise, if the underlying
-                                           open/create call — or, in
-                                           `append` mode, the follow-up
-                                           stat/seek to the file's current
-                                           end — fails (no such file in
-                                           `read` mode, no permission, it's
-                                           a directory, and so on).
+                                           otherwise (no such file in `read`
+                                           mode, no permission, etc).
                                        All three set `Vm.diagnostic`
                                        (`operation = "open"`, `path`, and a
-                                       `cause` that is `@errorName` of the
-                                       underlying error for
-                                       `FileOpenFailed`, or a fixed
-                                       explanatory string for the other
-                                       two). `write` mode creates the file,
-                                       truncating it first if it already
-                                       exists; `read` mode requires it to
-                                       already exist; `append` mode opens
-                                       it for writing and then seeks to its
-                                       current end (via `file.stat`) rather
-                                       than truncating, creating it first
-                                       if it's genuinely absent — that seek
-                                       is the one extra step distinguishing
-                                       `append` from `write`.
+                                       `cause`). `write` mode truncates or
+                                       creates; `read` mode requires the file
+                                       to exist; `append` opens for writing
+                                       and seeks to the current end (or
+                                       creates it if absent).
 
    CLOSE                    ( stream -- )   pops a STREAM (TypeMismatch if
-                                       the popped value isn't one).
-                                         - A `.standard` stream (a literal
-                                           `stdin`/`stdout`/`stderr`) is
+                                       it isn't one).
+                                         - A `.standard` stream is
                                            `RuntimeError.
-                                           CannotCloseStandardStream` —
-                                           those three belong to whoever
-                                           started the program. The
-                                           compiler already rejects this
-                                           case at compile time when it can
-                                           tell statically
-                                           (`CompileError.
-                                           CannotCloseStandardStream`,
-                                           GRAMMAR.bnf design note 3l);
-                                           this is the run-time backstop
-                                           for when it can't (the stream
-                                           came from a variable, an `if`,
-                                           and so on).
+                                           CannotCloseStandardStream` (the
+                                           compiler already rejects a
+                                           literal case at compile time).
                                          - A `.file` naming a slot that
-                                           isn't currently open (already
-                                           closed, or never a valid slot —
-                                           e.g. an index beyond the
-                                           table's size) is
+                                           isn't currently open is
                                            `RuntimeError.StreamClosed`.
                                          - Otherwise: flushes the file if
-                                           it was opened for writing
-                                           (`RuntimeError.
-                                           FileCloseFailed` if the flush
-                                           fails, `Vm.diagnostic` carrying
-                                           `@errorName` of the cause with
-                                           an empty path — there's no path
-                                           left to report once a file is
-                                           already open, only the stream
-                                           naming it), closes the
-                                           underlying OS file, and frees
-                                           the table slot UNCONDITIONALLY
-                                           either way — even a failed flush
-                                           still frees the slot, so a close
-                                           that fails can never leave the
-                                           table stuck holding a handle the
-                                           program has no way to get rid
-                                           of.
+                                           opened for writing
+                                           (`RuntimeError.FileCloseFailed`
+                                           if the flush fails), closes the
+                                           underlying OS file, and frees the
+                                           table slot UNCONDITIONALLY either
+                                           way.
 
-   READ/WRITE/WRITE_BYTES (section 9) ALREADY WORK ON A FILE STREAM
-   UNCHANGED — they pop a STREAM and dispatch through `Vm.readerFor`/
-   `writerFor`, which handle a `.file` stream by looking up its table entry
-   (`Vm.fileEntry`) and returning whichever half of its `Handle` exists:
-     - reading a `.file` opened in `write`/`append` mode (or writing to one
-       opened `read`) is `RuntimeError.StreamNotReadable`/
-       `StreamNotWritable` — the run-time backstop for the direction check
-       the compiler can only make statically for a literal `stdin`/
-       `stdout`/`stderr` (section 9).
-     - a `.file` naming a closed/invalid slot is `RuntimeError.
-       StreamClosed`, exactly as for CLOSE above.
+   READ/WRITE/WRITE_BYTES (section 9) work on a file stream unchanged,
+   dispatching through `Vm.readerFor`/`writerFor` (`Vm.fileEntry` looks up
+   the table entry and returns whichever half of its `Handle` exists):
+   reading a stream opened `write`/`append` (or writing to one opened
+   `read`) is `RuntimeError.StreamNotReadable`/`StreamNotWritable`; a closed
+   or invalid slot is `RuntimeError.StreamClosed`.
 
-   EVERY OPEN FILE IS CLOSED ON THE WAY OUT OF `run`, WHETHER IT HALTED
-   NORMALLY OR FAILED. `Vm.closeAllFiles` (flushing and closing every
-   still-open table slot, the same as CLOSE) runs from an `errdefer` set up
-   at the very top of `run` — so any propagated `RuntimeError` still closes
-   every file first — AND explicitly on the ordinary HALT path, so a
-   failure flushing the program's OWN files on ordinary exit is reported as
-   this run's own result rather than silently discarded the way an
-   `errdefer`-only close would be. A program that never `close`s a file it
-   opened does not leak it for the life of the process — only for the life
-   of this one `run` call — but IS still bounded by `max_open_files` while
-   it runs, since the table has no allocator to grow with (section 1's
-   "no heap" goal, same as the value stack).
+   EVERY OPEN FILE IS CLOSED ON THE WAY OUT OF `run`, whether it halted
+   normally or failed (`Vm.closeAllFiles`, run from an `errdefer` and
+   explicitly on the HALT path) — bounded by `max_open_files` while running,
+   since the table has no allocator to grow with.
 
-   `Vm.diagnostic` IS HOW A RUNTIME ERROR CARRIES DETAIL A ZIG ERROR VALUE
-   CAN'T. Four of the eight file-related `RuntimeError`s set it —
-   `FileOpenFailed`, `TooManyOpenFiles`, and `FilesUnavailable` (all three
-   from OPEN, since only `open` has a path worth reporting), plus
-   `FileCloseFailed` (from CLOSE, path left empty). The other four
+   `Vm.diagnostic` carries detail a bare Zig error tag can't: the four
+   file-related errors that set a path/cause do (`FileOpenFailed`,
+   `TooManyOpenFiles`, `FilesUnavailable`, `FileCloseFailed`); the other four
    (`StreamNotReadable`, `StreamNotWritable`, `StreamClosed`,
-   `CannotCloseStandardStream`) carry no diagnostic — the bare error tag
-   already says everything there is to say about them, with no path or
-   underlying-cause string to add. `path` is borrowed straight from the
-   chunk's own constant pool (never separately allocated, consistent with
-   every other STRING in this VM — section 2). `main.zig` prefers this
-   diagnostic when printing a runtime error to the user, falling back to
-   the bare `@errorName(err)` for every `RuntimeError` — file-related or
-   not — that doesn't set one.
-   ========================================================================== *)
+   `CannotCloseStandardStream`) need none — the bare tag already says
+   everything. `main.zig` prefers this diagnostic when printing a runtime
+   error, falling back to `@errorName(err)` for any error that doesn't set
+   one.
 
 
 (* --------------------------------------------------------------------------
-   11. MAPS, LISTS, AND THE HEAP (the VM's first, and only, heap-managed
-       value; nine of the ten new opcodes below — JSON_PARSE, the tenth,
-       is section 12's)
+   11. MAPS, LISTS, AND THE HEAP (the VM's only heap-managed value; nine of
+       the ten heap-related opcodes are in section 3 — JSON_PARSE is
+       section 12's)
    -------------------------------------------------------------------------- *)
 
-   `map`/`list` (GRAMMAR.bnf design note 3m) add one new runtime value kind
-   — OBJECT (section 2) — and, with it, the one thing every prior section
-   of this document was careful to say the VM didn't need: a real heap and
-   a real allocator. `Vm` now carries a `std.mem.Allocator`
-   (`Vm.init(allocator)`, a breaking signature change from the old
-   zero-argument `Vm.init()`); a program that never touches a map, a list,
-   or `json(...)` never calls into it.
+   `map`/`list` add one runtime value kind — OBJECT (section 2) — and the
+   heap/allocator backing it (`Vm` carries a `std.mem.Allocator`, via
+   `Vm.init(allocator)`); every compile-time string literal is ALSO an
+   OBJECT (section 2), so a program that touches only scalars still never
+   allocates, but any string at all does.
 
-   `value.Object` IS A REFCOUNTED HEAP HEADER, NOT A TRACED ONE.
+   `value.Object` IS A REFCOUNTED HEAP HEADER, NOT A TRACED ONE:
    ```
    Object = struct {
        refcount: usize = 1,
@@ -1129,265 +694,100 @@
        },
    }
    ```
-   `refcount` starts at 1 (the reference returned by whatever created it)
-   and is adjusted by `Value.incref`/`Value.decref` (below); reaching 0
-   frees the object, recursively decreffing every child `Value` it holds
-   (each list element, each map value) and freeing every map key it owns —
-   a plain recursive free, not a mark/sweep collector. A self-referential
-   structure (`m["self"] := m`) never reaches refcount 0 and leaks for the
-   life of the `Vm.run` call that built it; this is a known, accepted
-   limitation (GRAMMAR.bnf design note 3m), not a bug this VM tries to
-   catch — `print`ing one is separately guarded by a hard recursion-depth
-   cap (64), so walking a cycle to render it fails cheaply instead of
-   overflowing the native stack.
+   `refcount` starts at 1 and is adjusted by `Value.incref`/`Value.decref`;
+   reaching 0 frees the object, recursively decreffing every child `Value`
+   it holds and freeing every map key it owns — a plain recursive free, not
+   mark/sweep. A self-referential structure (`m["self"] := m`) never reaches
+   refcount 0 and leaks for the life of the `Vm.run` call that built it — a
+   known, accepted limitation. `print`ing one is separately guarded by a
+   hard recursion-depth cap (64).
 
-   ONE `object` TAG, NOT THREE. A heap-owned STRING (e.g. a JSON string
-   leaf) shares the same `Object`/refcount machinery as a list/map rather
-   than being its own `Value` variant — every incref/decref site only ever
-   has to ask "is this an OBJECT?" once. `Value.asStringBytes` is what lets
-   a heap string and the ordinary borrowed `.string` variant (section 2)
-   compare equal and substitute for each other by content anywhere a STRING
-   is expected; `Value.eql` uses it for exactly that. A list/map, by
-   contrast, compares by POINTER IDENTITY ONLY, never deep — no other
-   `<value>` does deep comparison either (ARRAY_REF/STREAM compare cheap
-   tuples), and a deep comparison could hang on the accepted cycle above.
+   `Value.newString(allocator, bytes)` is the single constructor for a
+   string OBJECT — used by literal compilation, map-literal keys,
+   `MAP_KEYS`, and JSON parsing alike. A Chunk's constant pool holds one
+   permanent reference per OBJECT-backed constant it contains (released on
+   `Chunk.deinit`); PUSH_CONST increfs the constant before pushing a copy,
+   exactly like LOAD_LOCAL increfs a local before pushing its copy.
 
-   A MAP IS ORDER-PRESERVING, NOT A PLAIN HASH TABLE. Its entries iterate
-   in insertion order (`std.StringArrayHashMapUnmanaged`, not a plain
-   `HashMap`) so `keys(...)`, `print`, and a document's own JSON structure
-   all see deterministic output. Every map KEY is a fresh, map-owned copy
+   `Value.asStringBytes` reads a string OBJECT's bytes for comparison/
+   printing/indexing, regardless of how it was constructed. A list/map, by
+   contrast, compares by POINTER IDENTITY ONLY, never deep (a deep
+   comparison could hang on the accepted cycle above).
+
+   A MAP IS ORDER-PRESERVING (`std.StringArrayHashMapUnmanaged`, not a plain
+   hash map), so `keys(...)`, `print`, and JSON output all see deterministic,
+   insertion-order results. Every map KEY is a fresh, map-owned copy
    (`allocator.dupe`'d on first insertion, freed on removal/overwrite/
-   destroy) — never a borrowed slice into whatever expression produced the
-   key — which is what lets `MAP_KEYS` (below) hand back independent,
-   freshly-owned values with no lifetime tie back to the map they came
-   from.
+   destroy) — never aliasing whatever expression produced the key.
 
-   `Local.collection` IS A SEPARATE AXIS FROM `Local.array`. The compiler's
-   per-local bookkeeping (section 5) gains a second, independent optional
-   field — null for anything that isn't a map/list, `.map`/`.list`
-   otherwise — checked BEFORE `Local.array` wherever a bare name is
-   resolved. It's kept separate rather than folded into `ArraySpec` because
-   `map`/`list` are new `<type>` entries that never take the `[N]`/`[]`
-   array suffix `ArraySpec` represents at all; they're always exactly one
-   heap-reference slot, addressed via INDEX_GET/INDEX_SET below rather than
-   any array opcode. Whatever `Local.collection` says at compile time, the
-   VM still re-checks the actual runtime tag before every INDEX_GET/
-   INDEX_SET/LIST_PUSH/MAP_HAS/MAP_DELETE/MAP_KEYS/LEN_VALUE (`TypeMismatch`
-   if it doesn't match) — the same "declared type isn't checked against
-   what's actually stored" latitude every other variable already has
-   (section 1), applied here too.
+   `Local.collection` is a separate axis from `Local.array` (section 5): a
+   map/list local is always exactly one heap-reference slot, addressed via
+   INDEX_GET/INDEX_SET/LIST_PUSH/MAP_HAS/MAP_DELETE/MAP_KEYS/LEN_VALUE, and
+   the VM re-checks the actual runtime tag before every one of those
+   (`TypeMismatch` if it doesn't match what the compiler expected).
 
    BRACKET INDEXING IS GENERIC, NOT SLOT-BASED, BECAUSE IT HAS TO CHAIN.
-   Unlike LOAD_INDEX/STORE_INDEX (fixed array) and LOAD_INDEX_REF/
-   STORE_INDEX_REF/LOAD_REF_LEN (generic array), which all take a
-   compile-time-known SLOT as their operand, INDEX_GET/INDEX_SET take NO
-   slot operand at all — they pop their container off the stack as an
-   ordinary `Value`, however it got there. This is what a chained
-   `doc["a"]["b"]` needs: the base `doc["a"]` is a value already sitting on
-   the stack, not a named local, so a slot-taking opcode literally couldn't
-   express it. The compiler's dispatch (`compileIndex`/`compileIndexAssign`)
-   reflects this directly: a bare identifier resolving to a FIXED/GENERIC
-   array local still goes through the existing slot-based opcodes
-   unchanged, with no chaining possible (an array element is always
-   scalar, GRAMMAR.bnf design note 3e, so there is structurally no way to
-   reach this case with a non-identifier base); a bare identifier resolving
-   to a `.map`/`.list` local, or ANY non-identifier base at all (a nested
-   index, a call, a literal), compiles `base` as an ordinary expression
-   (LOAD_LOCAL, or recursively through another INDEX_GET) and falls through
-   to INDEX_GET/INDEX_SET. Indexing into a value that turns out to be
-   scalar at runtime — including one produced by chaining off a fixed-array
-   element — is `RuntimeError.TypeMismatch`, not a special chaining-depth
-   check; this is how "a fixed/generic array element is never itself
-   indexable" stays enforced without the compiler needing to reason about
-   chains at all. A bare identifier resolving to neither an array nor a
-   `.map`/`.list` local is instead a COMPILE-time `SemanticError.
-   NotIndexable` — the one case the compiler can already rule out
-   statically.
+   Unlike LOAD_INDEX/LOAD_INDEX_REF (which take a compile-time-known slot),
+   INDEX_GET/INDEX_SET pop their container off the stack as an ordinary
+   `Value`, however it got there — necessary for a chained `doc["a"]["b"]`,
+   where the base `doc["a"]` is already a value on the stack, not a named
+   local. A bare identifier resolving to neither an array nor a map/list
+   local is a compile-time `SemanticError.NotIndexable`; indexing into a
+   value that turns out scalar at runtime is `RuntimeError.TypeMismatch`.
 
    REFCOUNTING: INCREF ON DUPLICATION, DECREF ON DISCARD-WITHOUT-MOVING.
-   `Value.incref`/`Value.decref` are no-ops for every non-OBJECT value,
-   which is what keeps them cheap to call unconditionally. The general
-   rule: incref happens exactly when a `Value` is duplicated into a second
-   live location while the first stays live; decref happens exactly when a
-   live location's `Value` is permanently destroyed or overwritten without
-   moving. A pure MOVE (temporarily on the expression stack, then relocated
-   to a new permanent home with nothing left behind referencing it) needs
-   neither — this covers every var-decl initializer, MAKE_LIST/MAKE_MAP's
-   element transplant, LIST_PUSH's appended value, and RET's copied-down
-   return value. Concretely:
-     - LOAD_LOCAL, LOAD_INDEX, LOAD_INDEX_REF: the pushed copy is increffed
-       (an array CAN hold a heap-backed `.string` element even though it
-       can never hold a `.map`/`.list` one, so these needed updating too,
-       not just the new opcodes).
-     - STORE_LOCAL, STORE_INDEX, STORE_INDEX_REF: the new value is
-       increffed BEFORE the old slot value is decreffed — in that order,
-       so `x := x` (old and new the same object) can never free the only
-       live copy before the incref meant to preserve it runs — then the old
-       value is decreffed.
-     - POP: decrefs the popped value. PRINT and WRITE (section 9) likewise
-       decref the value they render before discarding it — printing/
-       writing a list/map/heap-string is a real possibility now, and both
-       are otherwise exactly this same "read then discard" shape as POP.
-     - EQ/NEQ (section 3) decref BOTH operands after comparing them — the
-       one case where a non-numeric pair (e.g. two lists, by identity)
-       reaches a SUCCESSFUL comparison rather than `TypeMismatch`, so
-       there's a decref to do on the ordinary success path, not only on an
-       error path.
-     - ADD/SUB/MUL/DIV/MOD/POW/comparison (via `popNumericPair`) and
-       NEG/NOT decref their operand(s) on the `TypeMismatch` path (a
-       non-numeric/non-boolean operand might be a heap object) — the
-       success path never needs to, since succeeding requires the operands
-       to be non-refcounted scalars in the first place.
-     - RET decrefs every value in `stack[bp .. sp-return_width)` — the
-       departing frame's own locals/arguments/temporaries — BEFORE the
-       existing copy-down loop moves the return value(s) into place. Safe
-       even though this range can overlap the copy destination: the decref
-       pass only ever READS a slot strictly below `sp-return_width`, and
-       the copy loop only ever WRITES into `[bp, bp+return_width)`, and
-       `bp <= sp-return_width` always — so nothing is ever double-decreffed
-       or read after being overwritten.
-     - `Vm.run`'s two exit paths (the `errdefer` for any propagated error,
-       and the ordinary HALT path) each decref every value still in
-       `stack[0..sp)` in one pass, generalizing `closeAllFiles`'s own
-       exit-path cleanup (section 10) to the heap — needed because
-       top-level code (frame 0) never runs a RET of its own, so without
-       this its own locals would never get decreffed at all.
-   No change is needed for PUSH_CONST (a compile-time constant is never an
-   OBJECT), MAKE_ARRAY_REF/LOAD_REF_LEN (an ARRAY_REF is never refcounted),
-   or CALL (it copies nothing — every argument was already increffed by
-   whatever expression produced it).
+   Both are no-ops for every non-OBJECT value. The rule: incref when a
+   `Value` is duplicated into a second live location while the first stays
+   live; decref when a live location's `Value` is permanently destroyed or
+   overwritten without moving. A pure MOVE (temporarily on the expression
+   stack, then relocated to a new permanent home with nothing left behind)
+   needs neither — var-decl initializers, MAKE_LIST/MAKE_MAP's element
+   transplant, LIST_PUSH's appended value, and RET's copied-down return
+   value are all moves. See section 3 for exactly which instructions
+   incref/decref. `Vm.run`'s two exit paths (a propagated error, and the
+   ordinary HALT path) each decref every value still on the stack in one
+   pass, since top-level code (frame 0) never runs a RET of its own.
 
-   NEW OPCODES: see section 3 (MAKE_LIST, MAKE_MAP, INDEX_GET, INDEX_SET,
-   LIST_PUSH, MAP_HAS, MAP_DELETE, MAP_KEYS, LEN_VALUE) for exact stack
-   effects; JSON_PARSE is covered in section 12.
-
-   A MAP/LIST VALUE NEEDS NONE OF THE GENERIC-ARRAY-REFERENCE ESCAPE
-   ANALYSIS SECTION 6 DESCRIBES. `compileGenericArrayReturn`'s soundness
-   rule (a reference synthesized from THIS frame's own locals can't be
-   returned, only one already received as a parameter) exists because an
-   ARRAY_REF points into the VM's STACK, which the returning frame is about
-   to reuse. An OBJECT reference points into the HEAP instead, with its own
-   refcounted lifetime completely independent of any stack frame — so a
-   map/list can be returned from a function, stored inside another map/
-   list, or handed to a function and returned back, with no restriction at
-   all. `compileCallCommon`'s ordinary argument-compiling path already
-   handles a map/list-typed parameter correctly with no changes: since
-   `param.array_size` is always null for one, it falls through to the same
-   `compileExpr(arg)` any scalar argument already used, and a map/list
-   return likewise falls through to the ordinary (non-array) `return`
-   compilation path — in both cases what's being passed around is simply
-   one more ordinary `Value` that happens to be an OBJECT reference.
-   ========================================================================== *)
+   A MAP/LIST VALUE NEEDS NONE OF SECTION 6'S ESCAPE ANALYSIS. An ARRAY_REF
+   points into the VM's stack, which the returning frame is about to reuse;
+   an OBJECT points into the heap, with its own refcounted lifetime
+   independent of any stack frame. So a map/list can be returned, stored
+   inside another map/list, or handed to a function and returned back, with
+   no restriction — it's simply one more ordinary `Value` wherever a scalar
+   argument or return would go.
 
 
 (* --------------------------------------------------------------------------
-   12. JSON (one opcode, no new heap concept beyond section 11's)
+   12. JSON (json/stringify — one opcode each, no new value kind beyond
+       section 11's)
    -------------------------------------------------------------------------- *)
 
-   `json(buffer, count)` (GRAMMAR.bnf design note 3n) adds one instruction —
-   JSON_PARSE (section 3) — and, on its own, nothing else: no new value
-   kind (a parsed document is built entirely out of section 11's ordinary
-   OBJECT/NULL/scalar values) and no new VM state.
+   `json(buffer, count)` adds JSON_PARSE: it gathers `count` bytes via the
+   same `Vm.gatherBytes`/`io_buffer` staging area WRITE_BYTES uses (section
+   9), then `src/json.zig` parses them via `std.json.parseFromSlice` into a
+   `std.json.Value` tree (a throwaway scratch arena, freed immediately) and
+   walks it: a JSON object becomes a map, an array a list, a string a fresh
+   string value (`Value.newString`), a number an INT or FLOAT, a boolean
+   BOOL, and `null` NULL. Every heap object the walk builds already has the
+   refcount a fresh owner expects. `json` is a special form (parsed like
+   `len`/`read`/`write`/`open`), not an ordinary `func`, because its result
+   type isn't knowable until the bytes are read. Malformed input is
+   `RuntimeError.JsonParseFailed`, diagnosed via `Vm.diagnostic` with a fixed
+   `cause` string (every parse failure collapses to one error before it
+   reaches the VM).
 
-   THE BUFFER ARRIVES EXACTLY LIKE READ/WRITE_BYTES'S DOES. JSON_PARSE
-   gathers its `count` bytes via the SAME `Vm.gatherBytes`/`io_buffer`
-   staging area WRITE_BYTES already uses (section 9), reusing that
-   mechanism unchanged rather than inventing a second way to flatten a
-   Butter buffer into a flat `[]u8` — exactly the same reuse `emitArrayRef`
-   already gets between generic call arguments and I/O buffers (section 6).
-
-   PARSING ITSELF IS `std.json`'S JOB, NOT A HAND-WRITTEN ONE. `src/json.zig`
-   parses the gathered bytes via `std.json.parseFromSlice` into a
-   `std.json.Value` tree (in a throwaway scratch arena, freed immediately
-   after conversion — entirely separate from, and never sharing storage
-   with, the Butter heap objects the conversion below builds), then walks
-   it: a JSON object becomes a map, a JSON array becomes a list, a JSON
-   string becomes a fresh heap-owned `Object{.string}`, a JSON number
-   becomes an INT or FLOAT (matching whichever `std.json` produced), a JSON
-   boolean becomes BOOL, and JSON `null` becomes NULL. Every heap object
-   the conversion builds already has the refcount (1) a fresh owner
-   expects, exactly as if it had been built by ordinary MAKE_LIST/MAKE_MAP/
-   `mapSet` calls — JSON_PARSE itself needs no incref for the value it
-   pushes.
-
-   `json` IS A SPECIAL FORM, NOT AN ORDINARY CALL, BECAUSE ITS RESULT TYPE
-   ISN'T KNOWABLE UNTIL THE BYTES ARE READ. A `func`'s return type is fixed
-   and declared once (GRAMMAR.bnf design note 3c); a parsed document's root
-   could be any `<value>` kind depending on what the bytes actually say.
-   `json` is parsed like `len`/`read`/`write`/`open` — a keyword the parser
-   recognizes directly in `<atom>` position — precisely so it can hand back
-   a value whose kind isn't fixed at compile time, something an ordinary
-   CALL (section 6), with its one fixed `return_width`, has no way to do.
-
-   MALFORMED INPUT IS `RuntimeError.JsonParseFailed`, diagnosed via
-   `Vm.diagnostic` (`operation = "json"`, `path` left empty, `cause` a
-   fixed description) — the same side-channel files established (section
-   10) for an error whose bare tag can't carry enough detail on its own.
-   Unlike `FileOpenFailed`'s `cause` (the underlying OS error's own name),
-   JSON's `cause` is a fixed string rather than `@errorName` of some
-   specific underlying error: `src/json.zig` collapses every parse failure
-   (a syntax error, a truncated document, and so on) to one
-   `error.JsonParseFailed` before it ever reaches the VM, so there's no
-   more specific name left to report by the time `Vm.diagnostic` is set.
-   ========================================================================== *)
-
-
-(* --------------------------------------------------------------------------
-   13. JSON STRINGIFY (one opcode, section 12's reverse — still no new heap
-       concept, still no new VM state)
-   -------------------------------------------------------------------------- *)
-
-   `stringify(value)` (GRAMMAR.bnf design note 3o) adds one instruction —
-   JSON_STRINGIFY (section 3) — the reverse of JSON_PARSE: instead of
-   consuming bytes to build a value, it consumes a value to build bytes,
-   handing them back as a fresh heap `Object{.string}` (section 11) rather
-   than through the buffer convention READ/WRITE_BYTES and JSON_PARSE share,
-   since there's no destination buffer here for it to fill.
-
-   THE ENCODER IS A RECURSIVE WALK OVER `Value`, THE MIRROR IMAGE OF
-   `convert`'s WALK OVER `std.json.Value` (section 12). `src/json.zig`'s
-   `stringify` walks `v` directly — INT/FLOAT print as JSON numbers, BOOL as
-   `true`/`false`, NULL as `null`, and OBJECT's `.list`/`.map` payloads
-   recurse with `[...]`/`{"k":v,...}` punctuation — needing no intermediate
-   `std.json.Value` tree the way `parse` needs one on the way in, since
-   JSON_STRINGIFY only ever produces text, never Butter heap objects, as it
-   goes.
-
-   STRING ESCAPING IS `std.json`'S JOB, NOT A HAND-WRITTEN ONE — THE SAME
-   SPLIT `parse` ALREADY MAKES. Both `Value.string` (borrowed) and
-   `Object{.string}` (heap) leaves go through `std.json.Stringify.
-   encodeJsonString`, which handles quote/backslash/control-character
-   escaping (and surrounds the result in quotes) exactly as any other
-   `std.json` consumer gets it, rather than JSON_STRINGIFY reimplementing
-   that escaping table itself.
-
-   NOT THE SAME RENDERING `PRINT` USES, ON PURPOSE. `Value.print` (section
-   2) already renders a list/map in JSON-*shaped* syntax for human-readable
-   output, but writes a string element as bare `"{s}"` with no escaping at
-   all — correct only because `print`'s own job is producing text for a
-   person to read, never text meant to be re-parsed. JSON_STRINGIFY exists
-   specifically to produce text a `json(...)` call elsewhere can read back,
-   so it cannot share `print`'s implementation; `src/json.zig`'s `write`
-   helper is a second, independent renderer that happens to agree with
-   `print` on every value kind's *shape* while differing on every string
-   leaf's *content*.
-
-   A STREAM OR ARRAY REFERENCE IS `RuntimeError.TypeMismatch`, THE SAME
-   BARE-TAG CONVENTION MAP_HAS/LIST_PUSH ALREADY USE FOR A WRONG-KIND
-   OPERAND (section 11) — no `Vm.diagnostic`, since "value has no JSON
-   representation" is everything there is to say. `src/json.zig` reports
-   this to the VM as `error.Unstringifiable`, collapsed to `TypeMismatch` at
-   the JSON_STRINGIFY handler exactly as `error.JsonParseFailed` collapses
-   to `JsonParseFailed` at JSON_PARSE's.
-
-   `stringify` IS A SPECIAL FORM FOR A DIFFERENT REASON THAN `json` IS.
-   `json`'s result type isn't knowable until its bytes are read (section 12)
-   — that's what rules out an ordinary `func`. `stringify`'s result type
-   is always `string`, exactly as fixed as any `func`'s declared return
-   type (GRAMMAR.bnf design note 3c); what rules out an ordinary `func`
-   here instead is that nothing in this language lets a `func` body build a
-   `string` a piece at a time — no concatenation, no formatting primitive —
-   the way JSON_STRINGIFY's own recursive walk needs. So it's parsed like
-   `json`/`len`/`read`/`write`/`open` regardless — a keyword `<atom>`
-   recognizes directly, not a CALL.
+   `stringify(value)` adds JSON_STRINGIFY, the reverse: a recursive walk
+   over `Value` (INT/FLOAT as JSON numbers, BOOL as true/false, NULL as
+   null, OBJECT's list/map payloads as `[...]`/`{"k":v,...}`) producing a
+   fresh string value instead of consuming one. String escaping goes through
+   `std.json.Stringify.encodeJsonString` — unlike `Value.print`'s
+   human-readable rendering (bare, unescaped, meant for a person to read),
+   this properly escapes quote/backslash/control characters so the result
+   round-trips through `json(...)`. A stream or array reference has no JSON
+   representation: `src/json.zig` reports `error.Unstringifiable`, collapsed
+   to `RuntimeError.TypeMismatch` at the JSON_STRINGIFY handler. `stringify`
+   is a special form for a different reason than `json` is — its result
+   type (`string`) IS fixed, same as any `func`'s declared return type; what
+   rules out an ordinary `func` here is that nothing else in the language
+   lets a `func` body build a string a piece at a time.
    ========================================================================== *)

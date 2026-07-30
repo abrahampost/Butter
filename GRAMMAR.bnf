@@ -1,11 +1,8 @@
 (* ==========================================================================
    Butter — Context-Free Grammar (BNF/EBNF)
-   Originally derived from the recursive-descent parser in parser.go, the
-   lexer in tokenizer.go, and the AST node definitions in stmt.go / expr.go
-   at https://github.com/abrahampost/butter — since revised to smooth over
-   a handful of parser quirks in favor of more conventional language design
-   (see section 3). The reference implementation does not yet match this
-   version in every respect; section 3 spells out exactly where it diverges.
+   The syntax spec for the Butter language, implemented by src/lexer.zig,
+   src/parser.zig, and src/ast.zig. See ISA.bnf for the compiled bytecode
+   target this grammar lowers to.
 
    Notation:
      ::=        "is defined as"
@@ -35,8 +32,6 @@ STRING       ::= '"' { any character except '"' } '"'
 NEWLINE      ::= '\n'
 EOF          ::= (* end of input *)
 
-(* Reserved words — matched as keywords instead of IDENTIFIER when the
-   scanned identifier text matches exactly: *)
 KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'true' | 'false' | 'int' | 'float' | 'bool' | 'string'
                | 'func' | 'return' | 'for' | 'in' | 'import' | 'export'
@@ -45,27 +40,19 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'map' | 'list' | 'push' | 'keys' | 'has' | 'delete'
                | 'json' | 'stringify' | 'null'
 
-(* Operators and punctuation *)
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
                | '!' | '!=' | '==' | '<' | '<=' | '>' | '>=' | ':' | ':='
                | '->' | ',' | '..'
 
-(* Notes on lexing:
-   - Whitespace (space, tab, '\r') is discarded; '\n' is significant (NEWLINE).
-   - '#' starts a comment that runs through (but does not include) the next
-     '\n' (or EOF, if there is no further '\n'); the comment's own text is
-     discarded exactly like other insignificant whitespace, but the '\n'
-     terminating it is still scanned as its own NEWLINE token immediately
-     after. A comment does not nest and is not recognized inside a STRING.
-   - '=' must always be followed by '=' (producing '=='); a lone '=' is a
-     lexer error. ':' is different: ':=' is still its own single token, but
-     a lone ':' is legal on its own too, as the separator between a map
-     literal's key and its value (design note 3m) — unlike '=', there was
-     no existing meaning a lone ':' would ambiguously collide with. A lone
-     '.' is still a lexer error — the only thing '.' is ever part of is the
-     two-character '..' range operator.
-*)
+(* Whitespace (space, tab, '\r') is discarded; '\n' is significant (NEWLINE).
+   '#' starts a comment through (not including) the next '\n' or EOF; the
+   terminating '\n' is still scanned as its own NEWLINE. Comments don't nest
+   and aren't recognized inside a STRING. A lone '=' or '.' is a lexer
+   error — '=' must be followed by '=', and '.' only ever appears as part
+   of '..'. ':' can stand alone (a map literal's key/value separator); ':='
+   is its own two-character token. STRING has no escape-sequence syntax:
+   `"a\nb"` is the four literal characters a, \, n, b, never a newline. *)
 
 
 (* --------------------------------------------------------------------------
@@ -74,11 +61,8 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <program>          ::= { NEWLINE } { <top-level-decl> { NEWLINE } }
 
-(* <function-decl> and <import-decl> are only reachable from here, never
-   from <declaration> — that's the entire mechanism keeping functions
-   non-nestable and imports out of block/if/while bodies: a function
-   body's own statements only ever recurse through <declaration>, which
-   has no path back to either. See design notes 3b and 3h. *)
+(* Functions and imports are top-level only — never reachable from inside a
+   block/if/while/function body. *)
 <top-level-decl>    ::= <import-decl>
                       | [ 'export' ] <function-decl>
                       | <declaration>
@@ -90,15 +74,9 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <for-stmt>
                       | <statement>
 
-(* 'export' is only ever legal directly before 'func' — 'export int x' is
-   a parse error, not a quietly-ignored no-op (design note 3h). A
-   parameter's or the return type's optional array suffix opts it into an
-   array instead of a plain scalar — '[' INT ']' for a fixed size (passed
-   by VALUE, a copy) or bare '[' ']' for a generic/unsized array (passed by
-   REFERENCE instead) — see design note 3e, updated twice now: arrays cross
-   a call boundary at all, and (note 3e's "j" addendum) a size-less `[]`
-   form exists specifically so a function doesn't have to be written once
-   per array length. *)
+(* A parameter's or the return type's array suffix is '[' INT ']' (fixed
+   size, passed by value) or bare '[' ']' (generic/unsized, passed by
+   reference — section 3). *)
 <function-decl>     ::= 'func' IDENTIFIER '(' [ <param-list> ] ')'
                          '->' <type> [ '[' [ INT ] ']' ] <block>
 
@@ -106,18 +84,11 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <param>             ::= <type> [ '[' [ INT ] ']' ] IDENTIFIER
 
-(* `path` is an arbitrary STRING, resolved relative to the *importing*
-   file's own directory (design note 3h) — never relative to the entry
-   program, and never a language-level module name/namespace. *)
+(* `path` resolves relative to the IMPORTING file's own directory. *)
 <import-decl>       ::= 'import' STRING <end>
 
-(* The optional '[' INT ']' is what makes this an array declaration
-   instead of a plain scalar one — see design note 3e. INT here must be a
-   literal (the array's size is always known at compile time), not an
-   arbitrary <expression>. It never applies when <type> is 'map' or 'list'
-   — a map/list declaration is always exactly one value, never a run of
-   raw slots (design note 3m) — so `map[3] m` is a parse error: the array
-   suffix is simply never attempted after a 'map'/'list' type token. *)
+(* The array suffix's INT is always a literal (never `map`/`list`, which are
+   always exactly one value, never a run of raw slots). *)
 <var-declaration>   ::= <type> [ '[' INT ']' ] IDENTIFIER
                          [ ':=' <expression> ] <end>
 
@@ -127,14 +98,10 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <if-stmt>           ::= 'if' <expression> <declaration> { NEWLINE } [ 'else' <declaration> ]
 
-<while-stmt>         ::= 'while' <expression> <declaration>
+<while-stmt>        ::= 'while' <expression> <declaration>
 
-(* Always ascending, always step 1, end exclusive — see design note 3f.
-   `start`/`end` are arbitrary expressions, each evaluated exactly once at
-   loop entry rather than re-evaluated per iteration. IDENTIFIER
-   introduces a fresh int variable scoped to the loop (shadowing an outer
-   variable of the same name is allowed, same as any other declaration —
-   ISA.bnf section 5), not a reference to an existing one. *)
+(* Always ascending, step 1, end exclusive. `start`/`end` are each evaluated
+   once at loop entry. IDENTIFIER introduces a fresh loop-scoped int. *)
 <for-stmt>          ::= 'for' IDENTIFIER 'in' <expression> '..' <expression>
                         <declaration>
 
@@ -145,68 +112,43 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <print-stmt>        ::= 'print' <expression> <end>
 
-(* A statement, not an expression — closing produces no value to use, the
-   same shape (and reason) <print-stmt> has. See design note l. *)
 <close-stmt>        ::= 'close' <expression> <end>
 
-(* Legal anywhere a <statement> is (including nested inside a function
-   body's own if/while/block), but a semantic error — not a parse error —
-   outside a function body altogether; see design note 3c. *)
+(* Legal anywhere a <statement> is, but a semantic error outside a function
+   body. *)
 <return-stmt>       ::= 'return' <expression> <end>
 
 <expr-stmt>         ::= <expression> <end>
 
 <end>               ::= NEWLINE | EOF
-                      | ε   (* only when the next token is '}' — lets a
-                               block's final statement omit its terminator,
-                               e.g. '{ print 1 }' on one line *)
+                      | ε   (* only immediately before a block's closing '}' *)
 
 
 (* ---- Expressions, lowest to highest precedence ------------------------- *)
 
 <expression>        ::= <assignment>
 
-(* The second form is recognized after the fact, not predictively: the
-   parser parses a general <expression> first, and only afterward — if a
-   ':=' actually follows — checks whether what it parsed has the shape of
-   a bare identifier or a <primary> ending in a '[' <expression> ']' suffix,
-   reinterpreting it as an assignment target if so (design note 3m; this is
-   exactly how the bare-IDENTIFIER case already worked before maps/lists
-   existed, just now covering a `<primary>` base instead of only IDENTIFIER
-   directly). Anything else left of ':=' is a parse error either way. *)
+(* Recognized after the fact: the parser parses a general <expression>
+   first, then reinterprets it as an assignment target if ':=' follows and
+   it has the right shape (a bare identifier, or a <primary> ending in a
+   '[' <expression> ']' suffix). *)
 <assignment>        ::= IDENTIFIER ':=' <assignment>
                       | <primary> '[' <expression> ']' ':=' <assignment>
                       | <logic-or>
 
 <logic-or>          ::= <logic-and> { 'or' <logic-and> }
-
 <logic-and>         ::= <equality> { 'and' <equality> }
-
 <equality>          ::= <comparison> { ( '==' | '!=' ) <comparison> }
-
 <comparison>        ::= <exponent> { ( '>' | '>=' | '<' | '<=' ) <exponent> }
-
 <exponent>          ::= <addition> { '**' <addition> }
-
 <addition>          ::= <multiplication> { ( '+' | '-' ) <multiplication> }
-
 <multiplication>    ::= <unary> { ( '*' | '/' | '%' ) <unary> }
-
 <unary>             ::= ( '!' | '-' ) <unary>
                       | <primary>
 
-(* <primary>'s postfix '[' <expression> ']' suffix is what lets bracket
-   indexing CHAIN (`doc["a"]["b"]`, design note 3m) — applied uniformly
-   after ANY <atom>, not just IDENTIFIER. A shape that doesn't actually
-   name something indexable (`5[0]`) isn't rejected here, in the grammar —
-   it's rejected later, by the compiler (a statically-known non-array/
-   collection bare local) or the VM (`RuntimeError.TypeMismatch` for
-   anything else), the same "checked, not trusted" stance the rest of this
-   language already takes rather than a grammar-level restriction. A FIXED
-   or GENERIC array (design notes 3e/3j) is the one exception that still
-   can't chain in practice — its element is always scalar, so indexing
-   further only ever reaches the VM's own runtime type check, never a
-   second array/list/map layer. *)
+(* The postfix '[' <expression> ']' suffix applies after any <atom>, which
+   is what lets indexing chain (`doc["a"]["b"]`). A shape that isn't
+   actually indexable (`5[0]`) is rejected by the compiler or VM, not here. *)
 <primary>           ::= <atom> { '[' <expression> ']' }
 
 <atom>              ::= INT
@@ -233,630 +175,139 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | IDENTIFIER
 
 <call-expr>         ::= IDENTIFIER '(' [ <arg-list> ] ')'
-
 <arg-list>          ::= <expression> { ',' <expression> }
 
-(* Doubles as a `list` initializer (design note 3m) — this production is
-   unchanged either way; only the compiler's handling of it differs based
-   on what's being initialized. Beyond a fixed-array-initializer position,
-   a bracketed literal now always means "build a list" (design note 3m)
-   rather than being a compile error, the one place this grammar's
-   original "no nested/chained indexing" story (design note 3e) actually
-   changes: a LIST can hold another list/map as an element, so a list of
-   lists is fully expressible — just never through this `[N]`-suffix array
-   syntax, only through nesting two list/map values themselves. *)
+(* A fixed-array initializer wherever one's expected; otherwise builds a
+   `list`. *)
 <array-literal>     ::= '[' [ <expression> { ',' <expression> } ] ']'
 
 (* Keys are STRING tokens (static text), not arbitrary expressions — a
-   dynamic key remains fully expressible via `m[expr] := v` once the map
-   exists. Never ambiguous with <block> (which also starts with '{'): a
-   block is only ever reached in statement position, a map literal only in
-   expression position, so the parser never has to disambiguate the two at
-   the same decision point. *)
+   dynamic key is still reachable via `m[expr] := v` once the map exists. *)
 <map-literal>       ::= '{' [ <map-entry> { ',' <map-entry> } ] '}'
 <map-entry>         ::= STRING ':' <expression>
 
-(* Relaxed from a bare IDENTIFIER (design note 3m) now that a map/list is a
-   genuine first-class runtime value. A bare identifier naming a fixed or
-   generic array still gets the exact same compile-time-constant-fold /
-   runtime-length-read treatment as before (arrays still aren't first-class,
-   design note 3e) — that's now a compiler-level pattern match on the
-   parsed shape, not a parser-level restriction; anything else compiles as
-   an ordinary expression, checked at run time. *)
+(* On a bare identifier naming a fixed/generic array, resolves at compile
+   time (ISA.bnf section 2); otherwise a runtime read of a map/list's size. *)
 <len-expr>          ::= 'len' '(' <expression> ')'
 
-(* Byte-stream I/O — see design note 3k. `stdin`/`stdout`/`stderr` are bare
-   keywords (matched by <primary> directly, above) that evaluate to a
-   stream; `read`/`write`'s stream position is an arbitrary <expression>,
-   not restricted to those three keywords, so an opened file (<open-expr>,
-   design note 3l) works anywhere one of them does. Direction (read vs.
-   write) is checked at compile time only when the stream expression IS one
-   of those three keywords — the one case where which stream is meant is
-   truly known at compile time (`CompileError.WrongStreamDirection`); for
-   any other stream expression it is checked at run time instead, since a
-   file's own direction depends on how it was opened. *)
-
-(* Reads up to `len(IDENTIFIER)` bytes into that buffer and evaluates to
-   how many were actually read — 0, and only 0, at end of input. The
-   destination is a bare array name — arrays still aren't first-class
-   values to read into, design note 3e — the one restriction `<len-expr>`
-   no longer shares now that a map/list is a first-class runtime value. *)
+(* Byte-stream I/O (section 3). `stdin`/`stdout`/`stderr` are bare keywords
+   evaluating to a stream; `read`/`write`'s stream position is any
+   <expression>, so an opened file works anywhere one of them does. *)
 <read-expr>         ::= 'read' '(' <expression> ',' IDENTIFIER ')'
 
-(* Two forms, told apart by argument count alone. The two-argument form
-   writes an arbitrary value rendered exactly as 'print' renders it but
-   with NO trailing newline; the three-argument form writes the first
-   <expression> bytes of a buffer, the inverse of <read-expr>. Either way
-   the result is the number of bytes written. *)
 <write-expr>        ::= 'write' '(' <expression> ',' <expression> ')'
                       | 'write' '(' <expression> ',' IDENTIFIER ',' <expression> ')'
 
-(* Files — see design note 3l. Opens `path` (an arbitrary STRING-valued
-   expression) in the given mode and evaluates to a stream, usable
-   anywhere <read-expr>/<write-expr>/<close-stmt> accept one. The mode is
-   a bare keyword, not an expression — a file's direction is always known
-   at compile time even though the stream value naming it isn't.
-   'read'/'write'/'append' double as mode keywords here with no ambiguity,
-   since this position only ever accepts a mode. *)
 <open-expr>         ::= 'open' '(' <expression> ',' <open-mode> ')'
-
 <open-mode>         ::= 'read' | 'write' | 'append'
 
-(* Maps and lists — see design note 3m. All four take arbitrary
-   <expression>s, not bare identifiers: a map/list is a genuine first-class
-   runtime value, unlike the array-era primitives above that are restricted
-   to a name because arrays aren't first-class (design note 3e). *)
-
-(* Grows `list` by one element, evaluating to its new length (mirroring
-   <write-expr>'s "evaluates to a count" convention). *)
 <push-expr>         ::= 'push' '(' <expression> ',' <expression> ')'
-
-(* A fresh `list` of `map`'s own keys, in insertion order — how map/list
-   iteration works (`for i in 0..len(ks) { ... }`) instead of a dedicated
-   foreach form (design note 3g already declines one). *)
 <keys-expr>         ::= 'keys' '(' <expression> ')'
-
-(* Whether `key` is present in `map`, without the runtime error a
-   bracket-read raises for a missing one. *)
 <has-expr>          ::= 'has' '(' <expression> ',' <expression> ')'
-
-(* Removes `key` from `map` if present, evaluating to whether it was. *)
 <delete-expr>       ::= 'delete' '(' <expression> ',' <expression> ')'
 
-(* JSON — see design note 3n. Parses the first `count` bytes of an `int`
-   buffer as JSON text and evaluates to whatever the document's root turns
-   out to be. `buffer` is a bare array name, the same restriction
-   <read-expr>'s destination has and for the same reason (design note 3e). *)
 <json-expr>         ::= 'json' '(' IDENTIFIER ',' <expression> ')'
-
-(* The reverse of <json-expr> — see design note 3o. Renders `value` (an
-   arbitrary expression, unlike <json-expr>'s buffer) as JSON text and
-   evaluates to a `string`. *)
 <stringify-expr>    ::= 'stringify' '(' <expression> ')'
 
 
 (* --------------------------------------------------------------------------
-   3. DESIGN NOTES
+   3. DESIGN NOTES — load-bearing rules the grammar alone doesn't capture
    -------------------------------------------------------------------------- *)
 
-(* --- Quirks fixed relative to the original reference implementation ----
+(* --- Functions ---
+   - No nesting, no closures: a function body resolves only its own
+     parameters and locals, never a top-level or enclosing variable.
+   - Every function declares a return type and always returns one — no
+     'void'. Falling off the end without `return` yields the declared
+     type's zero value; there is no "did every path return?" check.
+   - A call's argument COUNT must match the callee's parameter count
+     exactly; argument types are not checked (no static type checking
+     anywhere in this language). *)
 
-   a) No arrays/collections, no 'switch' construct, and no unary '+'.
-      These are simply absent from the grammar today; adding them is a
-      language-growth task, not a fix. (Function/procedure declarations
-      used to be listed here too — see notes b/c below for how they were
-      added and what stayed deliberately restricted; arrays and maps/lists
-      likewise moved out from here as they were added — see notes e and m.)
-   -------------------------------------------------------------------- *)
+(* --- Arrays ---
+   - Fixed size only, no nesting: an array's size is a compile-time INT
+     literal, and an array's element type is always a plain scalar.
+   - Crosses a call boundary by VALUE (a copy) unless declared with a bare
+     '[]' suffix, which makes it GENERIC: passed by reference (one
+     `ArrayRef{base, len}` runtime value — ISA.bnf section 2) instead. A
+     generic reference may only be returned if it was received as-is (a
+     parameter, or forwarded from a nested call) — never one synthesized
+     from this function's own locals, since that would point into a frame
+     about to be discarded (`CompileError.EscapingArrayReference`).
+   - Indexing is bounds-checked at runtime (`RuntimeError.IndexOutOfBounds`).
+   - `len(arr)` on a bare fixed-array identifier is a compile-time constant;
+     on a generic one it's a runtime field read (ISA.bnf section 2). *)
 
-(* --- Functions (language-growth addition, not a "fix") -----------------
+(* --- Byte-stream I/O ---
+   - `read`/`write` move raw bytes between a stream and an `int` array (one
+     byte per element, 0..255) — arrays are the language's only unallocated
+     I/O destination, so this is what lets a read fill a buffer without
+     touching the heap.
+   - `read(stream, buf)` is a SHORT read (POSIX-style): at least 1 byte and
+     at most `len(buf)`, 0 only at end of input; it never loops to fill the
+     buffer.
+   - `write` has two forms: `write(stream, value)` renders a value exactly
+     like `print` but with no trailing newline; `write(stream, buf, n)`
+     writes the first `n` bytes of a buffer. Both evaluate to a byte count. *)
 
-   b) NO NESTING, NO CLOSURES. <function-decl> is reachable only from
-      <top-level-decl>, never from <declaration> — so a function can't be
-      declared inside a block/if/while body, and a function body can't
-      declare another function. There is deliberately no mechanism for a
-      function body to read or write a top-level variable either: name
-      resolution inside a function body only ever considers that
-      function's own parameters and its own locally-declared variables
-      (see ISA.bnf section 5 for why — it falls straight out of the
-      call-frame model, not an arbitrary restriction bolted on top).
+(* --- Files ---
+   - `open(path, mode)` evaluates to a stream, usable anywhere
+     `stdin`/`stdout`/`stderr` are. `mode` is a bare keyword ('read'
+     requires the file to exist; 'write' truncates or creates; 'append'
+     creates or seeks to the current end) — fixed at compile time even
+     though whether `open` actually succeeds isn't.
+   - `close` is a statement, not an expression. Closing one of the three
+     standard streams is rejected (at compile time when the stream is a
+     literal keyword, at runtime otherwise); every file still open when the
+     program halts is flushed and closed automatically.
+   - A relative path resolves against the process's current directory, not
+     any source file's own directory (unlike `import`, below). *)
 
-   c) EVERY FUNCTION MUST DECLARE A RETURN TYPE, AND ALWAYS RETURNS ONE.
-      There is no 'void'/unit type. `return` requires an expression
-      (unlike, say, an empty `return;`); and if control falls off the end
-      of a function body without hitting an explicit `return`, the
-      compiler implicitly returns the declared return type's zero value
-      — the same value a var-declaration without an initializer gets. This
-      means there is intentionally no "did every path return?" static
-      check; that's a semantic-analysis pass this compiler doesn't attempt
-      (matching ISA.bnf section 1's broader no-type-checking stance).
+(* --- Maps and lists ---
+   - `map`/`list` are first-class heap values (ISA.bnf section 11):
+     `b := a` where `a` is a list makes `b` an alias of the same list, and
+     mutation through one is visible through the other. Nesting is free —
+     a list of maps, a map of lists — since it's just one heap object
+     holding values that happen to be other heap objects.
+   - Bracket indexing (get and set) reuses the existing postfix `[...]`
+     syntax; a list index must be an in-bounds INT, a map index any
+     string value (insert-or-update on write, `RuntimeError.KeyNotFound` on
+     a missing read).
+   - `push(list, v)` grows a list by one, returning its new length. There is
+     no way to remove a list element in this pass.
+   - `keys(m)` returns a fresh list of a map's own keys in insertion order —
+     the only way to iterate a map (there is no dedicated foreach form;
+     `for i in 0..len(ks) { ks[i] ... }` covers both).
+   - `has(m, k)` / `delete(m, k)` check/remove without the error a bracket
+     read/write would otherwise raise. *)
 
-   d) ARITY IS CHECKED, TYPES ARE NOT. A call must supply exactly as many
-      arguments as the callee declares parameters — this is required
-      structurally, to know how many stack slots the callee's frame
-      reserves for them (ISA.bnf section 6), not an optional pedantic
-      check. Argument *types* are not checked against parameter types,
-      consistent with the rest of the language having no static type
-      checking.
-   -------------------------------------------------------------------- *)
+(* --- JSON ---
+   - `json(buf, count)` parses `count` bytes of an `int` buffer as JSON text
+     and evaluates to whatever the document's root turns out to be (number,
+     bool, null, string, list, or map) — a special form, not an ordinary
+     `func`, because its result type isn't fixed at compile time. Malformed
+     input is `RuntimeError.JsonParseFailed`.
+   - `stringify(value)` is the reverse: renders any value as JSON text,
+     properly escaped so it round-trips through `json(...)` (unlike
+     `Value.print`'s human-readable rendering). A stream or array reference
+     has no JSON representation (`RuntimeError.TypeMismatch`). It's a
+     special form because nothing else in the language lets a `func` build
+     a string a piece at a time. *)
 
-(* --- Arrays (language-growth addition, not a "fix") ---------------------
+(* --- The for-loop ---
+   - Range-based only (`for v in start..end body`) — no C-style
+     three-clause form, no descending range, no custom step. Sugar over the
+     same while-loop pattern every other loop compiles to. *)
 
-   e) FIXED SIZE, NO NESTING, PASSED BY VALUE ACROSS A CALL BOUNDARY. An
-      array's size is a compile-time-known INT literal, not an arbitrary
-      expression — arrays never grow, shrink, or get reallocated at runtime
-      (ISA.bnf section 2 explains why: they're just consecutive stack
-      slots, and there is still no heap or garbage collector anywhere in
-      this VM). There is no array-of-arrays (an array's element type is
-      always a plain scalar type). An array literal (`[e1, e2, ...]`) is
-      only valid as the initializer of an array declaration whose declared
-      size matches the literal's element count exactly; using one anywhere
-      else (as a bare expression, a call argument, and so on) is a compile
-      error, the same category of error as an arity mismatch.
-
-      A function parameter or return type may likewise opt into a
-      fixed-size array via the same `'[' INT ']'` syntax (<param>,
-      <function-decl>), and arrays DO cross a call boundary — by value,
-      as a copy, never by reference: the callee gets its own independent
-      slots, so mutating a parameter array inside the callee never affects
-      the caller's array (ISA.bnf section 6 covers the calling-convention
-      mechanics). Because arrays still aren't first-class expressions,
-      wherever an array VALUE is needed — a call argument matching an
-      array-typed parameter, a `return` inside a function with an array
-      return type, or the initializer of an array var-declaration — the
-      expression there is restricted to exactly two forms: a bare
-      IDENTIFIER naming an array of matching length (the same restriction
-      bracket-indexing and `len` already place on a FIXED/GENERIC array
-      target — notes f and i), or a <call-expr> to a function whose own
-      return type is an array of matching length. This is what lets
-      array-processing functions compose (`sum(doubleAll(nums))`) without
-      arrays ever needing to be a general expression form.
-
-   e2) ARITY COUNTS PARAMETERS, NOT STACK SLOTS. Design note d's "supply
-      exactly as many arguments as the callee declares parameters" still
-      counts declared parameters one-for-one with arguments — an
-      array-typed parameter is still exactly one parameter for arity
-      purposes, even though it occupies more than one stack slot at
-      runtime (ISA.bnf section 6 draws that distinction explicitly).
-
-   f) ARRAY INDEXING IS BOUNDS-CHECKED, NOT TRUSTED. Reading or writing
-      `arr[i]` checks `i` is an INT and that `0 <= i < <declared size>` at
-      runtime, raising `RuntimeError.IndexOutOfBounds` rather than
-      silently reading/writing whatever stack slot the arithmetic happens
-      to land on — unlike, say, a scalar-only VM, an out-of-bounds array
-      access here would otherwise corrupt an arbitrary neighboring local
-      (possibly belonging to a different call frame entirely), so this
-      check is load-bearing for memory safety, not a nicety.
-
-   i) `len(arr)` ON A FIXED ARRAY IS A COMPILE-TIME CONSTANT, NOT A RUNTIME
-      QUERY. Because an array's size can never change after its
-      declaration (note e above), `len(arr)` needs no runtime
-      representation at all when `arr` is a bare IDENTIFIER naming one — it
-      resolves at compile time to the same INT literal the declaration
-      itself used, exactly as if you'd written that literal by hand (see
-      ISA.bnf section 2's array-length addendum), the same bare-IDENTIFIER
-      restriction bracket-indexing places on a FIXED/GENERIC array target
-      (note f) — there is no array-valued expression to call `len` on in
-      the first place, since arrays aren't first-class values (note e).
-      `len`'s argument is no longer restricted to that one case, though:
-      see note m for a map/list, where it's a genuine runtime operation
-      instead. This is the building block a hand-written standard-library
-      function needs to loop over an array it's handed the size of without a
-      caller having to pass the size separately — e.g.
-      `for i in 0..len(arr) { ... }` — and combined with note e's
-      by-value call-boundary passing, this is enough to write and compose
-      real array-processing functions, e.g. `sum(doubleAll(nums))` — as
-      long as every such function is written once per fixed size it
-      accepts. Note j lifts that last restriction.
-
-   j) A BARE '[]' PARAMETER OR RETURN TYPE IS GENERIC (NO FIXED SIZE) AND
-      PASSED BY REFERENCE, NOT BY VALUE. `func sum(int[] arr) -> int` binds
-      `arr` to WHATEVER array the caller actually passes, of whatever
-      length it happens to have — unlike note e's fixed-size arrays, a
-      generic array parameter is not a copy: it's a single runtime
-      reference (`ArrayRef{base, len}`, ISA.bnf section 6's generic-array
-      addendum) pointing at the caller's own slots, so `len(arr)` becomes a
-      genuine runtime read for a generic array (not the compile-time
-      constant note i describes for a fixed-size one) and mutating
-      `arr[i]` IS visible to the caller — the one place in this language
-      two names can alias the same storage. This is what makes a single
-      `sum`/`doubleAll`/etc. usable across arrays of different sizes
-      without note e's one-specialization-per-size limitation, and it does
-      so without ever introducing a heap: a reference only ever points
-      into the same fixed VM value-stack every other local already lives
-      on.
-
-      References compose but are NOT interchangeable with fixed-size
-      arrays: a call argument or `return` that needs a fixed size (note e)
-      cannot be satisfied by a generic array — its length isn't known at
-      compile time, so there is nothing to check the required size
-      against — but any array, fixed or generic, CAN be handed to a
-      generic parameter (a fixed one is automatically turned into a fresh
-      reference at the call site; a generic one is simply forwarded).
-
-      RETURNING A GENERIC ARRAY IS RESTRICTED TO WHAT'S PROVABLY SAFE. A
-      function may only `return` a generic array it did not itself
-      manufacture: a bare reference to one of its own GENERIC parameters
-      (or a nested call's own generic return, transitively), never a fresh
-      reference synthesized from one of its own fixed-size locals — even
-      one of its own fixed-size PARAMETERS. The reason is aliasing plus
-      this VM's frame-reuse: a freshly-made reference always points into
-      the CURRENT frame, which is exactly the frame about to be discarded
-      (its slots reused by whoever the caller calls next) the instant this
-      function returns — so returning one would hand the caller a
-      reference that goes stale the moment they receive it. A reference
-      that was already handed to this function as a generic parameter,
-      by contrast, points into some ANCESTOR frame further up the call
-      stack that is still alive and will remain alive for as long as this
-      function's own caller is (calls only ever nest, never overlap), so
-      forwarding it back out is always sound. Violating this — e.g.
-      `func bad() -> int[] { int[3] x := [1,2,3]  return x }` — is a
-      compile error (`CompileError.EscapingArrayReference`), not a runtime
-      one: the whole point is to catch it before it could ever produce a
-      dangling reference, the same "checked, not trusted" spirit as note f.
-   -------------------------------------------------------------------- *)
-
-(* --- Byte-stream I/O (language-growth addition, not a "fix") ------------
-
-   k) I/O IS BYTES INTO AND OUT OF A BUFFER, NOT STRINGS. `read` and
-      `write` are the language's only I/O beyond `print`, and they move
-      raw bytes between one of the three standard streams and an ordinary
-      `int` array — one byte per element, as an INT in 0..255. This is not
-      an arbitrary choice of API: a string-returning `readLine()` would
-      have to allocate storage for a string that did not exist at compile
-      time, and this language deliberately has no heap, no garbage
-      collector, and no string type that owns its bytes (ISA.bnf section 2 —
-      every STRING value is a borrowed slice of a compile-time literal).
-      Reading into a buffer the program already declared needs no
-      allocation at all: the destination slots exist before the read does.
-      That is the whole reason the unit of I/O here is a byte buffer rather
-      than a string.
-
-      `read(stdin, buf)` performs a SHORT read, exactly like POSIX
-      `read(2)`: it returns at least 1 and at most `len(buf)` bytes, and
-      returns 0 only at end of input. It deliberately does NOT loop until
-      the buffer is full — an interactive program has to be able to act on
-      the line the user just typed without waiting for enough further input
-      to fill the rest of the buffer. Copying an input of unknown length
-      therefore always means a loop:
-
-          int[64] buf
-          int n := read(stdin, buf)
-          while n > 0 {
-              write(stdout, buf, n)
-              n := read(stdin, buf)
-          }
-
-      Slots past the returned count are left exactly as they were, so a
-      short read never clobbers the remainder of the buffer.
-
-      `write` HAS TWO FORMS BECAUSE THERE ARE TWO THINGS WORTH WRITING.
-      `write(stdout, expr)` writes a *value* — rendered identically to how
-      `print` renders it, but with no trailing newline, which is the entire
-      difference between the two and what makes building up a line piece by
-      piece possible (`write(stdout, x)  write(stdout, " ")  print y`).
-      `write(stdout, buf, n)` writes the first `n` *bytes* of a buffer, the
-      exact inverse of `read`. Both evaluate to the number of bytes
-      written. An element that isn't an INT in 0..255 is
-      `RuntimeError.ByteOutOfRange` rather than being silently masked to
-      its low 8 bits, and `n` outside `0..len(buf)` is
-      `RuntimeError.IndexOutOfBounds` — the same "checked, not trusted"
-      stance as note f's array bounds.
-
-      A BUFFER IS PASSED THE SAME WAY A GENERIC ARRAY ARGUMENT IS. Both
-      `read` and `write`'s buffer forms accept either kind of array local:
-      a fixed-size one (`int[64] buf`) or a generic one (`int[] buf`, a
-      reference received as a parameter — note 3j). They compile to exactly
-      the reference-passing the call boundary already used, which is why an
-      I/O helper can be written once and used with buffers of any size:
-
-          func fill(int[] b) -> int { return read(stdin, b) }
-
-      Because a generic array is a reference into the caller's own slots
-      rather than a copy, the bytes such a helper reads are visible to its
-      caller after it returns — the same aliasing note 3j already
-      describes, now doing real work.
-
-      A STREAM USED TO BE COMPILE-TIME-ONLY; A FILE MADE IT A RUNTIME VALUE
-      TOO (see design note l for why and how). `stdin`/`stdout`/`stderr`
-      are still bare keywords, and using one of them directly still gets
-      its direction checked at compile time exactly as before
-      (`CompileError.WrongStreamDirection`) — that part of the design costs
-      the language nothing, since a program that genuinely wants to pick
-      between two streams still writes an `if`. What changed is that
-      `read`/`write`'s stream position is no longer restricted to only
-      those three keywords: it's an arbitrary <expression>, because `open`
-      (design note l) can hand back a stream whose direction depends on
-      something only known at run time (which mode it was opened with) —
-      the compiler simply can't check that case statically, so the VM
-      checks it instead (`RuntimeError.StreamNotReadable`/
-      `StreamNotWritable`). This is a necessary relaxation, not a design
-      retreat: a variable, an `if`, or a function parameter can now hold or
-      forward a stream exactly like any other value, but a literal
-      `stdin`/`stdout`/`stderr` keyword use is exactly as restricted, and
-      exactly as cheaply checked, as it always was.
-
-      NO ESCAPE SEQUENCES, SO A NEWLINE IS A BYTE. STRING (section 1) still
-      has no escape syntax, so `write(stdout, "a\nb")` writes a literal
-      backslash and `n` — not a newline. A program that needs a raw newline
-      mid-output either uses `print` (which appends one) or writes the byte:
-      `int[1] nl := [10]  write(stdout, nl, 1)`. Adding escape sequences
-      would be a lexical change, not an I/O one, and is left as a separate
-      piece of language growth.
-   -------------------------------------------------------------------- *)
-
-(* --- Files (language-growth addition, not a "fix") ----------------------
-
-   l) A STREAM BECOMES A RUNTIME VALUE THE MOMENT A FILE CAN PRODUCE ONE.
-      `open(path, mode)` opens `path` (an arbitrary STRING-valued
-      expression, not just a literal) and evaluates to a stream — the
-      same kind of thing `stdin`/`stdout`/`stderr` are, but this one can't
-      possibly be a compile-time keyword, since which file (if any) `open`
-      actually manages to open depends on the filesystem at run time. This
-      is the one place note k's original story about streams changes: a
-      stream is no longer ALWAYS a bare keyword resolved at compile time —
-      it can now flow through a variable, an `if`, a function parameter,
-      anywhere any other value can (ISA.bnf section 10 covers the runtime
-      representation this requires). There is still no dedicated stream
-      TYPE keyword in <type>; a variable meant to hold one is simply
-      declared as one of the existing scalar types (in practice always
-      `int`), the same "declared type isn't checked against what's
-      actually stored" latitude every other variable already has (ISA.bnf
-      section 1).
-
-      THREE MODES, ONE OF WHICH DOESN'T TRUNCATE. `read` opens an existing
-      file for reading only (`RuntimeError.FileOpenFailed` if it doesn't
-      exist or can't be opened); `write` creates it, truncating it first
-      if it already exists; `append` opens it for writing starting at its
-      current end rather than at the start, creating it first if it's
-      genuinely absent. Exactly like the mode keyword itself, this choice
-      is fixed at compile time — a file's direction never depends on
-      anything computed at run time, only on which of the three keywords
-      the program's source actually wrote down.
-
-      `close` IS A STATEMENT, NOT AN EXPRESSION — closing produces no
-      value to use, the same shape (and reason) `print` has. Closing one
-      of the three standard streams is refused
-      (`CompileError.CannotCloseStandardStream` when the compiler can tell
-      statically, i.e. a literal `close stdout`/`close stdin`/
-      `close stderr`; `RuntimeError.CannotCloseStandardStream` otherwise,
-      the same compile-time/run-time split note k's direction check has)
-      — those three belong to whoever ran the program, not to the program
-      itself. A program that never gets around to `close`ing a file it
-      opened does not leak it forever: every file still open when the
-      program halts (or fails) is flushed and closed on the way out
-      (ISA.bnf section 10), a safety net for buffered writes reaching disk,
-      not a substitute for writing `close` — there is a fixed limit on how
-      many files may be open AT ONCE (ISA.bnf section 10), so a program
-      that opens many files in a loop without closing each one still fails
-      with `RuntimeError.TooManyOpenFiles`.
-
-      A RELATIVE PATH IS RESOLVED AGAINST THE CURRENT DIRECTORY, NOT ANY
-      SOURCE FILE'S OWN DIRECTORY. This is deliberately different from
-      `import`'s resolution (design note h): `import` is a compile-time
-      concept resolved once, relative to the file that wrote it, so the
-      same program behaves identically regardless of where the process
-      happens to be run from. `open` is a run-time filesystem operation
-      with no notion of "the file that wrote this call" once compiled —
-      the only directory available to resolve a relative path against at
-      that point is the one the whole process is running in, exactly like
-      any other language's `fopen`/`open()`. An embedder that wants a
-      sandboxed program simply doesn't grant it filesystem access at all,
-      in which case `open` fails with `RuntimeError.FilesUnavailable`
-      instead of touching anything on disk.
-   -------------------------------------------------------------------- *)
-
-(* --- Maps and lists (language-growth addition, not a "fix") -------------
-
-   m) THE VM'S FIRST HEAP. Every previous piece of language growth in this
-      document was careful to say some version of "and this still needs no
-      heap" (arrays are consecutive stack slots; a generic array is a
-      reference into the same stack; a stream is an index into a fixed
-      table). Maps and lists are the first values that genuinely can't be
-      represented that way: their size isn't known at compile time, doesn't
-      fit in a fixed number of slots, and can change after they're created.
-      So this is the first feature that gives the VM a real heap and a real
-      allocator — see ISA.bnf section 11 for the refcounted representation
-      this requires, and the accepted tradeoff (a self-referential
-      structure leaks) that comes with it.
-
-      `map` and `list` are new entries in `<type>`, not new suffixes on an
-      existing scalar type the way a fixed/generic array is — a `map`- or
-      `list`-declared local is always exactly one runtime value (a
-      reference to a heap object), never a run of raw stack slots, which is
-      also why neither ever takes the `[N]`/`[]` array suffix
-      `int`/`float`/`bool`/`string` can. Reading/writing an element reuses
-      the EXISTING bracket-indexing syntax (the assignment production's
-      `<primary> '[' <expression> ']' ':=' <assignment>` form, and
-      `<primary>`'s own postfix suffix) rather than adding get/set
-      functions — those productions already accepted an arbitrary
-      `<expression>` inside the brackets, so no grammar change was needed
-      there at all beyond generalizing the indexed thing from a bare
-      IDENTIFIER to any `<primary>` (which is what lets indexing CHAIN,
-      `doc["a"]["b"]`) — only a runtime distinction between "index by INT
-      into a list" and "index by STRING key into a map," which the VM
-      checks regardless of what the compiler expected a given local to hold
-      (the same "declared type isn't checked" latitude every other variable
-      already has, applied here too).
-
-      A map/list value is a REFERENCE TO A SHARED HEAP OBJECT, not a copy:
-      `b := a` where `a` is a list makes `b` an alias of the very same
-      list, and mutating one through `push`/index-assignment is visible
-      through the other — this is deliberately different from a fixed
-      array (always copied, note e) and closer to (but simpler than) a
-      generic array reference (note j). It's simpler because a map/list
-      reference never points into a stack frame that could be torn down
-      while a reference to it still exists — it's a heap allocation with
-      its own independent lifetime (refcounted, freed when the last
-      reference goes away — ISA.bnf section 11) — so, unlike note j's
-      generic array references, there is NO RESTRICTION on returning one,
-      storing one inside another map/list, or handing one to a function and
-      getting it back. Nesting falls out for free: a list of maps, a map of
-      lists, a list of lists are all just ordinary heap objects holding
-      values that happen to be other heap objects — the one place this
-      document's original "no nested/chained indexing" story (note e)
-      genuinely changes, though only through these new heap values, never
-      through the old fixed-slot array mechanism, which stays exactly as
-      restricted as it always was.
-
-      Growing a list is `push(list, value)`, evaluating to the list's new
-      length (mirroring `write`'s "evaluates to a count" convention) rather
-      than being a bracket-assignment, since bracket-assignment on a list
-      still requires an in-bounds index (exactly like an array) — there's
-      no auto-vivifying `xs[len(xs)] := v`. There is deliberately no way to
-      remove an element from a list in this pass (only a map key, via
-      `delete`) — write it another way for now, matching this grammar's
-      existing practice (note g) of declining a feature rather than
-      half-committing to it.
-
-      Iterating a map's keys is `keys(m) -> list`, not new loop syntax —
-      note g already declined to add a foreach form, and this is consistent
-      with that: `for i in 0..len(ks) { ks[i] ... }` over an ordinary list
-      is enough, and keeps `for` exactly the range-based form it's always
-      been. `has(map, key)` answers whether a key is present without
-      raising an error the way reading a missing key does
-      (`RuntimeError.KeyNotFound`) — a map's bracket-read requires
-      existence, the same "checked" stance array bounds have, but
-      `has`/`delete` are explicitly the escape hatch for code that doesn't
-      want that check to be fatal.
-
-      `len(...)` is relaxed from a bare IDENTIFIER to an arbitrary
-      `<expression>`, the same move note k made for `read`/`write`'s
-      stream position once a stream could be a genuine runtime value: a
-      bare fixed- or generic-array name still gets the exact same
-      treatment it always did (a compile-time constant, or a cheap runtime
-      field read — ISA.bnf section 2), because arrays still aren't
-      first-class values (note e is unchanged) — but a map or list
-      genuinely IS one now, so `len` on anything else is a real runtime
-      operation on whatever value it's handed,
-      `RuntimeError.TypeMismatch` if that value turns out not to be a list
-      or a map.
-   -------------------------------------------------------------------- *)
-
-(* --- JSON (language-growth addition, not a "fix") ------------------------
-
-   n) `json(buffer, count)` parses the first `count` bytes of an `int`
-      buffer — a byte buffer, the same convention `read`/`write`'s buffer
-      forms already use (note k), not a STRING — as JSON text, and
-      evaluates to whatever value the document's root turns out to be: a
-      number, a boolean, `null`, a string, a list, or a map. This is
-      deliberately NOT a `func` a program could declare an equivalent of: a
-      `func`'s return type is fixed and declared once (note c) — `int`,
-      `map`, whatever — but a parsed JSON document's root type is only
-      known once the bytes are actually read, which is exactly the kind of
-      genuinely dynamic result this language has otherwise never needed a
-      mechanism for. So `json` is a special form, parsed like
-      `len`/`read`/`write`/`open`, not an ordinary call.
-
-      The buffer-not-string choice also sidesteps a prerequisite this
-      language doesn't otherwise have: there is still no way to turn bytes
-      a program `read` from a file or stream into a Butter STRING value
-      (every STRING used to be a borrowed compile-time literal — ISA.bnf
-      section 2 — and even now that heap strings exist (note m), nothing
-      yet converts a raw byte buffer into one directly). `json` doesn't
-      need that primitive as a stepping stone: it consumes the buffer
-      directly and produces whatever heap strings/maps/lists the
-      document's own string/object/array values require, via the same heap
-      note m already introduced.
-
-      Malformed input is `RuntimeError.JsonParseFailed`, with
-      `Vm.diagnostic` carrying a description of what went wrong — the same
-      side-channel files already established (ISA.bnf section 10) for an
-      error a bare Zig error tag can't carry enough detail for on its own.
-
-   o) `stringify(value)` is `json`'s reverse: it renders ANY value — not
-      just a map/list, any of the six kinds note n) lists — as JSON text and
-      evaluates to a `string`. Unlike `json`, `value`'s TYPE is no obstacle
-      to `stringify` being an ordinary `func` (a `string` return type is
-      just as fixed and declarable as any other — note c); it's a special
-      form anyway, parsed like `json` itself, because nothing in this
-      language lets a `func` build a `string` a piece at a time (no
-      concatenation, no formatting) the way `stringify`'s own recursive
-      walk over a value needs to.
-
-      THIS IS A DEDICATED JSON ENCODER, NOT `print` REPURPOSED. `Value.print`
-      (ISA.bnf section 2) already renders a list/map in JSON-*shaped* syntax
-      for human-readable debug output (`print [1, "a"]` writes `[1, "a"]`),
-      but it does so unescaped — a string containing a `"` or a control
-      character comes out as broken JSON, because `print` exists to be read
-      by a person watching the program run, not re-parsed. `stringify`
-      instead escapes properly (quote, backslash, and control characters —
-      via `std.json.Stringify.encodeJsonString`, the same "let std.json
-      handle the solved problem" split `json` itself already makes for
-      parsing), so what it produces round-trips back through `json(...)`
-      for any string a document could actually contain.
-
-      A STREAM OR ARRAY REFERENCE HAS NO JSON REPRESENTATION. Both are
-      reachable here — `stringify(stdout)` parses, and a stream can end up
-      nested inside a list/map via `push`/`m[k] := stdout` — but JSON has no
-      value for either, so encoding one is `RuntimeError.TypeMismatch`
-      rather than `print`'s `<stdout>`/`<array>` placeholder text; a JSON
-      encoder has no business inventing text that isn't valid JSON.
-   -------------------------------------------------------------------- *)
-
-(* --- The for-loop (language-growth addition, not a "fix") ---------------
-
-   g) RANGE-BASED, NOT C-STYLE. `for v in start..end body` is the only
-      form — there is no three-clause `for (init; cond; post)`. It always
-      counts up by exactly 1 and `end` is always exclusive (Python/Rust
-      `..` convention); there is no descending range and no custom step.
-      This is deliberately just sugar over the same while-loop
-      backpatched-jump pattern every other loop in this language already
-      compiles to (ISA.bnf section 4) — see ISA.bnf section 7 for exactly
-      how it desugars. A foreach-style "for element in array" is a
-      plausible future extension but isn't attempted here; write
-      `for i in 0..n { ... arr[i] ... }` instead.
-   -------------------------------------------------------------------- *)
-
-(* --- import/export (language-growth addition, not a "fix") --------------
-
-   h) FUNCTIONS ONLY, AND ONLY AT THE TOP LEVEL OF AN ENTRY PROGRAM'S OWN
-      GRAPH. `import "path.butter"` pulls in another file's `export`ed
-      functions; only a function-decl can be prefixed with 'export' — a
-      top-level var-declaration can't be exported or imported. This
-      sidesteps a much harder question this language doesn't attempt to
-      answer: what would it even mean to "run" an imported file's own
-      top-level statements (print, while, a var-decl's initializer), and
-      in what order relative to the program that imported it? Rather than
-      inventing module-initialization-order semantics, an imported file is
-      simply not allowed to contain anything at its top level other than
-      more `import`s and function declarations (whether exported or not);
-      a bare statement or var-declaration there is a load error, not a
-      silently-skipped no-op. Only the entry program (the file/stdin
-      program actually passed to the CLI) may have "real" top-level code.
-
-   NO AUTOMATIC RE-EXPORT — VISIBILITY IS DIRECT-IMPORT-ONLY. If A imports
-      B, and B imports C, A cannot call one of C's `export`ed functions
-      just because B can — A would need to `import "c.butter"` itself.
-      Every function everywhere is still compiled exactly once into the
-      program regardless of visibility (ISA.bnf section 8); what
-      `export`/`import` gate is only which *names* a given file is allowed
-      to reference by call, not whether the callee exists.
-
-   A PATH IS RESOLVED RELATIVE TO THE FILE CONTAINING THE 'import', NOT
-      THE ENTRY PROGRAM. `import "../lib/util.butter"` inside some
-      subdirectory's file resolves from that file's own directory, exactly
-      like a typical filesystem-based module system (and unlike a
-      resolved-from-one-fixed-root scheme). The entry program's own
-      directory is used as this base only for its own `import` lines; for
-      `--stdin`, which has no file/directory of its own, the current
-      working directory is used instead.
-
-   FUNCTION NAMES ARE UNIQUE ACROSS THE WHOLE COMPILED PROGRAM, NOT JUST
-      WITHIN ONE FILE. Two different files may not both declare a function
-      named `helper`, even if neither exports it and neither ever imports
-      the other. This is a deliberate simplification, not a fundamental
-      limit of the design: call resolution has always been a single flat
-      name-indexed table (ISA.bnf section 6), and rather than inventing
-      per-file namespacing/mangling to let same-named private helpers
-      coexist, a same-named clash anywhere in the whole loaded graph is
-      simply a compile error (the same DuplicateFunction error a single
-      file's own two `func f()`s already were).
-
-   A SHARED DEPENDENCY IS COMPILED EXACTLY ONCE, NOT ONCE PER IMPORTER. If
-      two different files both `import "util.butter"` (directly, or via
-      a longer diamond-shaped chain), `util.butter` is read, parsed, and
-      compiled exactly one time — see ISA.bnf section 8 for the mechanism
-      (a canonical-path cache in the module loader) that guarantees this
-      rather than it being a best-effort optimization.
+(* --- import/export ---
+   - Only function declarations may be exported/imported — a top-level
+     var-declaration can't be, sidestepping any notion of module
+     initialization order. An imported file may only contain more imports
+     and function declarations at its top level.
+   - Visibility is direct-import-only, not transitive: importing B doesn't
+     expose what B itself imports.
+   - A path resolves relative to the file containing the `import`, not the
+     entry program. Function names are unique across the whole compiled
+     program, not just within one file. A dependency shared by more than
+     one importer is compiled exactly once. *)
    ========================================================================== *)
