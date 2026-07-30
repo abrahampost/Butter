@@ -1,0 +1,16 @@
+import "math.std.butter"
+
+func quadraticRootHigh(float a, float b, float c) -> float {
+    float discriminant := pow(b, 2) - 4 * a * c
+    return (-b + sqrt(discriminant)) / (2 * a)
+}
+
+func quadraticRootLow(float a, float b, float c) -> float {
+    float discriminant := pow(b, 2) - 4 * a * c
+    return (-b - sqrt(discriminant)) / (2 * a)
+}
+
+print quadraticRootHigh(1, -5, 6)
+print quadraticRootLow(1, -5, 6)
+print gcd(54, 24)
+print factorial(6)

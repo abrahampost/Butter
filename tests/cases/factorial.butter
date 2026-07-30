@@ -1,0 +1,11 @@
+func factorial(int n) -> int {
+    int result := 1
+    for i in 1..(n + 1) {
+        result := result * i
+    }
+    return result
+}
+
+for i in 0..11 {
+    print factorial(i)
+}

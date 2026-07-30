@@ -1,0 +1,16 @@
+int limit := 30
+bool[31] is_composite
+for i in 2..limit {
+    if !is_composite[i] {
+        int j := i * i
+        while j <= limit {
+            is_composite[j] := true
+            j := j + i
+        }
+    }
+}
+for i in 2..(limit + 1) {
+    if !is_composite[i] {
+        print i
+    }
+}

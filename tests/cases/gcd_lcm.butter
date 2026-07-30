@@ -1,0 +1,17 @@
+func gcd(int a, int b) -> int {
+    while b != 0 {
+        int temp := b
+        b := a % b
+        a := temp
+    }
+    return a
+}
+
+func lcm(int a, int b) -> int {
+    return a / gcd(a, b) * b
+}
+
+print gcd(48, 18)
+print gcd(17, 5)
+print lcm(4, 6)
+print lcm(21, 6)
