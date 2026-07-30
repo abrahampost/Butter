@@ -632,6 +632,7 @@ pub const Compiler = struct {
                 const idx = try self.chunk.addConstant(self.allocator, .{ .stream = .ofStandard(s) });
                 _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             },
+            .args_literal => _ = try self.chunk.emit(self.allocator, .push_args),
             .read_bytes => |r| try self.compileReadBytes(r),
             .write_value => |w| try self.compileWriteValue(w),
             .write_bytes => |w| try self.compileWriteBytes(w),

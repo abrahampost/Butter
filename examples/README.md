@@ -13,6 +13,7 @@
 | [io.butter](io.butter) | **Runs today** | `read`/`write` against `stdin`, `stdout`, and `stderr` — `write` as `print` without the newline, a short-read copy loop over a byte buffer, and a generic `int[]` buffer serving every size (GRAMMAR.bnf design note 3k, ISA.bnf section 9). Needs input piped in. |
 | [files.butter](files.butter) | **Runs today** | `open`/`read`/`write`/`close` against a real file — `write`/`append`/`read` modes, and a stream that's now a genuine runtime value rather than only ever one of `stdin`/`stdout`/`stderr` (GRAMMAR.bnf design note 3l, ISA.bnf section 10). Creates/overwrites `examples/greeting.txt`. |
 | [json.butter](json.butter) | **Runs today** | `map`/`list` as first-class heap values, bracket-indexing that chains through nested values, `has`/`keys`, `json(...)` parsing a byte buffer read from a real file into a map/list tree, and `stringify(...)` rendering a value back into (properly escaped) JSON text and writing it out again (GRAMMAR.bnf design notes 3m/3n/3o, ISA.bnf sections 11/12/13). Reads [data.json](data.json); creates/overwrites `dump.json`. |
+| [cli_args.butter](cli_args.butter) | **Runs today** | The bare `args` keyword (GRAMMAR.bnf design note 3p, ISA.bnf's PUSH_ARGS) — everything after a literal `--` on the CLI's own command line, as a `list` of strings. Needs `-- <name> ...` passed on the command line. |
 
 Try any of them:
 
@@ -29,6 +30,9 @@ zig build run -- examples/files.butter
 zig build run -- examples/json.butter
 # or, reading from standard input instead of a file:
 zig build run -- --stdin < examples/basic_math.butter
+# cli_args.butter needs its own '--' for the program's args (the first
+# '--' is zig build's own separator, consumed before butter ever sees it):
+zig build run -- examples/cli_args.butter -- Ada Grace
 ```
 
 `io.butter` reads standard input, so pipe it something:

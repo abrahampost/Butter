@@ -20,6 +20,12 @@ const butter = @import("butter");
 /// Runs `source` as a Butter program and returns everything it printed.
 /// Caller owns the returned slice.
 fn run(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    return runWithArgs(allocator, source, &.{});
+}
+
+/// Same as `run`, but with `args` available to the program as `args`
+/// (ISA.bnf's PUSH_ARGS) instead of the default empty list.
+fn runWithArgs(allocator: std.mem.Allocator, source: []const u8, args: []const []const u8) ![]u8 {
     var loader = butter.module.Loader.init(allocator, std.testing.io, std.Io.Dir.cwd());
     defer loader.deinit();
 
@@ -35,7 +41,7 @@ fn run(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     defer out.deinit();
 
     var vm = butter.vm.Vm.init(allocator);
-    try vm.run(&compiled, .{ .out = &out.writer });
+    try vm.run(&compiled, .{ .out = &out.writer, .args = args });
 
     return out.toOwnedSlice();
 }
@@ -48,6 +54,19 @@ fn expectCaseOutput(comptime name: []const u8) !void {
     const expected = @embedFile("cases/" ++ name ++ ".expected");
 
     const actual = try run(allocator, source);
+    defer allocator.free(actual);
+
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+/// Same as `expectCaseOutput`, but running with `args` available to the
+/// program as `args`.
+fn expectCaseOutputWithArgs(comptime name: []const u8, args: []const []const u8) !void {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("cases/" ++ name ++ ".butter");
+    const expected = @embedFile("cases/" ++ name ++ ".expected");
+
+    const actual = try runWithArgs(allocator, source, args);
     defer allocator.free(actual);
 
     try std.testing.expectEqualStrings(expected, actual);
@@ -99,6 +118,17 @@ test "string_indexing: hand-rolled key=value;... parsing via s[i]/s[a..b]" {
 
 test "strings: concatenation and lexicographic ordering, incl. a bubble sort" {
     try expectCaseOutput("strings");
+}
+
+test "args: the bare 'args' keyword sees the host's argv, in order" {
+    try expectCaseOutputWithArgs("args", &.{ "alpha", "beta", "gamma" });
+}
+
+test "args: with no host args, 'args' is an empty list" {
+    const allocator = std.testing.allocator;
+    const actual = try run(allocator, "print len(args)\n");
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings("0\n", actual);
 }
 
 // ---- Error-path cases ------------------------------------------------

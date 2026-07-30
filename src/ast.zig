@@ -120,6 +120,13 @@ pub const Expr = union(enum) {
     len_of: *Expr,
     /// One of the three keyword-named streams, as a value.
     stream_literal: Stream.Standard,
+    /// The bare `args` keyword (GRAMMAR.bnf design note 3p) — evaluates to a
+    /// fresh `list` of the program's own command-line arguments, as
+    /// strings. Unlike `stream_literal`, this isn't a compile-time constant:
+    /// the argument count and text vary per run, so it compiles to a
+    /// dedicated opcode (PUSH_ARGS, ISA.bnf) that builds the list from the
+    /// VM's `Host.args` at run time.
+    args_literal,
     read_bytes: ReadBytes,
     write_value: WriteValue,
     write_bytes: WriteBytes,
@@ -428,6 +435,7 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try writer.writeAll(")");
         },
         .stream_literal => |s| try writer.writeAll(s.name()),
+        .args_literal => try writer.writeAll("args"),
         .read_bytes => |r| {
             try writer.writeAll("(read ");
             try printExpr(writer, r.stream);

@@ -38,7 +38,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'len' | 'read' | 'write' | 'open' | 'close'
                | 'stdin' | 'stdout' | 'stderr' | 'append'
                | 'map' | 'list' | 'push' | 'keys' | 'has' | 'delete'
-               | 'json' | 'stringify' | 'null'
+               | 'json' | 'stringify' | 'null' | 'args'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -177,6 +177,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <json-expr>
                       | <stringify-expr>
                       | 'stdin' | 'stdout' | 'stderr'
+                      | 'args'
                       | IDENTIFIER
 
 <call-expr>         ::= IDENTIFIER '(' [ <arg-list> ] ')'
@@ -337,6 +338,17 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      has no JSON representation (`RuntimeError.TypeMismatch`). It's a
      special form because nothing else in the language lets a `func` build
      a string a piece at a time. *)
+
+(* --- Program arguments ---
+   - `args` is a bare keyword, like `stdin`/`stdout`/`stderr`, but unlike
+     them it evaluates directly to a value rather than a stream: a fresh
+     `list` of `string`s, one per argument the embedder handed the program
+     (ISA.bnf's PUSH_ARGS). The CLI (src/main.zig) passes everything after a
+     literal `--` on its own command line; a run with no `--` gets an empty
+     list, the same as a run with `--` followed by nothing.
+   - Every `args` occurrence builds its own independent list — mutating one
+     (`push`, index-assignment) never affects another read elsewhere in the
+     same program, unlike aliasing a `list`/`map` local via `b := a`. *)
 
 (* --- The for-loop ---
    - Range-based only (`for v in start..end body`) — no C-style

@@ -1,0 +1,7 @@
+list argv := args
+print len(argv)
+for i in 0..len(argv) {
+    print argv[i]
+}
+
+print len(args)

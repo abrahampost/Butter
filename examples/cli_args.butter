@@ -1,0 +1,9 @@
+list argv := args
+
+if len(argv) == 0 {
+    print "usage: cli_args.butter <name> [<name> ...]"
+} else {
+    for i in 0..len(argv) {
+        print "Hello, " + argv[i] + "!"
+    }
+}

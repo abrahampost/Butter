@@ -228,6 +228,24 @@
                                                followed by a newline, always
                                                to the `out` stream (section 9)
 
+   PUSH_ARGS               ( -- list )        builds a FRESH list Object
+                                               (section 11) from `Host.args`
+                                               (vm.zig), one FRESH heap
+                                               string per element, in order,
+                                               and pushes it. What the bare
+                                               `args` keyword (GRAMMAR.bnf
+                                               design note 3p) compiles to.
+                                               Unlike PUSH_CONST of a
+                                               `stdin`/`stdout`/`stderr`
+                                               stream constant, this reads
+                                               live Host state rather than
+                                               the chunk's constant pool,
+                                               since argv isn't known until
+                                               `Vm.run` is called. `Host.args`
+                                               defaults to an empty slice, so
+                                               an embedder that never sets it
+                                               gets an empty `args` list.
+
    READ         #stream   ( ref -- count )    pops an ARRAY_REF naming the
                                                destination buffer
                                                (TypeMismatch if it isn't one),

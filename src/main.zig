@@ -6,16 +6,19 @@
 //!     butter --stdin < path/to/program.butter
 //!     butter --disassemble path/to/program.butter
 //!     butter --disassemble --stdin < path/to/program.butter
+//!     butter path/to/program.butter -- foo bar   (program sees `args` == ["foo", "bar"])
 
 const std = @import("std");
 const butter = @import("butter");
 
 const usage =
-    \\usage: butter [--disassemble] (<file> | --stdin)
+    \\usage: butter [--disassemble] (<file> | --stdin) [-- <program-args>...]
     \\
-    \\  <file>          run the Butter source file at this path
-    \\  --stdin         read the Butter source program from standard input
-    \\  --disassemble   print compiled bytecode instead of running it
+    \\  <file>            run the Butter source file at this path
+    \\  --stdin           read the Butter source program from standard input
+    \\  --disassemble     print compiled bytecode instead of running it
+    \\  -- <program-args> everything after '--' is passed to the running
+    \\                    program as its own `args`, not parsed as CLI flags
     \\
 ;
 
@@ -32,8 +35,22 @@ pub fn main(init: std.process.Init) !void {
     var disassemble = false;
     var use_stdin = false;
     var file_path: ?[]const u8 = null;
+    var program_args: []const []const u8 = &.{};
 
-    for (args[1..]) |arg| {
+    // Everything from a bare '--' onward belongs to the running program
+    // (its own `args`), not to this CLI — so it's never matched against
+    // '--disassemble'/'--stdin' or treated as the source file/an extra
+    // argument below.
+    var cli_args = args[1..];
+    for (cli_args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--")) {
+            program_args = cli_args[i + 1 ..];
+            cli_args = cli_args[0..i];
+            break;
+        }
+    }
+
+    for (cli_args) |arg| {
         if (std.mem.eql(u8, arg, "--disassemble")) {
             disassemble = true;
         } else if (std.mem.eql(u8, arg, "--stdin")) {
@@ -128,6 +145,7 @@ pub fn main(init: std.process.Init) !void {
         // compile time, and whose base is the importing file). An embedder
         // that wants a sandboxed program simply passes no `fs` at all.
         .fs = .{ .io = init.io, .dir = std.Io.Dir.cwd() },
+        .args = program_args,
     }) catch |err| {
         // Flush whatever the program managed to produce before the error,
         // so a partial run's output isn't swallowed by the diagnostic.

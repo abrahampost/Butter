@@ -503,7 +503,7 @@ pub const Parser = struct {
     ///         | <map-literal> | <len-expr> | <read-expr> | <write-expr>
     ///         | <open-expr> | <push-expr> | <keys-expr> | <has-expr>
     ///         | <delete-expr> | <json-expr> | <stringify-expr>
-    ///         | 'stdin' | 'stdout' | 'stderr' | IDENTIFIER
+    ///         | 'stdin' | 'stdout' | 'stderr' | 'args' | IDENTIFIER
     fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
         switch (tok.type) {
@@ -569,6 +569,10 @@ pub const Parser = struct {
             .kw_stderr => {
                 _ = self.advance();
                 return self.createExpr(.{ .stream_literal = .stderr });
+            },
+            .kw_args => {
+                _ = self.advance();
+                return self.createExpr(.args_literal);
             },
             else => return self.fail("expected an expression"),
         }
@@ -1373,6 +1377,12 @@ test "a stream name is an expression in its own right" {
     try expectExprSexpr("stdout", "stdout");
     try expectExprSexpr("stdin", "stdin");
     try expectExprSexpr("stderr", "stderr");
+}
+
+test "'args' is a bare expression, like the stream names" {
+    try expectExprSexpr("args", "args");
+    try expectExprSexpr("len(args)", "(len args)");
+    try expectExprSexpr("args[0]", "(index args 0)");
 }
 
 test "parses open(...) in each mode" {

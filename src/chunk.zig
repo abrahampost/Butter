@@ -56,6 +56,12 @@ pub const OpCode = enum(u8) {
 
     print,
 
+    // The bare `args` keyword (ISA.bnf section 9's addendum). No operand:
+    // the program's own argv lives on the Host passed to `Vm.run`, not the
+    // chunk, since it varies per run rather than being fixed at compile
+    // time the way a `stdin`/`stdout`/`stderr` PUSH_CONST is.
+    push_args,
+
     // Byte-stream I/O (ISA.bnf section 9). All three take zero operands:
     // the stream they act on is an ordinary `Value` on the stack, pushed by
     // whatever expression named it, so the same instruction serves a

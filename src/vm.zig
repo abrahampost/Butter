@@ -95,6 +95,12 @@ pub const Host = struct {
     err: ?*std.Io.Writer = null,
     in: ?*std.Io.Reader = null,
     fs: ?Fs = null,
+    /// What the bare `args` keyword evaluates to (as a fresh `list` of
+    /// strings, one per element, built on demand — PUSH_ARGS never reads
+    /// this slice again after building that list). Absent by default: an
+    /// embedder that never sets it gets an empty `args`, exactly like a
+    /// program run with no arguments.
+    args: []const []const u8 = &.{},
 
     /// The filesystem as the program sees it: `io` performs the operations,
     /// and `dir` is what a relative path in `open` resolves against.
@@ -1078,6 +1084,18 @@ pub const Vm = struct {
                     defer v.decref(self.allocator);
                     try v.print(writer);
                     try writer.writeAll("\n");
+                },
+
+                .push_args => {
+                    var list: std.ArrayList(Value) = .empty;
+                    errdefer {
+                        for (list.items) |item| item.decref(self.allocator);
+                        list.deinit(self.allocator);
+                    }
+                    try list.ensureTotalCapacity(self.allocator, host.args.len);
+                    for (host.args) |arg| list.appendAssumeCapacity(try Value.newString(self.allocator, arg));
+                    const obj = try Object.create(self.allocator, .{ .list = list });
+                    try self.push(.{ .object = obj });
                 },
 
                 .read => {
@@ -2167,6 +2185,41 @@ test "make_list and index_get: a list literal's elements round-trip" {
     var buf: [64]u8 = undefined;
     const len = try runSource(&chunk, &buf);
     try std.testing.expectEqualStrings("20\n", buf[0..len]);
+}
+
+test "push_args builds a list of the host's args, in order" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .push_args);
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    _ = try chunk.emit(allocator, .index_get);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var vm = Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const program = chunk_mod.Program{ .main = chunk, .functions = &.{} };
+    try vm.run(&program, .{ .out = &writer, .args = &.{ "first", "second" } });
+    try std.testing.expectEqualStrings("second\n", buf[0..writer.end]);
+}
+
+test "push_args with no host args builds an empty list" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .push_args);
+    _ = try chunk.emit(allocator, .len_value);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("0\n", buf[0..len]);
 }
 
 test "index_get on a list out of bounds is IndexOutOfBounds, not memory corruption" {

@@ -27,19 +27,15 @@ existing numeric path. Documented in GRAMMAR.bnf/ISA.bnf. Covered by unit
 tests (equal-prefix, differing-length, empty-string cases) and the
 `strings` integration case.
 
-### 3. Program argument access (`argv`)
-[src/main.zig:36](src/main.zig#L36) consumes all CLI args itself
-(`--disassemble`, `--stdin`, file path); nothing forwards the remaining
-args to the running Butter program. No opcode, builtin, or stdlib
-function exposes them.
-- Decide the surface: a bare keyword like `stdin`/`stdout` (e.g. `args`
-  evaluating to a `list` of strings) is most consistent with the existing
-  design.
-- Thread args from `main.zig` through to `Vm.run`'s options struct
-  (parallel to `.fs`), the way stdin/stdout/stderr streams already are.
-- Update GRAMMAR.bnf (new atom/keyword) and ISA.bnf.
-- Add an example under `examples/` demonstrating a simple arg-parsing
-  program, and an integration test case.
+### 3. Program argument access (`argv`) — DONE
+`args` is now a bare keyword (like `stdin`/`stdout`/`stderr`, GRAMMAR.bnf
+design note 3p) evaluating to a fresh `list` of strings, built at run time
+by a new `PUSH_ARGS` opcode (ISA.bnf) from `Vm.run`'s `Host.args` field —
+threaded from [src/main.zig](src/main.zig), which now treats a literal
+`--` on its own command line as the boundary between CLI flags and the
+program's own args. Documented in GRAMMAR.bnf/ISA.bnf. Covered by lexer,
+parser, and VM unit tests, the `args` integration case under
+`tests/cases/`, and `examples/cli_args.butter`.
 
 ### 4. Process exit code control
 Every successful run exits 0; every uncaught `RuntimeError` exits 1 with a
