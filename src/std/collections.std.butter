@@ -1,0 +1,172 @@
+# Set, Stack, and Queue — three collections built directly on the `map`
+# builtin, since Butter has no struct/generic type of its own: each
+# collection IS a plain `map` value, and these functions are just the
+# operations that keep its contents self-consistent.
+#
+# Set   — membership only. An element's presence is the map key itself
+#          (value at that key is unused); this is why Set elements are
+#          `string`, the only type a map key can be.
+# Stack — LIFO, string elements, keyed "0".."n-1". `len(s)` is always the
+#          current size, since those keys are always contiguous from 0 —
+#          no separate size field needed.
+# Queue — FIFO, string elements. Unlike Stack, dequeuing drops the *front*
+#          key, so the live keys aren't contiguous from 0 over time; two
+#          reserved keys ("__head"/"__tail", which can never collide with
+#          a `stringify`d index) track the window of valid slots.
+#
+# Popping/peeking/dequeuing an empty collection raises the same
+# `RuntimeError.KeyNotFound` a plain missing-key map read would — guard
+# with the *IsEmpty functions first, same as you'd guard a map with `has`.
+
+# ---- Set --------------------------------------------------------------
+
+export func setNew() -> map {
+    return {}
+}
+
+export func setHas(map s, string item) -> bool {
+    return has(s, item)
+}
+
+export func setAdd(map s, string item) -> bool {
+    if has(s, item) {
+        return false
+    }
+    s[item] := true
+    return true
+}
+
+export func setRemove(map s, string item) -> bool {
+    return delete(s, item)
+}
+
+export func setSize(map s) -> int {
+    return len(s)
+}
+
+export func setIsEmpty(map s) -> bool {
+    return len(s) == 0
+}
+
+export func setToList(map s) -> list {
+    return keys(s)
+}
+
+export func setUnion(map a, map b) -> map {
+    map result := {}
+    list aKeys := keys(a)
+    for i in 0..len(aKeys) {
+        result[aKeys[i]] := true
+    }
+    list bKeys := keys(b)
+    for i in 0..len(bKeys) {
+        result[bKeys[i]] := true
+    }
+    return result
+}
+
+export func setIntersection(map a, map b) -> map {
+    map result := {}
+    list aKeys := keys(a)
+    for i in 0..len(aKeys) {
+        if has(b, aKeys[i]) {
+            result[aKeys[i]] := true
+        }
+    }
+    return result
+}
+
+export func setDifference(map a, map b) -> map {
+    map result := {}
+    list aKeys := keys(a)
+    for i in 0..len(aKeys) {
+        if !has(b, aKeys[i]) {
+            result[aKeys[i]] := true
+        }
+    }
+    return result
+}
+
+export func setIsSubset(map a, map b) -> bool {
+    list aKeys := keys(a)
+    for i in 0..len(aKeys) {
+        if !has(b, aKeys[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+export func setEquals(map a, map b) -> bool {
+    return setIsSubset(a, b) and setIsSubset(b, a)
+}
+
+# ---- Stack (LIFO) -------------------------------------------------------
+
+export func stackNew() -> map {
+    return {}
+}
+
+export func stackPush(map s, string item) -> int {
+    s[stringify(len(s))] := item
+    return len(s)
+}
+
+export func stackPop(map s) -> string {
+    string topKey := stringify(len(s) - 1)
+    string item := s[topKey]
+    delete(s, topKey)
+    return item
+}
+
+export func stackPeek(map s) -> string {
+    return s[stringify(len(s) - 1)]
+}
+
+export func stackSize(map s) -> int {
+    return len(s)
+}
+
+export func stackIsEmpty(map s) -> bool {
+    return len(s) == 0
+}
+
+# ---- Queue (FIFO) -------------------------------------------------------
+
+export func queueNew() -> map {
+    map q := {}
+    q["__head"] := 0
+    q["__tail"] := 0
+    return q
+}
+
+export func queueSize(map q) -> int {
+    int head := q["__head"]
+    int tail := q["__tail"]
+    return tail - head
+}
+
+export func queueIsEmpty(map q) -> bool {
+    return queueSize(q) == 0
+}
+
+export func queueEnqueue(map q, string item) -> int {
+    int tail := q["__tail"]
+    q[stringify(tail)] := item
+    q["__tail"] := tail + 1
+    return queueSize(q)
+}
+
+export func queueDequeue(map q) -> string {
+    int head := q["__head"]
+    string frontKey := stringify(head)
+    string item := q[frontKey]
+    delete(q, frontKey)
+    q["__head"] := head + 1
+    return item
+}
+
+export func queuePeek(map q) -> string {
+    int head := q["__head"]
+    return q[stringify(head)]
+}

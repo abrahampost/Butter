@@ -479,3 +479,85 @@ test "the bundled math stdlib's functions run correctly end to end" {
         writer.buffered(),
     );
 }
+
+test "the bundled collections stdlib imports by name with no matching file on disk" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var loader = Loader.init(allocator, std.testing.io, tmp.dir);
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(
+        "import \"collections.std.butter\"\nmap s := setNew()\nprint setAdd(s, \"a\")\n",
+        "main.butter",
+        ".",
+    );
+    try std.testing.expectEqual(@as(usize, 1), entry.imports.len);
+    try std.testing.expectEqualStrings("collections.std.butter", entry.imports[0].path);
+}
+
+test "the bundled collections stdlib's Set/Stack/Queue run correctly end to end" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var loader = Loader.init(allocator, std.testing.io, tmp.dir);
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(
+        \\import "collections.std.butter"
+        \\
+        \\map a := setNew()
+        \\setAdd(a, "x")
+        \\setAdd(a, "y")
+        \\map b := setNew()
+        \\setAdd(b, "y")
+        \\setAdd(b, "z")
+        \\print setAdd(a, "x")
+        \\print setHas(a, "x")
+        \\print setSize(setUnion(a, b))
+        \\print setSize(setIntersection(a, b))
+        \\print setSize(setDifference(a, b))
+        \\print setEquals(a, a)
+        \\print setEquals(a, b)
+        \\print setRemove(a, "x")
+        \\print setSize(a)
+        \\
+        \\map st := stackNew()
+        \\stackPush(st, "one")
+        \\stackPush(st, "two")
+        \\print stackPeek(st)
+        \\print stackPop(st)
+        \\print stackSize(st)
+        \\
+        \\map q := queueNew()
+        \\queueEnqueue(q, "one")
+        \\queueEnqueue(q, "two")
+        \\print queuePeek(q)
+        \\print queueDequeue(q)
+        \\print queueSize(q)
+        \\
+    ,
+        "main.butter",
+        ".",
+    );
+
+    const modules = try toCompilerUnits(loader.allocator(), loader.order.items, entry);
+    var compiler = compiler_mod.Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(modules.entry_index, modules.units);
+    defer compiled.deinit(allocator);
+
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    var vm = vm_mod.Vm.init(allocator);
+    try vm.run(&compiled, .{ .out = &writer });
+
+    try std.testing.expectEqualStrings(
+        "false\ntrue\n3\n1\n1\ntrue\nfalse\ntrue\n1\n" ++
+            "two\ntwo\n1\n" ++
+            "one\none\n1\n",
+        writer.buffered(),
+    );
+}
