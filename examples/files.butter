@@ -1,0 +1,55 @@
+# Files: open/read/write/close against real files on disk.
+# See GRAMMAR.bnf design note 3l and ISA.bnf section 10.
+#
+#   zig build run -- examples/files.butter
+
+# `open` evaluates to a stream, the same kind of thing `stdin`/`stdout`/
+# `stderr` are — but this one is a genuine runtime value: which file (if
+# any) actually gets opened depends on the filesystem, not just the
+# source text. Once opened, it flows into `read`/`write`/`close` exactly
+# the way a standard stream does.
+# The path is resolved against the CURRENT DIRECTORY at run time, not
+# against this source file's own directory the way `import` is (GRAMMAR.bnf
+# design note 3l) — so this assumes the usage line above, run from the
+# repo root, and writes examples/greeting.txt rather than a bare
+# "greeting.txt" wherever the process happens to be started from.
+int f := open("examples/greeting.txt", write)
+write(f, "Hello, file!")
+close f
+
+# Reopening for `read` gets back exactly what was written. `write`'s
+# two-argument form renders a value the same way `print` does, minus the
+# trailing newline (see GRAMMAR.bnf design note 3k) — so there's no
+# newline to read back here.
+int g := open("examples/greeting.txt", read)
+int[32] buf
+int n := read(g, buf)
+close g
+write(stdout, buf, n)
+print ""
+
+# `append` starts writing at the file's current end instead of
+# truncating it — the one difference between it and `write`, which
+# always starts from an empty file.
+int h := open("examples/greeting.txt", append)
+write(h, " ...and more.")
+close h
+
+int g2 := open("examples/greeting.txt", read)
+int[64] buf2
+int n2 := read(g2, buf2)
+close g2
+write(stdout, buf2, n2)
+print ""
+
+# A file left open when the program ends is flushed and closed
+# automatically (ISA.bnf section 10) — but `close`ing it explicitly, as
+# above, is still the normal way to release one as soon as a program is
+# done with it, rather than leaning on that as a safety net.
+
+# Trying to open a file that doesn't exist in `read` mode is a runtime
+# error, not a silently-empty stream — `open` reports exactly why on
+# stderr via `Vm.diagnostic` if the program doesn't catch it itself.
+# Uncomment to see it:
+#
+#     int missing := open("no-such-file.txt", read)

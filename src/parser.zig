@@ -309,6 +309,7 @@ pub const Parser = struct {
     fn statement(self: *Parser) Error!ast.Stmt {
         if (self.check(.kw_print)) return self.printStatement();
         if (self.check(.kw_return)) return self.returnStatement();
+        if (self.check(.kw_close)) return self.closeStatement();
         return self.exprStatement();
     }
 
@@ -318,6 +319,17 @@ pub const Parser = struct {
         const value = try self.expression();
         try self.consumeEnd();
         return ast.Stmt{ .print_stmt = value };
+    }
+
+    /// <close-stmt> ::= 'close' <expression> <end>
+    ///
+    /// A statement, not an expression, because closing produces no value —
+    /// exactly the shape (and the reason) `print` has.
+    fn closeStatement(self: *Parser) Error!ast.Stmt {
+        _ = self.advance(); // 'close'
+        const stream = try self.expression();
+        try self.consumeEnd();
+        return ast.Stmt{ .close_stmt = stream };
     }
 
     /// <return-stmt> ::= 'return' <expression> <end>
@@ -460,7 +472,7 @@ pub const Parser = struct {
 
     /// <primary> ::= INT | FLOAT | STRING | 'true' | 'false'
     ///            | '(' <expression> ')' | <call-expr> | <array-literal>
-    ///            | <len-expr> | IDENTIFIER
+    ///            | <len-expr> | <read-expr> | <write-expr> | IDENTIFIER
     fn primary(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
         switch (tok.type) {
@@ -502,6 +514,21 @@ pub const Parser = struct {
             },
             .lbracket => return self.arrayLiteral(),
             .kw_len => return self.lenExpr(),
+            .kw_read => return self.readExpr(),
+            .kw_write => return self.writeExpr(),
+            .kw_open => return self.openExpr(),
+            .kw_stdin => {
+                _ = self.advance();
+                return self.createExpr(.{ .stream_literal = .stdin });
+            },
+            .kw_stdout => {
+                _ = self.advance();
+                return self.createExpr(.{ .stream_literal = .stdout });
+            },
+            .kw_stderr => {
+                _ = self.advance();
+                return self.createExpr(.{ .stream_literal = .stderr });
+            },
             else => return self.fail("expected an expression"),
         }
     }
@@ -552,6 +579,76 @@ pub const Parser = struct {
         const name_tok = try self.expect(.identifier, "expected an array name");
         _ = try self.expect(.rparen, "expected ')' after array name");
         return self.createExpr(.{ .len_of = name_tok.lexeme });
+    }
+
+    /// <read-expr> ::= 'read' '(' <expression> ',' IDENTIFIER ')'
+    ///
+    /// The stream is an arbitrary expression so that an `open`ed file works
+    /// anywhere `stdin` does. The destination is still a bare array name,
+    /// the same restriction `lenExpr`/`finishIndex` place on their own
+    /// targets and for the same reason (GRAMMAR.bnf design note 3e) — there
+    /// is no array-valued expression to read into.
+    fn readExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'read'
+        _ = try self.expect(.lparen, "expected '(' after 'read'");
+        const stream = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the stream");
+        const name_tok = try self.expect(.identifier, "expected a buffer (array) name to read into");
+        _ = try self.expect(.rparen, "expected ')' after the buffer name");
+        return self.createExpr(.{ .read_bytes = .{ .stream = stream, .buffer = name_tok.lexeme } });
+    }
+
+    /// <write-expr> ::= 'write' '(' <expression> ',' <expression> ')'
+    ///                | 'write' '(' <expression> ',' IDENTIFIER ',' <expression> ')'
+    ///
+    /// The two forms are told apart by argument count alone: the second
+    /// argument parses as an ordinary expression either way, and only if a
+    /// ',' follows it (making this the three-argument buffer form) does it
+    /// have to have been a bare array name.
+    fn writeExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'write'
+        _ = try self.expect(.lparen, "expected '(' after 'write'");
+        const stream = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the stream");
+        const second = try self.expression();
+
+        if (self.match(.comma)) {
+            if (second.* != .variable) {
+                return self.fail("write's buffer argument must be a bare array name");
+            }
+            const count = try self.expression();
+            _ = try self.expect(.rparen, "expected ')' after the byte count");
+            return self.createExpr(.{ .write_bytes = .{ .stream = stream, .buffer = second.variable, .count = count } });
+        }
+
+        _ = try self.expect(.rparen, "expected ')' after the value to write");
+        return self.createExpr(.{ .write_value = .{ .stream = stream, .value = second } });
+    }
+
+    /// <open-expr> ::= 'open' '(' <expression> ',' <open-mode> ')'
+    /// <open-mode> ::= 'read' | 'write' | 'append'
+    ///
+    /// The mode is a bare keyword rather than an expression, so a file's
+    /// direction is always known at compile time even though the stream
+    /// value itself isn't (GRAMMAR.bnf design note 3l). `read` and `write`
+    /// double as mode keywords here without ambiguity: this position only
+    /// ever accepts a mode.
+    fn openExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'open'
+        _ = try self.expect(.lparen, "expected '(' after 'open'");
+        const path = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the path");
+
+        const mode: ast.OpenMode = switch (self.peek().type) {
+            .kw_read => .read,
+            .kw_write => .write,
+            .kw_append => .append,
+            else => return self.fail("expected an open mode: 'read', 'write', or 'append'"),
+        };
+        _ = self.advance();
+
+        _ = try self.expect(.rparen, "expected ')' after the open mode");
+        return self.createExpr(.{ .open_file = .{ .path = path, .mode = mode } });
     }
 
     /// <array-literal> ::= '[' [ <expression> { ',' <expression> } ] ']'
@@ -986,6 +1083,84 @@ test "len(...) requires a bare identifier, not an arbitrary expression" {
     defer parser.deinit();
 
     try std.testing.expectError(Error.UnexpectedToken, parser.expression());
+}
+
+test "parses read(...) with each stream and a bare buffer name" {
+    try expectExprSexpr("read(stdin, buf)", "(read stdin buf)");
+}
+
+test "parses the two-argument write(...) value form" {
+    try expectExprSexpr("write(stdout, 1 + 2)", "(write stdout (+ 1 2))");
+    try expectExprSexpr("write(stderr, \"oops\")", "(write stderr \"oops\")");
+}
+
+test "parses the three-argument write(...) buffer form" {
+    try expectExprSexpr("write(stdout, buf, n)", "(write stdout buf n)");
+}
+
+test "read/write are expressions, so their result is usable" {
+    try expectExprSexpr("read(stdin, buf) > 0", "(> (read stdin buf) 0)");
+}
+
+fn expectExprParseError(source: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.expression());
+    try std.testing.expect(parser.diagnostic != null);
+}
+
+test "read/write's stream may be an arbitrary expression, not just a keyword" {
+    // Since a stream is a value now (an `open`ed file is one), the parser
+    // accepts any expression here; whether it actually IS a stream is a
+    // runtime question the VM answers.
+    try expectExprSexpr("read(f, buf)", "(read f buf)");
+    try expectExprSexpr("write(files[0], 1)", "(write (index files 0) 1)");
+}
+
+test "read's destination must be a bare identifier, not an expression" {
+    try expectExprParseError("read(stdin, buf[0])");
+    try expectExprParseError("read(stdin, 1 + 2)");
+}
+
+test "the three-argument write's buffer must be a bare array name" {
+    try expectExprParseError("write(stdout, 1 + 2, 3)");
+}
+
+test "a stream name is an expression in its own right" {
+    try expectExprSexpr("stdout", "stdout");
+    try expectExprSexpr("stdin", "stdin");
+    try expectExprSexpr("stderr", "stderr");
+}
+
+test "parses open(...) in each mode" {
+    try expectExprSexpr("open(\"f.txt\", read)", "(open \"f.txt\" read)");
+    try expectExprSexpr("open(\"f.txt\", write)", "(open \"f.txt\" write)");
+    try expectExprSexpr("open(\"f.txt\", append)", "(open \"f.txt\" append)");
+}
+
+test "open's path may be an arbitrary expression, but its mode may not" {
+    try expectExprSexpr("open(name, read)", "(open name read)");
+    try expectExprParseError("open(\"f.txt\", banana)");
+    try expectExprParseError("open(\"f.txt\")");
+}
+
+test "an opened file is usable directly as read/write's stream" {
+    try expectExprSexpr("read(open(\"f.txt\", read), buf)", "(read (open \"f.txt\" read) buf)");
+}
+
+test "parses close as a statement" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "close f\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.program.len);
+    try std.testing.expectEqualStrings("f", result.program[0].close_stmt.variable);
 }
 
 test "parses an import declaration" {

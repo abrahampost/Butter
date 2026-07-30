@@ -52,13 +52,19 @@ pub fn main(init: std.process.Init) !void {
         printUsageAndExit("error: expected a source file or --stdin", .{});
     }
 
-    const source = if (use_stdin) blk: {
-        var stdin_buffer: [4096]u8 = undefined;
-        var stdin_reader: std.Io.File.Reader = .init(.stdin(), init.io, &stdin_buffer);
-        break :blk stdin_reader.interface.allocRemaining(gpa, .unlimited) catch |err| {
+    // One stdin reader for the whole process, shared between reading the
+    // source program (--stdin) and the running program's own `read(stdin,
+    // ...)`. With --stdin the source read consumes all of it, so the
+    // program then sees standard input already at its end — the two uses
+    // can't both have it.
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_reader: std.Io.File.Reader = .init(.stdin(), init.io, &stdin_buffer);
+
+    const source = if (use_stdin)
+        stdin_reader.interface.allocRemaining(gpa, .unlimited) catch |err| {
             printUsageAndExit("error: failed to read standard input: {s}", .{@errorName(err)});
-        };
-    } else std.Io.Dir.cwd().readFileAlloc(init.io, file_path.?, gpa, .unlimited) catch |err| {
+        }
+    else std.Io.Dir.cwd().readFileAlloc(init.io, file_path.?, gpa, .unlimited) catch |err| {
         printUsageAndExit("error: failed to read '{s}': {s}", .{ file_path.?, @errorName(err) });
     };
 
@@ -106,11 +112,37 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+    const stderr_writer = &stderr_file_writer.interface;
+
     var vm = butter.vm.Vm.init();
-    vm.run(&chunk, stdout_writer) catch |err| {
-        try stdout_writer.flush();
-        std.debug.print("runtime error: {s}\n", .{@errorName(err)});
+    vm.run(&chunk, .{
+        .out = stdout_writer,
+        .err = stderr_writer,
+        .in = &stdin_reader.interface,
+        // A program run from the CLI gets filesystem access, with relative
+        // paths in `open` resolved against the current directory — not the
+        // source file's own directory, unlike `import` (which is resolved at
+        // compile time, and whose base is the importing file). An embedder
+        // that wants a sandboxed program simply passes no `fs` at all.
+        .fs = .{ .io = init.io, .dir = std.Io.Dir.cwd() },
+    }) catch |err| {
+        // Flush whatever the program managed to produce before the error,
+        // so a partial run's output isn't swallowed by the diagnostic.
+        stdout_writer.flush() catch {};
+        stderr_writer.flush() catch {};
+        if (vm.diagnostic) |diag| {
+            if (diag.path.len > 0) {
+                std.debug.print("runtime error: {s} '{s}': {s}\n", .{ diag.operation, diag.path, diag.cause });
+            } else {
+                std.debug.print("runtime error: {s}: {s}\n", .{ diag.operation, diag.cause });
+            }
+        } else {
+            std.debug.print("runtime error: {s}\n", .{@errorName(err)});
+        }
         std.process.exit(1);
     };
     try stdout_writer.flush();
+    try stderr_writer.flush();
 }

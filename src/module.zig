@@ -472,7 +472,7 @@ test "the bundled math stdlib's functions run correctly end to end" {
     var buf: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
     var vm = vm_mod.Vm.init();
-    try vm.run(&compiled, &writer);
+    try vm.run(&compiled, .{ .out = &writer });
 
     try std.testing.expectEqualStrings(
         "5\n3\n7\n10\n3\n4\n3\n12\n1024\n6\n120\n",

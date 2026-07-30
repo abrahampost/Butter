@@ -40,7 +40,8 @@ EOF          ::= (* end of input *)
 KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'true' | 'false' | 'int' | 'float' | 'bool' | 'string'
                | 'func' | 'return' | 'for' | 'in' | 'import' | 'export'
-               | 'len'
+               | 'len' | 'read' | 'write' | 'open' | 'close'
+               | 'stdin' | 'stdout' | 'stderr' | 'append'
 
 (* Operators and punctuation *)
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
@@ -130,10 +131,15 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                         <declaration>
 
 <statement>         ::= <print-stmt>
+                      | <close-stmt>
                       | <return-stmt>
                       | <expr-stmt>
 
 <print-stmt>        ::= 'print' <expression> <end>
+
+(* A statement, not an expression — closing produces no value to use, the
+   same shape (and reason) <print-stmt> has. See design note l. *)
+<close-stmt>        ::= 'close' <expression> <end>
 
 (* Legal anywhere a <statement> is (including nested inside a function
    body's own if/while/block), but a semantic error — not a parse error —
@@ -183,6 +189,10 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <array-literal>
                       | <index-expr>
                       | <len-expr>
+                      | <read-expr>
+                      | <write-expr>
+                      | <open-expr>
+                      | 'stdin' | 'stdout' | 'stderr'
                       | IDENTIFIER
 
 <call-expr>         ::= IDENTIFIER '(' [ <arg-list> ] ')'
@@ -199,6 +209,42 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    restriction as <index-expr>'s target, and for the same reason: arrays
    aren't first-class values to compute one from (design note 3e). *)
 <len-expr>          ::= 'len' '(' IDENTIFIER ')'
+
+(* Byte-stream I/O — see design note 3k. `stdin`/`stdout`/`stderr` are bare
+   keywords (matched by <primary> directly, above) that evaluate to a
+   stream; `read`/`write`'s stream position is an arbitrary <expression>,
+   not restricted to those three keywords, so an opened file (<open-expr>,
+   design note 3l) works anywhere one of them does. Direction (read vs.
+   write) is checked at compile time only when the stream expression IS one
+   of those three keywords — the one case where which stream is meant is
+   truly known at compile time (`CompileError.WrongStreamDirection`); for
+   any other stream expression it is checked at run time instead, since a
+   file's own direction depends on how it was opened. *)
+
+(* Reads up to `len(IDENTIFIER)` bytes into that buffer and evaluates to
+   how many were actually read — 0, and only 0, at end of input. The
+   destination is a bare array name for the same reason <index-expr>'s and
+   <len-expr>'s targets are. *)
+<read-expr>         ::= 'read' '(' <expression> ',' IDENTIFIER ')'
+
+(* Two forms, told apart by argument count alone. The two-argument form
+   writes an arbitrary value rendered exactly as 'print' renders it but
+   with NO trailing newline; the three-argument form writes the first
+   <expression> bytes of a buffer, the inverse of <read-expr>. Either way
+   the result is the number of bytes written. *)
+<write-expr>        ::= 'write' '(' <expression> ',' <expression> ')'
+                      | 'write' '(' <expression> ',' IDENTIFIER ',' <expression> ')'
+
+(* Files — see design note 3l. Opens `path` (an arbitrary STRING-valued
+   expression) in the given mode and evaluates to a stream, usable
+   anywhere <read-expr>/<write-expr>/<close-stmt> accept one. The mode is
+   a bare keyword, not an expression — a file's direction is always known
+   at compile time even though the stream value naming it isn't.
+   'read'/'write'/'append' double as mode keywords here with no ambiguity,
+   since this position only ever accepts a mode. *)
+<open-expr>         ::= 'open' '(' <expression> ',' <open-mode> ')'
+
+<open-mode>         ::= 'read' | 'write' | 'append'
 
 
 (* --------------------------------------------------------------------------
@@ -356,6 +402,156 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
       compile error (`CompileError.EscapingArrayReference`), not a runtime
       one: the whole point is to catch it before it could ever produce a
       dangling reference, the same "checked, not trusted" spirit as note f.
+   -------------------------------------------------------------------- *)
+
+(* --- Byte-stream I/O (language-growth addition, not a "fix") ------------
+
+   k) I/O IS BYTES INTO AND OUT OF A BUFFER, NOT STRINGS. `read` and
+      `write` are the language's only I/O beyond `print`, and they move
+      raw bytes between one of the three standard streams and an ordinary
+      `int` array — one byte per element, as an INT in 0..255. This is not
+      an arbitrary choice of API: a string-returning `readLine()` would
+      have to allocate storage for a string that did not exist at compile
+      time, and this language deliberately has no heap, no garbage
+      collector, and no string type that owns its bytes (ISA.bnf section 2 —
+      every STRING value is a borrowed slice of a compile-time literal).
+      Reading into a buffer the program already declared needs no
+      allocation at all: the destination slots exist before the read does.
+      That is the whole reason the unit of I/O here is a byte buffer rather
+      than a string.
+
+      `read(stdin, buf)` performs a SHORT read, exactly like POSIX
+      `read(2)`: it returns at least 1 and at most `len(buf)` bytes, and
+      returns 0 only at end of input. It deliberately does NOT loop until
+      the buffer is full — an interactive program has to be able to act on
+      the line the user just typed without waiting for enough further input
+      to fill the rest of the buffer. Copying an input of unknown length
+      therefore always means a loop:
+
+          int[64] buf
+          int n := read(stdin, buf)
+          while n > 0 {
+              write(stdout, buf, n)
+              n := read(stdin, buf)
+          }
+
+      Slots past the returned count are left exactly as they were, so a
+      short read never clobbers the remainder of the buffer.
+
+      `write` HAS TWO FORMS BECAUSE THERE ARE TWO THINGS WORTH WRITING.
+      `write(stdout, expr)` writes a *value* — rendered identically to how
+      `print` renders it, but with no trailing newline, which is the entire
+      difference between the two and what makes building up a line piece by
+      piece possible (`write(stdout, x)  write(stdout, " ")  print y`).
+      `write(stdout, buf, n)` writes the first `n` *bytes* of a buffer, the
+      exact inverse of `read`. Both evaluate to the number of bytes
+      written. An element that isn't an INT in 0..255 is
+      `RuntimeError.ByteOutOfRange` rather than being silently masked to
+      its low 8 bits, and `n` outside `0..len(buf)` is
+      `RuntimeError.IndexOutOfBounds` — the same "checked, not trusted"
+      stance as note f's array bounds.
+
+      A BUFFER IS PASSED THE SAME WAY A GENERIC ARRAY ARGUMENT IS. Both
+      `read` and `write`'s buffer forms accept either kind of array local:
+      a fixed-size one (`int[64] buf`) or a generic one (`int[] buf`, a
+      reference received as a parameter — note 3j). They compile to exactly
+      the reference-passing the call boundary already used, which is why an
+      I/O helper can be written once and used with buffers of any size:
+
+          func fill(int[] b) -> int { return read(stdin, b) }
+
+      Because a generic array is a reference into the caller's own slots
+      rather than a copy, the bytes such a helper reads are visible to its
+      caller after it returns — the same aliasing note 3j already
+      describes, now doing real work.
+
+      A STREAM USED TO BE COMPILE-TIME-ONLY; A FILE MADE IT A RUNTIME VALUE
+      TOO (see design note l for why and how). `stdin`/`stdout`/`stderr`
+      are still bare keywords, and using one of them directly still gets
+      its direction checked at compile time exactly as before
+      (`CompileError.WrongStreamDirection`) — that part of the design costs
+      the language nothing, since a program that genuinely wants to pick
+      between two streams still writes an `if`. What changed is that
+      `read`/`write`'s stream position is no longer restricted to only
+      those three keywords: it's an arbitrary <expression>, because `open`
+      (design note l) can hand back a stream whose direction depends on
+      something only known at run time (which mode it was opened with) —
+      the compiler simply can't check that case statically, so the VM
+      checks it instead (`RuntimeError.StreamNotReadable`/
+      `StreamNotWritable`). This is a necessary relaxation, not a design
+      retreat: a variable, an `if`, or a function parameter can now hold or
+      forward a stream exactly like any other value, but a literal
+      `stdin`/`stdout`/`stderr` keyword use is exactly as restricted, and
+      exactly as cheaply checked, as it always was.
+
+      NO ESCAPE SEQUENCES, SO A NEWLINE IS A BYTE. STRING (section 1) still
+      has no escape syntax, so `write(stdout, "a\nb")` writes a literal
+      backslash and `n` — not a newline. A program that needs a raw newline
+      mid-output either uses `print` (which appends one) or writes the byte:
+      `int[1] nl := [10]  write(stdout, nl, 1)`. Adding escape sequences
+      would be a lexical change, not an I/O one, and is left as a separate
+      piece of language growth.
+   -------------------------------------------------------------------- *)
+
+(* --- Files (language-growth addition, not a "fix") ----------------------
+
+   l) A STREAM BECOMES A RUNTIME VALUE THE MOMENT A FILE CAN PRODUCE ONE.
+      `open(path, mode)` opens `path` (an arbitrary STRING-valued
+      expression, not just a literal) and evaluates to a stream — the
+      same kind of thing `stdin`/`stdout`/`stderr` are, but this one can't
+      possibly be a compile-time keyword, since which file (if any) `open`
+      actually manages to open depends on the filesystem at run time. This
+      is the one place note k's original story about streams changes: a
+      stream is no longer ALWAYS a bare keyword resolved at compile time —
+      it can now flow through a variable, an `if`, a function parameter,
+      anywhere any other value can (ISA.bnf section 10 covers the runtime
+      representation this requires). There is still no dedicated stream
+      TYPE keyword in <type>; a variable meant to hold one is simply
+      declared as one of the existing scalar types (in practice always
+      `int`), the same "declared type isn't checked against what's
+      actually stored" latitude every other variable already has (ISA.bnf
+      section 1).
+
+      THREE MODES, ONE OF WHICH DOESN'T TRUNCATE. `read` opens an existing
+      file for reading only (`RuntimeError.FileOpenFailed` if it doesn't
+      exist or can't be opened); `write` creates it, truncating it first
+      if it already exists; `append` opens it for writing starting at its
+      current end rather than at the start, creating it first if it's
+      genuinely absent. Exactly like the mode keyword itself, this choice
+      is fixed at compile time — a file's direction never depends on
+      anything computed at run time, only on which of the three keywords
+      the program's source actually wrote down.
+
+      `close` IS A STATEMENT, NOT AN EXPRESSION — closing produces no
+      value to use, the same shape (and reason) `print` has. Closing one
+      of the three standard streams is refused
+      (`CompileError.CannotCloseStandardStream` when the compiler can tell
+      statically, i.e. a literal `close stdout`/`close stdin`/
+      `close stderr`; `RuntimeError.CannotCloseStandardStream` otherwise,
+      the same compile-time/run-time split note k's direction check has)
+      — those three belong to whoever ran the program, not to the program
+      itself. A program that never gets around to `close`ing a file it
+      opened does not leak it forever: every file still open when the
+      program halts (or fails) is flushed and closed on the way out
+      (ISA.bnf section 10), a safety net for buffered writes reaching disk,
+      not a substitute for writing `close` — there is a fixed limit on how
+      many files may be open AT ONCE (ISA.bnf section 10), so a program
+      that opens many files in a loop without closing each one still fails
+      with `RuntimeError.TooManyOpenFiles`.
+
+      A RELATIVE PATH IS RESOLVED AGAINST THE CURRENT DIRECTORY, NOT ANY
+      SOURCE FILE'S OWN DIRECTORY. This is deliberately different from
+      `import`'s resolution (design note h): `import` is a compile-time
+      concept resolved once, relative to the file that wrote it, so the
+      same program behaves identically regardless of where the process
+      happens to be run from. `open` is a run-time filesystem operation
+      with no notion of "the file that wrote this call" once compiled —
+      the only directory available to resolve a relative path against at
+      that point is the one the whole process is running in, exactly like
+      any other language's `fopen`/`open()`. An embedder that wants a
+      sandboxed program simply doesn't grant it filesystem access at all,
+      in which case `open` fails with `RuntimeError.FilesUnavailable`
+      instead of touching anything on disk.
    -------------------------------------------------------------------- *)
 
 (* --- The for-loop (language-growth addition, not a "fix") ---------------

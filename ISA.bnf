@@ -36,6 +36,15 @@
       family (PUSH_CONST, LOAD_LOCAL, STORE_LOCAL). Nothing else reaches
       into the constant pool or a variable slot.
 
+      The two byte-buffer I/O instructions (READ and WRITE_BYTES, section
+      9) are the one deliberate exception: they read and write a whole
+      run of slots directly. That is unavoidable for I/O — the entire
+      point is to move bytes between a stream and storage the program
+      already declared — but note they still don't *name* those slots
+      themselves: they're handed an ARRAY_REF on the stack, produced by
+      the ordinary LOAD/STORE-family instructions, so the "which memory"
+      decision stays where this goal wants it.
+
    c) ORTHOGONAL AND MINIMAL. There is exactly one conditional-branch
       instruction (JUMP_IF_FALSE) and one unconditional one (JUMP); a
       JUMP_IF_TRUE was deliberately omitted because 'or' is expressible as
@@ -63,7 +72,7 @@
    2. VALUE REPRESENTATION
    -------------------------------------------------------------------------- *)
 
-<value>    ::= INT | FLOAT | BOOL | STRING | ARRAY_REF
+<value>    ::= INT | FLOAT | BOOL | STRING | ARRAY_REF | STREAM
 
 (* INT and FLOAT are i64 / f64. STRING values are borrowed slices into a
    Chunk's constant pool (which in turn borrows from the original source
@@ -86,9 +95,28 @@
    those two remain deliberately different runtime representations. There
    is no way to construct an ARRAY_REF from Butter source directly (no
    syntax makes one appear as a literal); the only way one comes into
-   being is MAKE_ARRAY_REF, always compiler-generated at a call site
-   passing a fixed-size local into a generic parameter (`compiler.zig`'s
-   `compileGenericArrayArgument`). *)
+   being is MAKE_ARRAY_REF, always compiler-generated where a fixed-size
+   local has to be handed over by reference — at a call site passing it
+   into a generic parameter (`compiler.zig`'s
+   `compileGenericArrayArgument`), or as the buffer of a READ/WRITE_BYTES
+   (section 9). Both routes go through the same `compiler.zig` helper,
+   `emitArrayRef`, which is exactly why the I/O instructions need no
+   fixed-vs-generic variants of their own. *)
+
+(* STREAM (GRAMMAR.bnf design notes 3k and 3l) is `value.Stream`, a tagged
+   union: `{ .standard: Standard }` naming one of the three fixed keywords
+   stdin/stdout/stderr, or `{ .file: u32 }` naming a slot in the VM's own
+   open-file table (section 10) — never a raw OS file handle or
+   descriptor. There is no way to construct a `.file` stream from Butter
+   source except through OPEN (section 10); a literal `stdin`/`stdout`/
+   `stderr` keyword use instead compiles to a PUSH_CONST of a `.standard`
+   stream constant, exactly like any other literal. A stream is a small,
+   trivially-copyable value with no ownership semantics of its own — it
+   never needs to be freed, and copying one (assigning it to a variable,
+   passing it as an argument) copies only which stream it names, never any
+   underlying resource — which is what keeps the VM's "no heap, no
+   allocator at run time" property intact even though `open`'s result is
+   now a genuine runtime value. *)
 
 (* A compiled program is one main Chunk (the top-level code, run as an
    implicit frame 0 — see section 6) plus one Chunk per declared function,
@@ -285,7 +313,49 @@
                                                ever ends.
 
    PRINT                  ( v -- )            pop v, write it followed by
-                                               a newline
+                                               a newline, always to the
+                                               `out` stream (section 9)
+
+   READ         #stream   ( ref -- count )    pops an ARRAY_REF naming the
+                                               destination buffer
+                                               (TypeMismatch if it isn't
+                                               one), reads at least 1 and
+                                               at most ref.len bytes from
+                                               `stream`, stores each as an
+                                               INT in 0..255 into
+                                               stack[ref.base + i], and
+                                               pushes how many were read.
+                                               Pushes 0, and only 0, at end
+                                               of input; slots past `count`
+                                               are left untouched. A SHORT
+                                               read, like POSIX read(2) —
+                                               see section 9 for why.
+                                               StreamReadFailed if the
+                                               underlying stream errors.
+   WRITE        #stream   ( v -- count )      pops v, writes it to `stream`
+                                               in exactly PRINT's rendering
+                                               but with NO trailing
+                                               newline, and pushes the
+                                               number of bytes that took.
+                                               StreamWriteFailed if the
+                                               underlying stream errors.
+   WRITE_BYTES  #stream   ( ref count -- written )
+                                               pops count (must be INT),
+                                               then an ARRAY_REF; the exact
+                                               inverse of READ. Bounds- and
+                                               range-checked:
+                                               IndexOutOfBounds unless
+                                               0 <= count <= ref.len, and
+                                               ByteOutOfRange if any of the
+                                               first `count` elements isn't
+                                               an INT in 0..255 (TypeMismatch
+                                               if one isn't an INT at all).
+                                               Writes those bytes to
+                                               `stream` and pushes how many
+                                               were written. The count is
+                                               pushed AFTER the reference,
+                                               which is why the stack effect
+                                               reads ref-then-count.
 
    HALT                                       stop execution (only ever
                                                appears in the main chunk,
@@ -680,4 +750,254 @@
    any other: its functions still need `export` to be visible outside it,
    it's still one graph node in `Loader.order`, and its own `import`s (if
    it had any) would go through this same by-name-first check.
+
+
+(* --------------------------------------------------------------------------
+   9. BYTE-STREAM I/O (three instructions, no new value kind, still no heap)
+   -------------------------------------------------------------------------- *)
+
+   `read`/`write` (GRAMMAR.bnf design note 3k) add three instructions —
+   READ, WRITE, WRITE_BYTES (section 3) — and, on their own, nothing else:
+   no allocator, no runtime stream table of their own (files get one —
+   section 10, which also explains the STREAM value these three now
+   consume).
+
+   THE STREAM IS A VALUE ON THE STACK, NOT AN OPERAND. This is a change
+   from these three instructions' original design, where each carried
+   which of stdin/stdout/stderr it acted on as its own u32 operand — valid
+   only because a stream used to be nothing but a bare compile-time
+   keyword. Files (section 10) changed that: `open`'s result is inherently
+   a runtime value, and it has to be able to flow into READ/WRITE/
+   WRITE_BYTES exactly like a literal `stdin`/`stdout`/`stderr` does. So
+   all three now take ZERO operands and instead pop the STREAM they act on
+   off the top of the stack — pushed there by whatever expression named
+   it, a PUSH_CONST of a literal stream or the result of an OPEN — rather
+   than being told which stream via their operand. This is what lets a
+   file's stream reach `read`/`write` without needing three more
+   instructions just for "the stream happens to be a file" instead of
+   "the stream happens to be one of the three keywords": by the time READ
+   executes, it doesn't need to know or care which kind of STREAM it was
+   handed.
+
+   DIRECTION IS CHECKED AT COMPILE TIME WHEN IT CAN BE, AT RUN TIME
+   OTHERWISE. `compiler.zig`'s `compileStreamOperand` statically checks
+   direction (`CompileError.WrongStreamDirection`) only when the stream
+   expression is a literal `stdin`/`stdout`/`stderr` keyword use — the one
+   case where which stream is meant, and therefore its direction, is truly
+   known at compile time. For any other stream expression (a variable, an
+   `open(...)` call, a parameter, ...) the compiler has no way to know, so
+   it emits the instruction unconditionally and the VM checks instead:
+   `readerFor`/`writerFor` (section 10) raise
+   `RuntimeError.StreamNotReadable`/`StreamNotWritable` if the stream
+   they're handed turns out to be opened in the wrong direction.
+
+   THE BUFFER ARRIVES AS AN ARRAY_REF ON THE STACK. READ and WRITE_BYTES
+   don't take a packed (slot, length) operand the way LOAD_INDEX does —
+   now that their old operand is spent on nothing (the stream moved to the
+   stack, above), they simply take no operand at all. Instead the compiler
+   puts the buffer on the stack as a single ARRAY_REF first, reusing the
+   exact instructions a generic call argument already used (section 6's
+   generic-array addendum): MAKE_ARRAY_REF for a fixed-size local,
+   LOAD_LOCAL for a local that already holds a reference. That one decision
+   is what keeps this to three instructions instead of six — there is no
+   READ/READ_REF pair, because by the time READ executes it can no longer
+   tell which kind of array it was handed, and doesn't need to.
+
+   A fresh reference synthesized for an I/O buffer is trivially safe in a
+   way a returned one isn't (section 6's "why a reference is safe as an
+   argument but not always safe as a return"): it is created and fully
+   consumed by a single instruction inside the very frame it points into, so
+   there is no window in which the frame could have been popped.
+
+   BYTES AND VALUES ARE TWO DIFFERENT TRANSLATIONS. A Butter buffer holds
+   one `Value` per byte, so both directions need a translation step through
+   `Vm.io_buffer`, a fixed `[stack_max]u8` staging area — large enough by
+   construction to hold any buffer the value stack itself could contain, so
+   it never needs to grow and the VM stays allocator-free at run time
+   (section 2):
+     - READ reads into `io_buffer`, then scatters each byte out as an
+       `INT` (`Vm.scatterBytes`).
+     - WRITE_BYTES gathers each slot back down into `io_buffer`, checking
+       as it goes that every element really names a byte
+       (`Vm.gatherBytes`), then writes that flat slice once.
+   WRITE (the value form) needs neither, since it is writing a rendering
+   rather than bytes: it counts the rendered length with a discarding pass
+   and then renders again to the real stream, so the count it pushes is
+   exact for a value of any size without a staging buffer to overflow.
+
+   EVERYTHING OUTSIDE THE VM IS INJECTED, AND MOST OF IT IS OPTIONAL.
+   `Vm.run` takes a `Host { out, err, in, fs }` (section 10 covers `fs`,
+   added once files needed a fourth field — `Host` was called `Streams`
+   before that) rather than the single writer it took before I/O existed.
+   `out` is required (PRINT has nowhere else to go); `in`, `err`, and `fs`
+   are each optional, and an absent one behaves exactly like the shell
+   redirection or permission it stands in for — a missing `in` is
+   `< /dev/null` (every READ immediately reports 0 rather than failing), a
+   missing `err` is `2>/dev/null` (bytes are counted as written, then
+   dropped), and a missing `fs` is running with no filesystem access at all
+   (every OPEN fails with `RuntimeError.FilesUnavailable` — section 10).
+   This is what lets every test drive real I/O against in-memory buffers
+   and (for files) a temporary directory, and it's why nothing in the VM
+   ever reaches for a process-wide handle itself.
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   10. FILES (two instructions, one new runtime table, still no heap)
+   -------------------------------------------------------------------------- *)
+
+   `open`/`close` (GRAMMAR.bnf design note 3l) add two instructions — OPEN
+   and CLOSE (section 3) — and one new piece of VM state: a fixed-size
+   table of open files (`Vm.files`, `max_open_files = 8` slots of
+   `?OpenFile`). Nothing else about the "no heap, no allocator at run time"
+   goal (section 1) changes: the table is part of the `Vm` struct itself,
+   the same as the value stack, so it costs no allocation to have and none
+   to use.
+
+   A STREAM NAMES A TABLE SLOT, NEVER A RAW OS HANDLE. `Value.stream`'s
+   `.file` payload (section 2) is a `u32` INDEX into `Vm.files`, not an
+   `std.Io.File` or file descriptor copied directly into the value. This
+   indirection is what keeps a stream small, trivially copyable, and free
+   of ownership semantics: copying a `Value.stream` (assigning it to
+   another variable, passing it as an argument) copies only which slot it
+   names, never the underlying OS resource, so there is no way for a
+   Butter program to observe two "independent" copies of the same open
+   file behaving differently, and no destructor/ownership-tracking
+   machinery is needed anywhere a `Value` is copied. The real resource —
+   an `std.Io.File`, a buffered reader OR writer (`OpenFile.Handle`, never
+   both: a file is opened in exactly one direction), and its own byte
+   buffer — lives entirely in the table entry, owned by the `Vm`, not by
+   any `Value` a program holds. A `null` slot is a free one; CLOSE (below)
+   sets a slot back to `null` unconditionally, which is what turns "using a
+   closed file" into a clean `RuntimeError.StreamClosed` rather than a
+   stale handle.
+
+   OPEN #mode   ( path -- stream )    pops path (must be STRING —
+                                       TypeMismatch otherwise) and opens it
+                                       against `Host.fs` in the given
+                                       `mode` (`value.OpenMode` — the one
+                                       operand this instruction carries,
+                                       since the mode is always a bare
+                                       keyword and so is fixed at compile
+                                       time even though the resulting
+                                       stream isn't). On success, records
+                                       the opened file in the first free
+                                       table slot and pushes a STREAM
+                                       naming it.
+                                         - `RuntimeError.FilesUnavailable`
+                                           if `Host.fs` is null (the
+                                           embedder granted no filesystem
+                                           access at all).
+                                         - `RuntimeError.TooManyOpenFiles`
+                                           if every table slot is already
+                                           in use — a hard limit, since
+                                           there is no heap to grow the
+                                           table with.
+                                         - `RuntimeError.FileOpenFailed`
+                                           otherwise, if the underlying
+                                           open/create call — or, in
+                                           `append` mode, the follow-up
+                                           stat/seek to the file's current
+                                           end — fails (no such file in
+                                           `read` mode, no permission, it's
+                                           a directory, and so on).
+                                       All three set `Vm.diagnostic`
+                                       (`operation = "open"`, `path`, and a
+                                       `cause` that is `@errorName` of the
+                                       underlying error for
+                                       `FileOpenFailed`, or a fixed
+                                       explanatory string for the other
+                                       two). `write` mode creates the file,
+                                       truncating it first if it already
+                                       exists; `read` mode requires it to
+                                       already exist; `append` mode opens
+                                       it for writing and then seeks to its
+                                       current end (via `file.stat`) rather
+                                       than truncating, creating it first
+                                       if it's genuinely absent — that seek
+                                       is the one extra step distinguishing
+                                       `append` from `write`.
+
+   CLOSE                    ( stream -- )   pops a STREAM (TypeMismatch if
+                                       the popped value isn't one).
+                                         - A `.standard` stream (a literal
+                                           `stdin`/`stdout`/`stderr`) is
+                                           `RuntimeError.
+                                           CannotCloseStandardStream` —
+                                           those three belong to whoever
+                                           started the program. The
+                                           compiler already rejects this
+                                           case at compile time when it can
+                                           tell statically
+                                           (`CompileError.
+                                           CannotCloseStandardStream`,
+                                           GRAMMAR.bnf design note 3l);
+                                           this is the run-time backstop
+                                           for when it can't (the stream
+                                           came from a variable, an `if`,
+                                           and so on).
+                                         - A `.file` naming a slot that
+                                           isn't currently open (already
+                                           closed, or never a valid slot —
+                                           e.g. an index beyond the
+                                           table's size) is
+                                           `RuntimeError.StreamClosed`.
+                                         - Otherwise: flushes the file if
+                                           it was opened for writing
+                                           (`RuntimeError.
+                                           FileCloseFailed` if the flush
+                                           fails, `Vm.diagnostic` carrying
+                                           `@errorName` of the cause with
+                                           an empty path — there's no path
+                                           left to report once a file is
+                                           already open, only the stream
+                                           naming it), closes the
+                                           underlying OS file, and frees
+                                           the table slot UNCONDITIONALLY
+                                           either way — even a failed flush
+                                           still frees the slot, so a close
+                                           that fails can never leave the
+                                           table stuck holding a handle the
+                                           program has no way to get rid
+                                           of.
+
+   READ/WRITE/WRITE_BYTES (section 9) ALREADY WORK ON A FILE STREAM
+   UNCHANGED — they pop a STREAM and dispatch through `Vm.readerFor`/
+   `writerFor`, which handle a `.file` stream by looking up its table entry
+   (`Vm.fileEntry`) and returning whichever half of its `Handle` exists:
+     - reading a `.file` opened in `write`/`append` mode (or writing to one
+       opened `read`) is `RuntimeError.StreamNotReadable`/
+       `StreamNotWritable` — the run-time backstop for the direction check
+       the compiler can only make statically for a literal `stdin`/
+       `stdout`/`stderr` (section 9).
+     - a `.file` naming a closed/invalid slot is `RuntimeError.
+       StreamClosed`, exactly as for CLOSE above.
+
+   EVERY OPEN FILE IS CLOSED ON THE WAY OUT OF `run`, WHETHER IT HALTED
+   NORMALLY OR FAILED. `Vm.closeAllFiles` (flushing and closing every
+   still-open table slot, the same as CLOSE) runs from an `errdefer` set up
+   at the very top of `run` — so any propagated `RuntimeError` still closes
+   every file first — AND explicitly on the ordinary HALT path, so a
+   failure flushing the program's OWN files on ordinary exit is reported as
+   this run's own result rather than silently discarded the way an
+   `errdefer`-only close would be. A program that never `close`s a file it
+   opened does not leak it for the life of the process — only for the life
+   of this one `run` call — but IS still bounded by `max_open_files` while
+   it runs, since the table has no allocator to grow with (section 1's
+   "no heap" goal, same as the value stack).
+
+   `Vm.diagnostic` IS HOW A RUNTIME ERROR CARRIES DETAIL A ZIG ERROR VALUE
+   CAN'T. Four of the eight file-related `RuntimeError`s set it —
+   `FileOpenFailed`, `TooManyOpenFiles`, and `FilesUnavailable` (all three
+   from OPEN, since only `open` has a path worth reporting), plus
+   `FileCloseFailed` (from CLOSE, path left empty). The other four
+   (`StreamNotReadable`, `StreamNotWritable`, `StreamClosed`,
+   `CannotCloseStandardStream`) carry no diagnostic — the bare error tag
+   already says everything there is to say about them, with no path or
+   underlying-cause string to add. `path` is borrowed straight from the
+   chunk's own constant pool (never separately allocated, consistent with
+   every other STRING in this VM — section 2). `main.zig` prefers this
+   diagnostic when printing a runtime error to the user, falling back to
+   the bare `@errorName(err)` for every `RuntimeError` — file-related or
+   not — that doesn't set one.
    ========================================================================== *)

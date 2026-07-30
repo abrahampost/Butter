@@ -55,6 +55,26 @@ pub const OpCode = enum(u8) {
     ret,
 
     print,
+
+    // Byte-stream I/O (ISA.bnf section 9). All three take zero operands:
+    // the stream they act on is an ordinary `Value` on the stack, pushed by
+    // whatever expression named it, so the same instruction serves a
+    // standard stream and an opened file alike (GRAMMAR.bnf design note
+    // 3l). READ and WRITE_BYTES likewise find their buffer as an ARRAY_REF
+    // already on the stack — the compiler reuses MAKE_ARRAY_REF (fixed
+    // array) or LOAD_LOCAL (generic array) to put it there, exactly as a
+    // generic call argument is passed.
+    read,
+    write,
+    write_bytes,
+
+    // Files (ISA.bnf section 10). OPEN's operand is the `ast.OpenMode` it
+    // was written with — the one part of a file that IS fixed at compile
+    // time, since the mode is a bare keyword. CLOSE needs no operand: like
+    // the three above, it acts on whatever stream is on the stack.
+    open,
+    close,
+
     halt,
 };
 
@@ -135,6 +155,10 @@ pub const Chunk = struct {
                 },
                 .jump, .jump_if_false => try writer.print(" -> {d}\n", .{instr.operand}),
                 .call => try writer.print(" #{d}\n", .{instr.operand}),
+                .open => {
+                    const mode: value_mod.OpenMode = @enumFromInt(instr.operand);
+                    try writer.print(" {s}\n", .{mode.name()});
+                },
                 else => try writer.writeAll("\n"),
             }
         }
@@ -284,6 +308,60 @@ test "disassemble renders load_index and store_index" {
         "0000 load_index slot=2 len=5\n0001 store_index slot=2 len=5\n",
         writer.buffered(),
     );
+}
+
+test "the I/O instructions carry no operand — their stream comes off the stack" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .read);
+    _ = try chunk.emit(allocator, .write);
+    _ = try chunk.emit(allocator, .write_bytes);
+    _ = try chunk.emit(allocator, .close);
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings(
+        "0000 read\n0001 write\n0002 write_bytes\n0003 close\n",
+        writer.buffered(),
+    );
+}
+
+test "disassemble names the mode an open was written with" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emitWithOperand(allocator, .open, @intFromEnum(value_mod.OpenMode.read));
+    _ = try chunk.emitWithOperand(allocator, .open, @intFromEnum(value_mod.OpenMode.write));
+    _ = try chunk.emitWithOperand(allocator, .open, @intFromEnum(value_mod.OpenMode.append));
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings(
+        "0000 open read\n0001 open write\n0002 open append\n",
+        writer.buffered(),
+    );
+}
+
+test "a stream constant renders as the stream it names" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const idx = try chunk.addConstant(allocator, .{ .stream = .ofStandard(.stdout) });
+    _ = try chunk.emitWithOperand(allocator, .push_const, idx);
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 push_const #0 (<stdout>)\n", writer.buffered());
 }
 
 test "Program.deinit frees the main chunk and every function's chunk" {

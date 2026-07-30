@@ -1,0 +1,45 @@
+# Byte-stream I/O: read/write against stdin, stdout, and stderr.
+# See GRAMMAR.bnf design note 3k and ISA.bnf section 9.
+#
+#   echo "hello there" | butter examples/io.butter
+
+# `write` renders a value exactly as `print` does, but WITHOUT a trailing
+# newline — so a line can be built up piece by piece.
+write(stdout, "1 + 2 = ")
+write(stdout, 1 + 2)
+print ""
+
+# Butter string literals have no escape sequences, so a raw newline is
+# written as the byte it is (10). Any byte works this way.
+int[1] nl := [10]
+
+# A generic `int[]` buffer is a reference to the caller's own slots, not a
+# copy — so bytes this helper reads are still there once it returns, and one
+# helper serves buffers of every size.
+func fill(int[] b) -> int {
+    return read(stdin, b)
+}
+
+# Copying input of unknown length is always a loop: `read` is a short read,
+# returning at least 1 byte and only returning 0 at end of input.
+int[8] buf
+int total := 0
+int n := fill(buf)
+while n > 0 {
+    write(stdout, buf, n)
+    total := total + n
+    n := fill(buf)
+}
+write(stdout, nl, 1)
+
+# Diagnostics belong on stderr, which stays out of stdout entirely — try
+# `... | butter examples/io.butter 2>/dev/null` to watch this line vanish
+# while the copied input above survives.
+write(stderr, "copied ")
+write(stderr, total)
+write(stderr, " bytes")
+write(stderr, nl, 1)
+
+# Both forms of `write` evaluate to the number of bytes written, so a
+# program can check its own output the same way it checks a read.
+print write(stdout, "")

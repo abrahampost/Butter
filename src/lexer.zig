@@ -29,6 +29,14 @@ pub const TokenType = enum {
     kw_import,
     kw_export,
     kw_len,
+    kw_read,
+    kw_write,
+    kw_stdin,
+    kw_stdout,
+    kw_stderr,
+    kw_open,
+    kw_close,
+    kw_append,
 
     // Operators and punctuation
     plus,
@@ -79,6 +87,14 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "import", .kw_import },
     .{ "export", .kw_export },
     .{ "len", .kw_len },
+    .{ "read", .kw_read },
+    .{ "write", .kw_write },
+    .{ "stdin", .kw_stdin },
+    .{ "stdout", .kw_stdout },
+    .{ "stderr", .kw_stderr },
+    .{ "open", .kw_open },
+    .{ "close", .kw_close },
+    .{ "append", .kw_append },
 });
 
 pub const Token = struct {
@@ -425,6 +441,14 @@ test "tokenizeAll includes a trailing eof token" {
 
 test "empty source produces only eof" {
     try expectTokenTypes("", &.{.eof});
+}
+
+test "'read' and 'write' are recognized as keywords" {
+    try expectTokenTypes("read write reader writer", &.{ .kw_read, .kw_write, .identifier, .identifier, .eof });
+}
+
+test "the three stream names are recognized as keywords" {
+    try expectTokenTypes("stdin stdout stderr stdinx", &.{ .kw_stdin, .kw_stdout, .kw_stderr, .identifier, .eof });
 }
 
 test "'#' starts a comment that runs to end of line" {

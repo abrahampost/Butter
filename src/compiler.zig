@@ -30,6 +30,8 @@ pub const SemanticError = error{
     InvalidArrayArgument,
     InvalidArrayReturn,
     EscapingArrayReference,
+    WrongStreamDirection,
+    CannotCloseStandardStream,
 };
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
@@ -356,6 +358,7 @@ pub const Compiler = struct {
             .function_decl => unreachable, // top-level only; compileModules never calls compileStmt on this
             .for_stmt => |f| try self.compileFor(f),
             .import_stmt => unreachable, // top-level only; compileModules never calls compileStmt on this
+            .close_stmt => |e| try self.compileCloseStmt(e),
         }
     }
 
@@ -531,6 +534,14 @@ pub const Compiler = struct {
             .index => |ix| try self.compileIndex(ix),
             .index_assign => |ia| try self.compileIndexAssign(ia),
             .len_of => |name| try self.compileLenOf(name),
+            .stream_literal => |s| {
+                const idx = try self.chunk.addConstant(self.allocator, .{ .stream = .ofStandard(s) });
+                _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+            },
+            .read_bytes => |r| try self.compileReadBytes(r),
+            .write_value => |w| try self.compileWriteValue(w),
+            .write_bytes => |w| try self.compileWriteBytes(w),
+            .open_file => |o| try self.compileOpenFile(o),
         }
     }
 
@@ -641,16 +652,28 @@ pub const Compiler = struct {
     /// Passing a call's FIXED-size result directly isn't supported (its
     /// values land in a transient stack position with no local slot to
     /// anchor a reference to) — assign it to a local array first.
+    /// Leaves exactly one ARRAY_REF value on the stack for the array local
+    /// named `name`, whichever kind it is: a FIXED local needs a fresh
+    /// reference synthesized to its slots (MAKE_ARRAY_REF), while a GENERIC
+    /// local already holds one, so LOAD_LOCAL forwarding it along is enough.
+    /// Shared by every context that wants an array by reference rather than
+    /// by value — a generic call argument, and `read`/`write`'s buffer
+    /// (ISA.bnf section 9) — which is exactly why neither the I/O opcodes
+    /// nor CALL need a fixed-vs-generic variant of their own.
+    /// `not_array_err` differs per context, the same way `compileArrayValue`
+    /// parameterizes its own invalid-form error.
+    fn emitArrayRef(self: *Compiler, name: []const u8, comptime not_array_err: SemanticError, not_array_msg: []const u8) CompileError!void {
+        const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
+        const spec = local.array orelse return self.fail(not_array_err, name, not_array_msg);
+        switch (spec) {
+            .fixed => |len| _ = try self.chunk.emitWithOperand(self.allocator, .make_array_ref, chunk_mod.packIndexOperand(local.slot, len)),
+            .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_local, local.slot),
+        }
+    }
+
     fn compileGenericArrayArgument(self: *Compiler, arg: *const ast.Expr) CompileError!void {
         switch (arg.*) {
-            .variable => |name| {
-                const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
-                const spec = local.array orelse return self.fail(SemanticError.InvalidArrayArgument, name, "not an array");
-                switch (spec) {
-                    .fixed => |len| _ = try self.chunk.emitWithOperand(self.allocator, .make_array_ref, chunk_mod.packIndexOperand(local.slot, len)),
-                    .generic => _ = try self.chunk.emitWithOperand(self.allocator, .load_local, local.slot),
-                }
-            },
+            .variable => |name| try self.emitArrayRef(name, SemanticError.InvalidArrayArgument, "not an array"),
             .call => |c| {
                 const info = try self.compileCallCommon(c);
                 const ret_spec = info.return_array_size orelse return self.fail(SemanticError.InvalidArrayArgument, c.name, "function call does not return an array");
@@ -798,6 +821,80 @@ pub const Compiler = struct {
         }
     }
 
+    /// Compiles the stream an I/O operation acts on, and — where the answer
+    /// is knowable now — rejects using it in a direction it doesn't support.
+    ///
+    /// A stream is a runtime value (it can be an opened file, whose
+    /// direction depends on the mode it was opened with), so the VM checks
+    /// direction too and is the only line of defence in general. But when
+    /// the source names one of the three standard streams by keyword the
+    /// answer IS static, and catching `read(stdout, buf)` at compile time —
+    /// where it can be reported against the keyword the program actually
+    /// wrote — beats catching it on the first execution.
+    fn compileStreamOperand(self: *Compiler, stream: *const ast.Expr, comptime dir: enum { read, write }) CompileError!void {
+        if (stream.* == .stream_literal) {
+            const standard = stream.stream_literal;
+            const ok = switch (dir) {
+                .read => standard == .stdin,
+                .write => standard == .stdout or standard == .stderr,
+            };
+            if (!ok) return switch (dir) {
+                .read => self.fail(SemanticError.WrongStreamDirection, standard.name(), "cannot read from this stream — of the standard streams only 'stdin' is readable"),
+                .write => self.fail(SemanticError.WrongStreamDirection, standard.name(), "cannot write to this stream — of the standard streams only 'stdout' and 'stderr' are writable"),
+            };
+        }
+        try self.compileExpr(stream);
+    }
+
+    /// `read(stream, buf)` — the stream is pushed first, then the buffer as
+    /// an ARRAY_REF (`emitArrayRef`, so a fixed and a generic buffer both
+    /// work and READ needs only one form), matching READ's
+    /// `( stream ref -- count )` stack effect.
+    fn compileReadBytes(self: *Compiler, r: ast.Expr.ReadBytes) CompileError!void {
+        try self.compileStreamOperand(r.stream, .read);
+        try self.emitArrayRef(r.buffer, SemanticError.NotAnArray, "read's destination must be an array");
+        _ = try self.chunk.emit(self.allocator, .read);
+    }
+
+    /// `write(stream, expr)` — an ordinary scalar expression, so this is
+    /// just its codegen followed by WRITE. Unlike `print`, no newline is
+    /// emitted; the value is rendered exactly as PRINT renders it and
+    /// nothing more.
+    fn compileWriteValue(self: *Compiler, w: ast.Expr.WriteValue) CompileError!void {
+        try self.compileStreamOperand(w.stream, .write);
+        try self.compileExpr(w.value);
+        _ = try self.chunk.emit(self.allocator, .write);
+    }
+
+    /// `write(stream, buf, count)` — mirrors `compileReadBytes`, with the
+    /// count pushed after the reference so the runtime stack order matches
+    /// WRITE_BYTES's `( stream ref count -- written )` stack effect.
+    fn compileWriteBytes(self: *Compiler, w: ast.Expr.WriteBytes) CompileError!void {
+        try self.compileStreamOperand(w.stream, .write);
+        try self.emitArrayRef(w.buffer, SemanticError.NotAnArray, "write's buffer must be an array");
+        try self.compileExpr(w.count);
+        _ = try self.chunk.emit(self.allocator, .write_bytes);
+    }
+
+    /// `open(path, mode)` — the path is an ordinary expression (it has to be
+    /// a string at runtime, which the VM checks), while the mode is a
+    /// compile-time keyword and so becomes OPEN's operand.
+    fn compileOpenFile(self: *Compiler, o: ast.Expr.OpenFile) CompileError!void {
+        try self.compileExpr(o.path);
+        _ = try self.chunk.emitWithOperand(self.allocator, .open, @intFromEnum(o.mode));
+    }
+
+    /// `close <expr>` — CLOSE consumes the stream and leaves nothing, so
+    /// unlike the other I/O forms there is no result to pop afterwards
+    /// (which is exactly why `close` is a statement).
+    fn compileCloseStmt(self: *Compiler, stream: *const ast.Expr) CompileError!void {
+        if (stream.* == .stream_literal) {
+            return self.fail(SemanticError.CannotCloseStandardStream, stream.stream_literal.name(), "cannot close a standard stream — it belongs to whoever ran this program");
+        }
+        try self.compileExpr(stream);
+        _ = try self.chunk.emit(self.allocator, .close);
+    }
+
     fn compileBinary(self: *Compiler, b: ast.Expr.Binary) CompileError!void {
         switch (b.op) {
             .logic_and => return self.compileLogicAnd(b),
@@ -874,8 +971,57 @@ fn runProgram(allocator: std.mem.Allocator, source: []const u8, buf: []u8) ![]co
 
     var vm = vm_mod.Vm.init();
     var writer = std.Io.Writer.fixed(buf);
-    try vm.run(&compiled, &writer);
+    try vm.run(&compiled, .{ .out = &writer });
     return writer.buffered();
+}
+
+const IoResult = struct { out: []const u8, err: []const u8 };
+
+/// `runProgram` with the other two streams wired up too: `input` is what
+/// the program's `read(stdin, ...)` sees, and stdout/stderr come back
+/// separately so a test can tell which stream a `write` actually reached.
+fn runProgramWithIo(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    input: []const u8,
+    out_buf: []u8,
+    err_buf: []u8,
+) !IoResult {
+    var lex = lexer_mod.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init();
+    var out = std.Io.Writer.fixed(out_buf);
+    var err = std.Io.Writer.fixed(err_buf);
+    var in = std.Io.Reader.fixed(input);
+    try vm.run(&compiled, .{ .out = &out, .err = &err, .in = &in });
+    return .{ .out = out.buffered(), .err = err.buffered() };
+}
+
+/// Compiles `source` expecting it to fail, returning the semantic error —
+/// for the I/O tests below, which are mostly about what the compiler
+/// rejects statically rather than what the VM does at runtime.
+fn expectCompileError(allocator: std.mem.Allocator, source: []const u8, expected: SemanticError) !void {
+    var lex = lexer_mod.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(expected, compiler.compileProgram(program));
+    try std.testing.expect(compiler.diagnostic != null);
 }
 
 /// Lexes and parses `source` in isolation, for building up the
@@ -1784,7 +1930,7 @@ test "compileModules: a module may call an exported function from a directly imp
 
     var vm = vm_mod.Vm.init();
     var writer = std.Io.Writer.fixed(&buf);
-    try vm.run(&compiled, &writer);
+    try vm.run(&compiled, .{ .out = &writer });
     try std.testing.expectEqualStrings("42\n", writer.buffered());
 }
 
@@ -1881,6 +2027,332 @@ test "compileModules: two modules importing the same module both see one compile
 
     var vm = vm_mod.Vm.init();
     var writer = std.Io.Writer.fixed(&buf);
-    try vm.run(&compiled, &writer);
+    try vm.run(&compiled, .{ .out = &writer });
     try std.testing.expectEqualStrings("20\n", writer.buffered());
+}
+
+// ---- Byte-stream I/O (GRAMMAR.bnf design note 3k) -----------------------
+
+test "write emits a value with no trailing newline, unlike print" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithIo(allocator,
+        \\write(stdout, 1)
+        \\write(stdout, 2)
+        \\print 3
+    , "", &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("123\n", result.out);
+}
+
+test "write to stderr stays out of stdout" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithIo(allocator,
+        \\write(stdout, "to out")
+        \\write(stderr, "to err")
+    , "", &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("to out", result.out);
+    try std.testing.expectEqualStrings("to err", result.err);
+}
+
+test "write evaluates to the number of bytes it wrote" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithIo(allocator,
+        \\print write(stderr, "hello")
+        \\print write(stderr, 1000)
+        \\print write(stderr, true)
+    , "", &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("5\n4\n4\n", result.out);
+    try std.testing.expectEqualStrings("hello1000true", result.err);
+}
+
+test "read fills a fixed-size buffer and evaluates to the byte count" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithIo(allocator,
+        \\int[4] buf
+        \\int n := read(stdin, buf)
+        \\print n
+        \\print buf[0]
+        \\print buf[3]
+    , "ABCD", &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("4\n65\n68\n", result.out);
+}
+
+test "read then write round-trips bytes through a buffer" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithIo(allocator,
+        \\int[16] buf
+        \\int n := read(stdin, buf)
+        \\write(stdout, buf, n)
+    , "round trip", &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("round trip", result.out);
+}
+
+test "a read/write loop copies input larger than the buffer" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    // A 3-byte buffer against 10 bytes of input: only a loop that keeps
+    // reading until `read` reports 0 copies all of it.
+    const result = try runProgramWithIo(allocator,
+        \\int[3] buf
+        \\int n := read(stdin, buf)
+        \\while n > 0 {
+        \\    write(stdout, buf, n)
+        \\    n := read(stdin, buf)
+        \\}
+    , "0123456789", &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("0123456789", result.out);
+}
+
+test "read at end of input evaluates to 0" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithIo(allocator,
+        \\int[4] buf
+        \\print read(stdin, buf)
+    , "", &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("0\n", result.out);
+}
+
+test "a generic (unsized) buffer works for I/O, and by reference" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    // `fill` reads into the CALLER's own slots — a generic array parameter
+    // is a reference, not a copy (design note 3j) — so the bytes are still
+    // there to write back out after the call returns.
+    const result = try runProgramWithIo(allocator,
+        \\func fill(int[] b) -> int {
+        \\    return read(stdin, b)
+        \\}
+        \\int[8] buf
+        \\int n := fill(buf)
+        \\print n
+        \\write(stdout, buf, n)
+    , "hey", &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("3\nhey", result.out);
+}
+
+test "a buffer of byte values writes exactly those bytes" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    // 72/105/10 are 'H', 'i', and a newline — how a program emits a raw
+    // newline, since Butter string literals have no escape sequences.
+    const result = try runProgramWithIo(allocator,
+        \\int[3] line := [72, 105, 10]
+        \\write(stdout, line, 3)
+    , "", &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("Hi\n", result.out);
+}
+
+test "reading from a non-readable stream is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int[2] b\nread(stdout, b)\n", SemanticError.WrongStreamDirection);
+    try expectCompileError(allocator, "int[2] b\nread(stderr, b)\n", SemanticError.WrongStreamDirection);
+}
+
+test "writing to a non-writable stream is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "write(stdin, 1)\n", SemanticError.WrongStreamDirection);
+    try expectCompileError(allocator, "int[2] b\nwrite(stdin, b, 1)\n", SemanticError.WrongStreamDirection);
+}
+
+test "read/write's buffer must name an array, not a scalar" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int x := 1\nread(stdin, x)\n", SemanticError.NotAnArray);
+    try expectCompileError(allocator, "int x := 1\nwrite(stdout, x, 1)\n", SemanticError.NotAnArray);
+}
+
+test "read/write's buffer must be a declared name" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "read(stdin, nope)\n", SemanticError.UndefinedVariable);
+    try expectCompileError(allocator, "write(stdout, nope, 1)\n", SemanticError.UndefinedVariable);
+}
+
+// ---- Files (GRAMMAR.bnf design note 3l) ----------------------------------
+
+/// `runProgramWithIo` with real filesystem access wired up too, rooted at
+/// `dir` (a test's own `std.testing.tmpDir`) — what `open` needs to do
+/// anything at all (`Host.fs`).
+fn runProgramWithFs(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    dir: std.Io.Dir,
+    out_buf: []u8,
+    err_buf: []u8,
+) !IoResult {
+    var lex = lexer_mod.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init();
+    var out = std.Io.Writer.fixed(out_buf);
+    var err = std.Io.Writer.fixed(err_buf);
+    try vm.run(&compiled, .{
+        .out = &out,
+        .err = &err,
+        .fs = .{ .io = std.testing.io, .dir = dir },
+    });
+    return .{ .out = out.buffered(), .err = err.buffered() };
+}
+
+test "open/write/close, then reopen/read/close, round-trips a file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithFs(allocator,
+        \\int f := open("greeting.txt", write)
+        \\write(f, "hello")
+        \\close f
+        \\int g := open("greeting.txt", read)
+        \\int[16] buf
+        \\int n := read(g, buf)
+        \\close g
+        \\print n
+        \\write(stdout, buf, n)
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("5\nhello", result.out);
+}
+
+test "append mode adds to a file's existing content instead of truncating it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithFs(allocator,
+        \\int f := open("log.txt", write)
+        \\write(f, "one")
+        \\close f
+        \\int g := open("log.txt", append)
+        \\write(g, "two")
+        \\close g
+        \\int h := open("log.txt", read)
+        \\int[16] buf
+        \\int n := read(h, buf)
+        \\close h
+        \\write(stdout, buf, n)
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("onetwo", result.out);
+}
+
+test "write mode truncates an existing file rather than appending to it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithFs(allocator,
+        \\int f := open("log.txt", write)
+        \\write(f, "first version, quite long")
+        \\close f
+        \\int g := open("log.txt", write)
+        \\write(g, "short")
+        \\close g
+        \\int h := open("log.txt", read)
+        \\int[64] buf
+        \\int n := read(h, buf)
+        \\close h
+        \\print n
+        \\write(stdout, buf, n)
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("5\nshort", result.out);
+}
+
+test "opening a nonexistent file for reading is a runtime error" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.FileOpenFailed, runProgramWithFs(allocator,
+        \\open("does-not-exist.txt", read)
+    , tmp.dir, &out_buf, &err_buf));
+}
+
+test "using a file after it's been closed is a clean error, not a stale handle" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.StreamClosed, runProgramWithFs(allocator,
+        \\int f := open("data.txt", write)
+        \\close f
+        \\close f
+    , tmp.dir, &out_buf, &err_buf));
+}
+
+test "opening more files at once than the table holds is a runtime error" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TooManyOpenFiles, runProgramWithFs(allocator,
+        \\int f := open("data.txt", write)
+        \\close f
+        \\for i in 0..9 {
+        \\    open("data.txt", read)
+        \\}
+    , tmp.dir, &out_buf, &err_buf));
+}
+
+test "a program run with no filesystem access can't open files" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.FilesUnavailable, runProgramWithIo(allocator,
+        \\open("anything.txt", read)
+    , "", &out_buf, &err_buf));
+}
+
+test "closing a standard stream named directly is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "close stdout\n", SemanticError.CannotCloseStandardStream);
+    try expectCompileError(allocator, "close stdin\n", SemanticError.CannotCloseStandardStream);
+    try expectCompileError(allocator, "close stderr\n", SemanticError.CannotCloseStandardStream);
+}
+
+test "closing a standard stream reached through a variable is a runtime error instead" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.CannotCloseStandardStream, runProgramWithIo(allocator,
+        \\int s := stdout
+        \\close s
+    , "", &out_buf, &err_buf));
+}
+
+test "an opened file's direction is checked at runtime, not compile time" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.StreamNotReadable, runProgramWithFs(allocator,
+        \\int f := open("data.txt", write)
+        \\int[4] buf
+        \\read(f, buf)
+    , tmp.dir, &out_buf, &err_buf));
 }

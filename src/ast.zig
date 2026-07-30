@@ -5,6 +5,22 @@
 
 const std = @import("std");
 
+/// Re-exported so the AST and the ISA name the same three streams by the
+/// same type (see `value.Stream` for why it's declared over there). Only
+/// `Standard` appears in the AST — the three keyword-named streams, which
+/// are the only streams source code can spell out. A `file` stream has no
+/// syntax at all; it only ever comes from evaluating an `open` at runtime,
+/// which is exactly why the stream that `read`/`write` act on is a general
+/// `*Expr` here rather than a fixed tag (design note 3l).
+pub const Stream = @import("value.zig").Stream;
+
+/// `'read' | 'write' | 'append'` in the mode position of an `open`
+/// (re-exported from `value` alongside `Stream`, same reasoning). Kept
+/// distinct from the `read`/`write` *operations* that share those keywords:
+/// the parser only ever looks for a mode where a mode is legal, so there is
+/// no ambiguity to resolve.
+pub const OpenMode = @import("value.zig").OpenMode;
+
 pub const ValueType = enum {
     int,
     float,
@@ -76,6 +92,12 @@ pub const Expr = union(enum) {
     /// `len(IDENTIFIER)` — only ever a bare array name, matching `Index`'s
     /// restriction to bare identifiers (no chained/computed targets).
     len_of: []const u8,
+    /// One of the three keyword-named streams, as a value.
+    stream_literal: Stream.Standard,
+    read_bytes: ReadBytes,
+    write_value: WriteValue,
+    write_bytes: WriteBytes,
+    open_file: OpenFile,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -110,6 +132,46 @@ pub const Expr = union(enum) {
         index: *Expr,
         value: *Expr,
     };
+
+    /// `read(stream, buffer)` — fills `buffer`'s elements with raw bytes
+    /// (one byte per element, 0-255) and evaluates to how many were read,
+    /// 0 at end of input (GRAMMAR.bnf design note 3k). `stream` is an
+    /// arbitrary expression so an opened file works everywhere `stdin`
+    /// does, but `buffer` is still a bare array name for the same reason
+    /// `Index`'s and `len_of`'s targets are: arrays aren't first-class
+    /// values there'd be an expression to compute one from.
+    pub const ReadBytes = struct {
+        stream: *Expr,
+        buffer: []const u8,
+    };
+
+    /// `write(stream, expr)` — writes `expr`'s value in exactly the
+    /// rendering `print` uses but WITHOUT a trailing newline, and evaluates
+    /// to how many bytes that took.
+    pub const WriteValue = struct {
+        stream: *Expr,
+        value: *Expr,
+    };
+
+    /// `write(stream, buffer, count)` — writes the first `count` elements
+    /// of `buffer` as raw bytes, the inverse of `ReadBytes`. Distinguished
+    /// from `WriteValue` purely by argument count (see parser.zig's
+    /// `writeExpr`), so `write(f, x)` and `write(f, buf, n)` never need
+    /// different keywords.
+    pub const WriteBytes = struct {
+        stream: *Expr,
+        buffer: []const u8,
+        count: *Expr,
+    };
+
+    /// `open(path, mode)` — evaluates to a new stream naming that file
+    /// (design note 3l). `path` is an arbitrary expression that must be a
+    /// string at runtime; `mode` is a bare keyword, so which direction the
+    /// file is opened in is always known at compile time.
+    pub const OpenFile = struct {
+        path: *Expr,
+        mode: OpenMode,
+    };
 };
 
 pub const Stmt = union(enum) {
@@ -123,6 +185,10 @@ pub const Stmt = union(enum) {
     return_stmt: *Expr,
     for_stmt: For,
     import_stmt: Import,
+    /// `close <expression>` — a statement rather than an expression because,
+    /// unlike `open`/`read`/`write`, it produces no value; `print` is the
+    /// same shape for the same reason (design note 3l).
+    close_stmt: *Expr,
 
     pub const VarDecl = struct {
         type: ValueType,
@@ -251,6 +317,31 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try writer.writeAll(")");
         },
         .len_of => |name| try writer.print("(len {s})", .{name}),
+        .stream_literal => |s| try writer.writeAll(s.name()),
+        .read_bytes => |r| {
+            try writer.writeAll("(read ");
+            try printExpr(writer, r.stream);
+            try writer.print(" {s})", .{r.buffer});
+        },
+        .write_value => |w| {
+            try writer.writeAll("(write ");
+            try printExpr(writer, w.stream);
+            try writer.writeAll(" ");
+            try printExpr(writer, w.value);
+            try writer.writeAll(")");
+        },
+        .write_bytes => |w| {
+            try writer.writeAll("(write ");
+            try printExpr(writer, w.stream);
+            try writer.print(" {s} ", .{w.buffer});
+            try printExpr(writer, w.count);
+            try writer.writeAll(")");
+        },
+        .open_file => |o| {
+            try writer.writeAll("(open ");
+            try printExpr(writer, o.path);
+            try writer.print(" {s})", .{o.mode.name()});
+        },
     }
 }
 
@@ -371,6 +462,11 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
             try writer.writeAll(")");
         },
         .import_stmt => |i| try writer.print("(import \"{s}\")", .{i.path}),
+        .close_stmt => |e| {
+            try writer.writeAll("(close ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
     }
 }
 
