@@ -250,3 +250,119 @@ test "int(x) on a float outside i64's range is a runtime Overflow" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.Overflow, run(allocator, "print int(99999999999999999999999999999999.0)\n"));
 }
+
+// ---- Compile errors: reported line number ------------------------------
+//
+// The compiler stamps every diagnostic with the source line of the
+// statement it failed on (compiler.zig's `current_line`/`fail`). These
+// drive that line-tracking through the same loader -> compiler pipeline
+// `run` uses, but stop short of the VM, and check *which* line lands in
+// the diagnostic — not just that compilation failed — since a wrong-line
+// diagnostic is a distinct, less obvious bug from a wrong-error diagnostic.
+
+/// Compiles `source` expecting it to fail with `expected`, then asserts
+/// the diagnostic's line number is `expected_line`.
+fn expectCompileErrorAtLine(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    expected: butter.compiler.SemanticError,
+    expected_line: usize,
+) !void {
+    var loader = butter.module.Loader.init(allocator, std.testing.io, std.Io.Dir.cwd());
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(source, "<test>", ".");
+    const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry);
+
+    var compiler = butter.compiler.Compiler.init(allocator);
+    defer compiler.deinit();
+
+    try std.testing.expectError(expected, compiler.compileModules(modules.entry_index, modules.units));
+
+    const diag = compiler.diagnostic orelse return error.TestExpectedDiagnostic;
+    try std.testing.expectEqual(expected_line, diag.line);
+}
+
+test "compile error line: undefined variable reports the line it's used on, not line 1" {
+    const allocator = std.testing.allocator;
+    try expectCompileErrorAtLine(
+        allocator,
+        "int a := 1\nint b := 2\nprint a + nope\n",
+        error.UndefinedVariable,
+        3,
+    );
+}
+
+test "compile error line: error nested inside an if/while/for reports the inner statement's own line, not the block's" {
+    const allocator = std.testing.allocator;
+    try expectCompileErrorAtLine(
+        allocator,
+        "int i\n" ++
+            "while true {\n" ++
+            "    print 1\n" ++
+            "    print nope\n" ++
+            "}\n",
+        error.UndefinedVariable,
+        4,
+    );
+}
+
+test "compile error line: error in a function body reports the line within that function, not the call site" {
+    const allocator = std.testing.allocator;
+    try expectCompileErrorAtLine(
+        allocator,
+        "func greet() -> int {\n" ++
+            "    print \"hi\"\n" ++
+            "    print missing\n" ++
+            "}\n" ++
+            "greet()\n",
+        error.UndefinedVariable,
+        3,
+    );
+}
+
+test "compile error line: error in the second of two functions doesn't inherit the line from the first" {
+    const allocator = std.testing.allocator;
+    try expectCompileErrorAtLine(
+        allocator,
+        "func first() -> int {\n" ++
+            "    print 1\n" ++
+            "    print 2\n" ++
+            "    return 3\n" ++
+            "}\n" ++
+            "func second() -> int {\n" ++
+            "    print oops\n" ++
+            "    return 0\n" ++
+            "}\n" ++
+            "first()\n",
+        error.UndefinedVariable,
+        7,
+    );
+}
+
+test "compile error line: array length mismatch reports the declaration's own line" {
+    const allocator = std.testing.allocator;
+    try expectCompileErrorAtLine(
+        allocator,
+        "int x := 1\nint y := 2\nint[3] a := [1, 2]\n",
+        error.ArrayLengthMismatch,
+        3,
+    );
+}
+
+test "compile error line: duplicate function declaration reports the second declaration's line, not line 0" {
+    const allocator = std.testing.allocator;
+    try expectCompileErrorAtLine(
+        allocator,
+        "func f() -> int {\n" ++
+            "    print 1\n" ++
+            "    return 1\n" ++
+            "}\n" ++
+            "func f() -> int {\n" ++
+            "    print 2\n" ++
+            "    return 2\n" ++
+            "}\n",
+        error.DuplicateFunction,
+        5,
+    );
+}

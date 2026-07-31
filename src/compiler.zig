@@ -46,6 +46,7 @@ pub const SemanticError = error{
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
 pub const Diagnostic = struct {
+    line: usize,
     name: []const u8,
     message: []const u8,
 };
@@ -193,6 +194,9 @@ pub const Compiler = struct {
     /// this to decide whether a `return` needs `compileArrayReturn` instead
     /// of a plain `compileExpr`.
     current_return_array_size: ?ast.ArraySpec = null,
+    /// The line number of the statement currently being compiled, used by
+    /// `fail()` to stamp error diagnostics with accurate source locations.
+    current_line: usize = 0,
     diagnostic: ?Diagnostic = null,
 
     pub fn init(allocator: std.mem.Allocator) Compiler {
@@ -241,9 +245,10 @@ pub const Compiler = struct {
     pub fn compileModules(self: *Compiler, entry: usize, modules: []const ModuleUnit) CompileError!chunk_mod.Program {
         for (modules, 0..) |m, mi| {
             for (m.program) |*stmt| {
-                if (stmt.* != .function_decl) continue;
-                const f = stmt.function_decl;
+                if (stmt.kind != .function_decl) continue;
+                const f = stmt.kind.function_decl;
                 if (self.findFunction(f.name) != null) {
+                    self.current_line = stmt.line;
                     return self.fail(SemanticError.DuplicateFunction, f.name, "function already declared");
                 }
                 try self.functions.append(self.allocator, .{
@@ -269,7 +274,7 @@ pub const Compiler = struct {
         var main_chunk: Chunk = blk: {
             errdefer self.chunk.deinit(self.allocator);
             for (modules[entry].program) |*stmt| {
-                if (stmt.* == .function_decl or stmt.* == .import_stmt) continue;
+                if (stmt.kind == .function_decl or stmt.kind == .import_stmt) continue;
                 try self.compileStmt(stmt);
             }
             _ = try self.chunk.emit(self.allocator, .halt);
@@ -289,8 +294,8 @@ pub const Compiler = struct {
             self.current_module = mi;
             self.visible_imports = m.imports;
             for (m.program) |*stmt| {
-                if (stmt.* != .function_decl) continue;
-                const f = stmt.function_decl;
+                if (stmt.kind != .function_decl) continue;
+                const f = stmt.kind.function_decl;
                 const info = self.findFunction(f.name).?; // registered in pass 1, above
                 const body_chunk = try self.compileFunctionBody(f);
                 try compiled.append(self.allocator, .{
@@ -312,7 +317,7 @@ pub const Compiler = struct {
     /// usual. If control falls off the end without an explicit `return`,
     /// the return type's zero value is returned implicitly (the same
     /// `defaultValue` a var-decl without an initializer gets).
-    fn compileFunctionBody(self: *Compiler, f: ast.Stmt.FunctionDecl) CompileError!Chunk {
+    fn compileFunctionBody(self: *Compiler, f: ast.StmtKind.FunctionDecl) CompileError!Chunk {
         self.chunk = .{};
         errdefer self.chunk.deinit(self.allocator);
         self.locals.clearRetainingCapacity();
@@ -376,12 +381,13 @@ pub const Compiler = struct {
     }
 
     fn fail(self: *Compiler, comptime err: SemanticError, name: []const u8, message: []const u8) CompileError {
-        self.diagnostic = .{ .name = name, .message = message };
+        self.diagnostic = .{ .line = self.current_line, .name = name, .message = message };
         return err;
     }
 
     fn compileStmt(self: *Compiler, stmt: *const ast.Stmt) CompileError!void {
-        switch (stmt.*) {
+        self.current_line = stmt.line;
+        switch (stmt.kind) {
             .var_decl => |d| try self.compileVarDecl(d),
             .block => |stmts| try self.compileBlock(stmts),
             .if_stmt => |i| try self.compileIf(i),
@@ -433,7 +439,7 @@ pub const Compiler = struct {
     /// A declared local's runtime storage IS the value its initializer
     /// (or its type's zero value) leaves on the stack — there is no
     /// separate store step at declaration time (ISA.bnf section 5).
-    fn compileVarDecl(self: *Compiler, d: ast.Stmt.VarDecl) CompileError!void {
+    fn compileVarDecl(self: *Compiler, d: ast.StmtKind.VarDecl) CompileError!void {
         const slot = self.next_slot;
         if (collectionKind(d.type)) |kind| {
             // Always exactly one heap-reference slot — an initializer, if
@@ -518,7 +524,7 @@ pub const Compiler = struct {
     /// clox-style backpatched jumps (ISA.bnf section 4): emit the branch
     /// with a placeholder target, keep compiling, then patch the target
     /// once it's known.
-    fn compileIf(self: *Compiler, i: ast.Stmt.If) CompileError!void {
+    fn compileIf(self: *Compiler, i: ast.StmtKind.If) CompileError!void {
         try self.compileExpr(i.condition);
         const then_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false, 0);
         _ = try self.chunk.emit(self.allocator, .pop);
@@ -532,7 +538,7 @@ pub const Compiler = struct {
         self.chunk.patchOperand(else_jump, @intCast(self.chunk.code.items.len));
     }
 
-    fn compileWhile(self: *Compiler, w: ast.Stmt.While) CompileError!void {
+    fn compileWhile(self: *Compiler, w: ast.StmtKind.While) CompileError!void {
         const loop_start = self.chunk.code.items.len;
         try self.compileExpr(w.condition);
         const exit_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false, 0);
@@ -553,7 +559,7 @@ pub const Compiler = struct {
     /// only `compileFor` knows about: the end bound (evaluated once, up
     /// front — not re-evaluated per iteration) and the loop variable
     /// itself, which the body resolves like any other local by name.
-    fn compileFor(self: *Compiler, f: ast.Stmt.For) CompileError!void {
+    fn compileFor(self: *Compiler, f: ast.StmtKind.For) CompileError!void {
         self.scope_depth += 1;
 
         try self.compileExpr(f.end);

@@ -168,11 +168,12 @@ pub const Parser = struct {
     /// literal in `primary`) — resolving it to an actual file is the
     /// module loader's job (module.zig), not the parser's.
     fn importDeclaration(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = self.advance(); // 'import'
         const path_tok = try self.expect(.string, "expected a file path string after 'import'");
         const path = try self.unescapeString(path_tok.lexeme[1 .. path_tok.lexeme.len - 1]);
         try self.consumeEnd();
-        return ast.Stmt{ .import_stmt = .{ .path = path } };
+        return ast.Stmt{ .kind = .{ .import_stmt = .{ .path = path } }, .line = line };
     }
 
     // ---- <declaration> -------------------------------------------------
@@ -221,6 +222,7 @@ pub const Parser = struct {
     /// optional leading 'export' keyword, which this function itself never
     /// looks at (the 'func' token must already be the current token).
     fn functionDeclaration(self: *Parser, exported: bool) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = self.advance(); // 'func'
         const name_tok = try self.expect(.identifier, "expected a function name");
 
@@ -246,14 +248,14 @@ pub const Parser = struct {
 
         const body_stmt = try self.block();
 
-        return ast.Stmt{ .function_decl = .{
+        return ast.Stmt{ .kind = .{ .function_decl = .{
             .name = name_tok.lexeme,
             .params = try params.toOwnedSlice(self.allocator()),
             .return_type = return_type,
             .return_array_size = return_array_size,
-            .body = body_stmt.block,
+            .body = body_stmt.kind.block,
             .exported = exported,
-        } };
+        } }, .line = line };
     }
 
     /// `[ '[' INT ']' ]` — used by `varDeclaration`, which only ever
@@ -281,6 +283,7 @@ pub const Parser = struct {
     /// <var-declaration> ::= <type> [ '[' INT ']' ] IDENTIFIER
     ///                       [ ':=' <expression> ] <end>
     fn varDeclaration(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         const value_type = try self.parseType();
         // map/list never take the array-size suffix (GRAMMAR.bnf design
         // note 3m) — writing `map[3] m` simply never gets this far as an
@@ -293,11 +296,12 @@ pub const Parser = struct {
         if (self.match(.colon_equal)) initializer = try self.expression();
 
         try self.consumeEnd();
-        return ast.Stmt{ .var_decl = .{ .type = value_type, .array_len = array_len, .name = name_tok.lexeme, .initializer = initializer } };
+        return ast.Stmt{ .kind = .{ .var_decl = .{ .type = value_type, .array_len = array_len, .name = name_tok.lexeme, .initializer = initializer } }, .line = line };
     }
 
     /// <block> ::= '{' { NEWLINE } { <declaration> { NEWLINE } } '}'
     fn block(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = try self.expect(.lbrace, "expected '{'");
         self.skipNewlines();
 
@@ -308,11 +312,12 @@ pub const Parser = struct {
         }
 
         _ = try self.expect(.rbrace, "expected '}' to close block");
-        return ast.Stmt{ .block = try stmts.toOwnedSlice(self.allocator()) };
+        return ast.Stmt{ .kind = .{ .block = try stmts.toOwnedSlice(self.allocator()) }, .line = line };
     }
 
     /// <if-stmt> ::= 'if' <expression> <declaration> { NEWLINE } [ 'else' <declaration> ]
     fn ifStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = self.advance(); // 'if'
         const condition = try self.expression();
         const then_branch = try self.createStmt(try self.declaration());
@@ -321,15 +326,16 @@ pub const Parser = struct {
         var else_branch: ?*ast.Stmt = null;
         if (self.match(.kw_else)) else_branch = try self.createStmt(try self.declaration());
 
-        return ast.Stmt{ .if_stmt = .{ .condition = condition, .then_branch = then_branch, .else_branch = else_branch } };
+        return ast.Stmt{ .kind = .{ .if_stmt = .{ .condition = condition, .then_branch = then_branch, .else_branch = else_branch } }, .line = line };
     }
 
     /// <while-stmt> ::= 'while' <expression> <declaration>
     fn whileStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = self.advance(); // 'while'
         const condition = try self.expression();
         const body = try self.createStmt(try self.declaration());
-        return ast.Stmt{ .while_stmt = .{ .condition = condition, .body = body } };
+        return ast.Stmt{ .kind = .{ .while_stmt = .{ .condition = condition, .body = body } }, .line = line };
     }
 
     /// <for-stmt> ::= 'for' IDENTIFIER 'in' <expression> '..' <expression> <declaration>
@@ -339,6 +345,7 @@ pub const Parser = struct {
     /// evaluated exactly once at loop entry (not re-evaluated per
     /// iteration), matching typical for-range semantics.
     fn forStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = self.advance(); // 'for'
         const name_tok = try self.expect(.identifier, "expected a loop variable name");
         _ = try self.expect(.kw_in, "expected 'in' after loop variable");
@@ -346,7 +353,7 @@ pub const Parser = struct {
         _ = try self.expect(.dot_dot, "expected '..' in for-loop range");
         const end = try self.expression();
         const body = try self.createStmt(try self.declaration());
-        return ast.Stmt{ .for_stmt = .{ .var_name = name_tok.lexeme, .start = start, .end = end, .body = body } };
+        return ast.Stmt{ .kind = .{ .for_stmt = .{ .var_name = name_tok.lexeme, .start = start, .end = end, .body = body } }, .line = line };
     }
 
     // ---- <statement> ---------------------------------------------------
@@ -361,10 +368,11 @@ pub const Parser = struct {
 
     /// <print-stmt> ::= 'print' <expression> <end>
     fn printStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = self.advance(); // 'print'
         const value = try self.expression();
         try self.consumeEnd();
-        return ast.Stmt{ .print_stmt = value };
+        return ast.Stmt{ .kind = .{ .print_stmt = value }, .line = line };
     }
 
     /// <close-stmt> ::= 'close' <expression> <end>
@@ -372,10 +380,11 @@ pub const Parser = struct {
     /// A statement, not an expression, because closing produces no value —
     /// exactly the shape (and the reason) `print` has.
     fn closeStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = self.advance(); // 'close'
         const stream = try self.expression();
         try self.consumeEnd();
-        return ast.Stmt{ .close_stmt = stream };
+        return ast.Stmt{ .kind = .{ .close_stmt = stream }, .line = line };
     }
 
     /// <exit-stmt> ::= 'exit' <expression> <end>
@@ -383,25 +392,28 @@ pub const Parser = struct {
     /// A statement, not an expression, for the same reason `close` is —
     /// nothing after it can ever run, so there is no result to hand back to.
     fn exitStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = self.advance(); // 'exit'
         const code = try self.expression();
         try self.consumeEnd();
-        return ast.Stmt{ .exit_stmt = code };
+        return ast.Stmt{ .kind = .{ .exit_stmt = code }, .line = line };
     }
 
     /// <return-stmt> ::= 'return' <expression> <end>
     fn returnStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         _ = self.advance(); // 'return'
         const value = try self.expression();
         try self.consumeEnd();
-        return ast.Stmt{ .return_stmt = value };
+        return ast.Stmt{ .kind = .{ .return_stmt = value }, .line = line };
     }
 
     /// <expr-stmt> ::= <expression> <end>
     fn exprStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
         const value = try self.expression();
         try self.consumeEnd();
-        return ast.Stmt{ .expr_stmt = value };
+        return ast.Stmt{ .kind = .{ .expr_stmt = value }, .line = line };
     }
 
     /// <end> ::= NEWLINE | EOF | ε (only when the next token is '}')
@@ -968,7 +980,7 @@ test "parses a variable declaration with an initializer" {
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
-    const decl = result.program[0].var_decl;
+    const decl = result.program[0].kind.var_decl;
     try std.testing.expectEqual(ast.ValueType.int, decl.type);
     try std.testing.expectEqualStrings("x", decl.name);
     try std.testing.expect(decl.initializer != null);
@@ -980,7 +992,7 @@ test "variable declaration without an initializer" {
     var result = try parseProgramSource(allocator, "bool flag\n");
     defer result.parser.deinit();
 
-    const decl = result.program[0].var_decl;
+    const decl = result.program[0].kind.var_decl;
     try std.testing.expectEqual(ast.ValueType.bool, decl.type);
     try std.testing.expect(decl.initializer == null);
 }
@@ -991,9 +1003,9 @@ test "a single-line block does not require a newline after '{' (grammar fix d)" 
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
-    const block = result.program[0].block;
+    const block = result.program[0].kind.block;
     try std.testing.expectEqual(@as(usize, 1), block.len);
-    try std.testing.expectEqual(@as(i64, 1), block[0].print_stmt.literal.int);
+    try std.testing.expectEqual(@as(i64, 1), block[0].kind.print_stmt.literal.int);
 }
 
 test "if/else with single-line blocks on one logical statement (grammar fix d)" {
@@ -1001,10 +1013,10 @@ test "if/else with single-line blocks on one logical statement (grammar fix d)" 
     var result = try parseProgramSource(allocator, "if x { print 1 } else { print 2 }");
     defer result.parser.deinit();
 
-    const if_stmt = result.program[0].if_stmt;
+    const if_stmt = result.program[0].kind.if_stmt;
     try std.testing.expectEqualStrings("x", if_stmt.condition.variable);
-    try std.testing.expectEqual(@as(i64, 1), if_stmt.then_branch.block[0].print_stmt.literal.int);
-    try std.testing.expectEqual(@as(i64, 2), if_stmt.else_branch.?.block[0].print_stmt.literal.int);
+    try std.testing.expectEqual(@as(i64, 1), if_stmt.then_branch.kind.block[0].kind.print_stmt.literal.int);
+    try std.testing.expectEqual(@as(i64, 2), if_stmt.else_branch.?.kind.block[0].kind.print_stmt.literal.int);
 }
 
 test "else if chains without a dedicated elif keyword (design note c)" {
@@ -1016,11 +1028,11 @@ test "else if chains without a dedicated elif keyword (design note c)" {
     );
     defer result.parser.deinit();
 
-    const outer = result.program[0].if_stmt;
+    const outer = result.program[0].kind.if_stmt;
     try std.testing.expectEqualStrings("a", outer.condition.variable);
-    const inner = outer.else_branch.?.if_stmt;
+    const inner = outer.else_branch.?.kind.if_stmt;
     try std.testing.expectEqualStrings("b", inner.condition.variable);
-    try std.testing.expectEqual(@as(i64, 3), inner.else_branch.?.print_stmt.literal.int);
+    try std.testing.expectEqual(@as(i64, 3), inner.else_branch.?.kind.print_stmt.literal.int);
 }
 
 test "while loop parses condition and a block body" {
@@ -1032,9 +1044,9 @@ test "while loop parses condition and a block body" {
     );
     defer result.parser.deinit();
 
-    const while_stmt = result.program[0].while_stmt;
+    const while_stmt = result.program[0].kind.while_stmt;
     try std.testing.expectEqualStrings("x", while_stmt.condition.variable);
-    try std.testing.expectEqual(@as(usize, 1), while_stmt.body.block.len);
+    try std.testing.expectEqual(@as(usize, 1), while_stmt.body.kind.block.len);
 }
 
 test "blank lines are allowed before the first declaration (grammar fix e)" {
@@ -1095,17 +1107,17 @@ test "a full program with nested control flow" {
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), result.program.len);
-    try std.testing.expectEqual(ast.ValueType.int, result.program[0].var_decl.type);
-    try std.testing.expectEqual(ast.ValueType.int, result.program[1].var_decl.type);
+    try std.testing.expectEqual(ast.ValueType.int, result.program[0].kind.var_decl.type);
+    try std.testing.expectEqual(ast.ValueType.int, result.program[1].kind.var_decl.type);
 
-    const while_stmt = result.program[2].while_stmt;
+    const while_stmt = result.program[2].kind.while_stmt;
     try std.testing.expectEqual(ast.BinaryOp.lt, while_stmt.condition.binary.op);
 
-    const while_body = while_stmt.body.block;
+    const while_body = while_stmt.body.kind.block;
     try std.testing.expectEqual(@as(usize, 2), while_body.len);
-    try std.testing.expectEqual(ast.BinaryOp.mod, while_body[0].if_stmt.condition.binary.left.binary.op);
+    try std.testing.expectEqual(ast.BinaryOp.mod, while_body[0].kind.if_stmt.condition.binary.left.binary.op);
 
-    try std.testing.expectEqualStrings("total", result.program[3].print_stmt.variable);
+    try std.testing.expectEqualStrings("total", result.program[3].kind.print_stmt.variable);
 }
 
 test "parses a function declaration with parameters and a return type" {
@@ -1118,7 +1130,7 @@ test "parses a function declaration with parameters and a return type" {
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
-    const f = result.program[0].function_decl;
+    const f = result.program[0].kind.function_decl;
     try std.testing.expectEqualStrings("add", f.name);
     try std.testing.expectEqual(ast.ValueType.int, f.return_type);
     try std.testing.expectEqual(@as(usize, 2), f.params.len);
@@ -1126,7 +1138,7 @@ test "parses a function declaration with parameters and a return type" {
     try std.testing.expectEqualStrings("a", f.params[0].name);
     try std.testing.expectEqualStrings("b", f.params[1].name);
     try std.testing.expectEqual(@as(usize, 1), f.body.len);
-    try std.testing.expectEqualStrings("a", f.body[0].return_stmt.binary.left.variable);
+    try std.testing.expectEqualStrings("a", f.body[0].kind.return_stmt.binary.left.variable);
 }
 
 test "parses a function with an array parameter and an array return type" {
@@ -1141,12 +1153,12 @@ test "parses a function with an array parameter and an array return type" {
     );
     defer result.parser.deinit();
 
-    const first = result.program[0].function_decl;
+    const first = result.program[0].kind.function_decl;
     try std.testing.expectEqual(@as(usize, 1), first.params.len);
     try std.testing.expectEqual(@as(u32, 3), first.params[0].array_size.?.fixed);
     try std.testing.expectEqual(@as(?ast.ArraySpec, null), first.return_array_size);
 
-    const pair = result.program[1].function_decl;
+    const pair = result.program[1].kind.function_decl;
     try std.testing.expectEqual(@as(usize, 0), pair.params.len);
     try std.testing.expectEqual(@as(u32, 2), pair.return_array_size.?.fixed);
     try std.testing.expectEqual(ast.ValueType.int, pair.return_type);
@@ -1164,11 +1176,11 @@ test "parses a generic array parameter and a generic array return type" {
     );
     defer result.parser.deinit();
 
-    const sum_fn = result.program[0].function_decl;
+    const sum_fn = result.program[0].kind.function_decl;
     try std.testing.expectEqual(ast.ArraySpec.generic, sum_fn.params[0].array_size.?);
     try std.testing.expectEqual(@as(?ast.ArraySpec, null), sum_fn.return_array_size);
 
-    const identity_fn = result.program[1].function_decl;
+    const identity_fn = result.program[1].kind.function_decl;
     try std.testing.expectEqual(ast.ArraySpec.generic, identity_fn.params[0].array_size.?);
     try std.testing.expectEqual(ast.ArraySpec.generic, identity_fn.return_array_size.?);
 }
@@ -1182,7 +1194,7 @@ test "a function with no parameters parses an empty param list" {
     );
     defer result.parser.deinit();
 
-    const f = result.program[0].function_decl;
+    const f = result.program[0].kind.function_decl;
     try std.testing.expectEqual(@as(usize, 0), f.params.len);
 }
 
@@ -1227,7 +1239,7 @@ test "parses a fixed-size array declaration" {
     var result = try parseProgramSource(allocator, "int[3] arr\n");
     defer result.parser.deinit();
 
-    const decl = result.program[0].var_decl;
+    const decl = result.program[0].kind.var_decl;
     try std.testing.expectEqual(ast.ValueType.int, decl.type);
     try std.testing.expectEqual(@as(?u32, 3), decl.array_len);
     try std.testing.expectEqualStrings("arr", decl.name);
@@ -1239,7 +1251,7 @@ test "parses an array declaration with a literal initializer" {
     var result = try parseProgramSource(allocator, "int[3] arr := [1, 2, 3]\n");
     defer result.parser.deinit();
 
-    const decl = result.program[0].var_decl;
+    const decl = result.program[0].kind.var_decl;
     try std.testing.expectEqual(@as(?u32, 3), decl.array_len);
     const lit = decl.initializer.?.array_literal;
     try std.testing.expectEqual(@as(usize, 3), lit.len);
@@ -1251,7 +1263,7 @@ test "a plain scalar declaration has a null array_len" {
     var result = try parseProgramSource(allocator, "int x := 5\n");
     defer result.parser.deinit();
 
-    try std.testing.expectEqual(@as(?u32, null), result.program[0].var_decl.array_len);
+    try std.testing.expectEqual(@as(?u32, null), result.program[0].kind.var_decl.array_len);
 }
 
 test "parses array indexing" {
@@ -1304,7 +1316,7 @@ test "parses a map declaration with no initializer" {
     var result = try parseProgramSource(allocator, "map m\n");
     defer result.parser.deinit();
 
-    const decl = result.program[0].var_decl;
+    const decl = result.program[0].kind.var_decl;
     try std.testing.expectEqual(ast.ValueType.map, decl.type);
     try std.testing.expectEqual(@as(?u32, null), decl.array_len);
     try std.testing.expect(decl.initializer == null);
@@ -1315,7 +1327,7 @@ test "parses a list declaration with an array-literal initializer" {
     var result = try parseProgramSource(allocator, "list xs := [1, 2, 3]\n");
     defer result.parser.deinit();
 
-    const decl = result.program[0].var_decl;
+    const decl = result.program[0].kind.var_decl;
     try std.testing.expectEqual(ast.ValueType.list, decl.type);
     try std.testing.expectEqual(@as(usize, 3), decl.initializer.?.array_literal.len);
 }
@@ -1384,7 +1396,7 @@ test "int(...)/float(...) work fine nested inside a statement" {
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
-    try std.testing.expectEqualStrings("42", result.program[0].print_stmt.int_parse.literal.string);
+    try std.testing.expectEqualStrings("42", result.program[0].kind.print_stmt.int_parse.literal.string);
 }
 
 test "parses 'null' as a literal" {
@@ -1415,11 +1427,11 @@ test "parses a for loop over a range" {
     );
     defer result.parser.deinit();
 
-    const f = result.program[0].for_stmt;
+    const f = result.program[0].kind.for_stmt;
     try std.testing.expectEqualStrings("i", f.var_name);
     try std.testing.expectEqual(@as(i64, 0), f.start.literal.int);
     try std.testing.expectEqual(@as(i64, 3), f.end.literal.int);
-    try std.testing.expectEqual(@as(usize, 1), f.body.block.len);
+    try std.testing.expectEqual(@as(usize, 1), f.body.kind.block.len);
 }
 
 test "parses len(...) with a bare array name" {
@@ -1518,7 +1530,7 @@ test "parses close as a statement" {
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
-    try std.testing.expectEqualStrings("f", result.program[0].close_stmt.variable);
+    try std.testing.expectEqualStrings("f", result.program[0].kind.close_stmt.variable);
 }
 
 test "parses exit as a statement" {
@@ -1527,7 +1539,7 @@ test "parses exit as a statement" {
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
-    try std.testing.expectEqual(@as(i64, 1), result.program[0].exit_stmt.literal.int);
+    try std.testing.expectEqual(@as(i64, 1), result.program[0].kind.exit_stmt.literal.int);
 }
 
 test "exit takes an arbitrary expression, not just a literal" {
@@ -1547,7 +1559,7 @@ test "parses an import declaration" {
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
-    try std.testing.expectEqualStrings("util.butter", result.program[0].import_stmt.path);
+    try std.testing.expectEqualStrings("util.butter", result.program[0].kind.import_stmt.path);
 }
 
 // ---- String escape sequences (GRAMMAR.bnf design note 3s) --------------
@@ -1555,7 +1567,7 @@ test "parses an import declaration" {
 test "a string literal with no backslash is unaffected" {
     var result = try parseProgramSource(std.testing.allocator, "print \"hello\"\n");
     defer result.parser.deinit();
-    try std.testing.expectEqualStrings("hello", result.program[0].print_stmt.literal.string);
+    try std.testing.expectEqualStrings("hello", result.program[0].kind.print_stmt.literal.string);
 }
 
 test "decodes \\n, \\t, \\\\, and \\\" in a string literal" {
@@ -1564,7 +1576,7 @@ test "decodes \\n, \\t, \\\\, and \\\" in a string literal" {
         \\
     );
     defer result.parser.deinit();
-    try std.testing.expectEqualStrings("a\nb\tc\\d\"e", result.program[0].print_stmt.literal.string);
+    try std.testing.expectEqualStrings("a\nb\tc\\d\"e", result.program[0].kind.print_stmt.literal.string);
 }
 
 test "an escaped quote inside a string literal is decoded, not a terminator" {
@@ -1573,7 +1585,7 @@ test "an escaped quote inside a string literal is decoded, not a terminator" {
         \\
     );
     defer result.parser.deinit();
-    try std.testing.expectEqualStrings("say \"hi\"", result.program[0].print_stmt.literal.string);
+    try std.testing.expectEqualStrings("say \"hi\"", result.program[0].kind.print_stmt.literal.string);
 }
 
 test "escapes decode in an import path the same as in an ordinary string literal" {
@@ -1582,7 +1594,7 @@ test "escapes decode in an import path the same as in an ordinary string literal
         \\
     );
     defer result.parser.deinit();
-    try std.testing.expectEqualStrings("a\tb.butter", result.program[0].import_stmt.path);
+    try std.testing.expectEqualStrings("a\tb.butter", result.program[0].kind.import_stmt.path);
 }
 
 test "escapes decode in a map-literal string key" {
@@ -1599,7 +1611,7 @@ test "a plain function declaration is not exported" {
     var result = try parseProgramSource(allocator, "func f() -> int { return 1 }\n");
     defer result.parser.deinit();
 
-    try std.testing.expect(!result.program[0].function_decl.exported);
+    try std.testing.expect(!result.program[0].kind.function_decl.exported);
 }
 
 test "'export' before 'func' marks the function exported" {
@@ -1607,7 +1619,7 @@ test "'export' before 'func' marks the function exported" {
     var result = try parseProgramSource(allocator, "export func f() -> int { return 1 }\n");
     defer result.parser.deinit();
 
-    try std.testing.expect(result.program[0].function_decl.exported);
+    try std.testing.expect(result.program[0].kind.function_decl.exported);
 }
 
 test "'export' before anything other than 'func' is a parse error" {
@@ -1647,7 +1659,7 @@ test "a for loop's range bounds may be arbitrary expressions" {
     );
     defer result.parser.deinit();
 
-    const f = result.program[0].for_stmt;
+    const f = result.program[0].kind.for_stmt;
     try std.testing.expectEqualStrings("start", f.start.variable);
     try std.testing.expectEqualStrings("end", f.end.grouping.binary.left.variable);
 }

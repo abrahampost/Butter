@@ -143,7 +143,7 @@ pub const Loader = struct {
 
         if (!allow_top_level_code) {
             for (program) |*stmt| {
-                switch (stmt.*) {
+                switch (stmt.kind) {
                     .function_decl, .import_stmt => {},
                     else => return self.fail(
                         LoadError.ImportedFileHasTopLevelCode,
@@ -156,19 +156,19 @@ pub const Loader = struct {
 
         var import_list: std.ArrayList(*Module) = .empty;
         for (program) |*stmt| {
-            if (stmt.* != .import_stmt) continue;
+            if (stmt.kind != .import_stmt) continue;
             // A bundled standard-library module (reserved `.std.butter`
             // name) is matched before ever touching the filesystem, and by
             // its bare name rather than a path resolved against `dir` — it
             // has no real file/directory of its own, so it resolves the
             // same way regardless of which directory imports it.
-            if (stdlib.lookup(stmt.import_stmt.path)) |std_source| {
-                const child_key = try self.allocator().dupe(u8, stmt.import_stmt.path);
+            if (stdlib.lookup(stmt.kind.import_stmt.path)) |std_source| {
+                const child_key = try self.allocator().dupe(u8, stmt.kind.import_stmt.path);
                 const child = try self.loadModule(std_source, child_key, ".", false);
                 try import_list.append(self.allocator(), child);
                 continue;
             }
-            const child_key = try std.fs.path.resolve(self.allocator(), &.{ dir, stmt.import_stmt.path });
+            const child_key = try std.fs.path.resolve(self.allocator(), &.{ dir, stmt.kind.import_stmt.path });
             const child_dir = std.fs.path.dirname(child_key) orelse ".";
             const child_source = self.readFile(child_key) catch |err| {
                 self.diagnostic = .{ .path = child_key, .message = @errorName(err) };

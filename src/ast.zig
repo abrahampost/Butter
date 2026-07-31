@@ -285,7 +285,12 @@ pub const Expr = union(enum) {
     };
 };
 
-pub const Stmt = union(enum) {
+pub const Stmt = struct {
+    kind: StmtKind,
+    line: usize,
+};
+
+pub const StmtKind = union(enum) {
     var_decl: VarDecl,
     block: []Stmt,
     if_stmt: If,
@@ -577,7 +582,7 @@ fn valueTypeName(t: ValueType) []const u8 {
 /// Writes an S-expression rendering of `stmt`, indented by `depth` levels.
 pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io.Writer.Error!void {
     try writer.splatByteAll(' ', depth * 2);
-    switch (stmt.*) {
+    switch (stmt.kind) {
         .var_decl => |d| {
             if (d.array_len) |n| {
                 try writer.print("({s}[{d}] {s}", .{ valueTypeName(d.type), n, d.name });
@@ -695,9 +700,9 @@ test "printStmt renders an if/else with indented branches" {
     var cond = Expr{ .variable = "x" };
     var one = Expr{ .literal = .{ .int = 1 } };
     var two = Expr{ .literal = .{ .int = 2 } };
-    var then_branch = Stmt{ .print_stmt = &one };
-    var else_branch = Stmt{ .print_stmt = &two };
-    var if_stmt = Stmt{ .if_stmt = .{ .condition = &cond, .then_branch = &then_branch, .else_branch = &else_branch } };
+    var then_branch = Stmt{ .kind = .{ .print_stmt = &one }, .line = 1 };
+    var else_branch = Stmt{ .kind = .{ .print_stmt = &two }, .line = 1 };
+    var if_stmt = Stmt{ .kind = .{ .if_stmt = .{ .condition = &cond, .then_branch = &then_branch, .else_branch = &else_branch } }, .line = 1 };
 
     var buf: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);

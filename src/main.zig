@@ -115,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
         error.OutOfMemory => return err,
         else => {
             const diag = compiler.diagnostic.?;
-            std.debug.print("compile error: {s}: '{s}'\n", .{ diag.message, diag.name });
+            std.debug.print("compile error at line {d}: {s}: '{s}'\n", .{ diag.line, diag.message, diag.name });
             std.process.exit(1);
         },
     };
