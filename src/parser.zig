@@ -97,6 +97,41 @@ pub const Parser = struct {
         return node;
     }
 
+    /// Decodes `\n`/`\t`/`\\`/`\"` in a STRING token's already-unquoted
+    /// contents (GRAMMAR.bnf design note 3s). The lexer has already
+    /// validated that every backslash in `raw` starts one of those four
+    /// sequences (`lexer.zig`'s `string()`), so this never fails — it just
+    /// copies bytes through, shrinking two-character escapes to one.
+    /// A literal with no backslash at all (the common case) returns `raw`
+    /// unchanged, borrowed straight from the source text same as before
+    /// this feature existed; only a literal that actually uses an escape
+    /// pays for an arena allocation.
+    fn unescapeString(self: *Parser, raw: []const u8) std.mem.Allocator.Error![]const u8 {
+        if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
+
+        const buf = try self.allocator().alloc(u8, raw.len);
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < raw.len) {
+            const c = raw[i];
+            if (c == '\\') {
+                buf[j] = switch (raw[i + 1]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    '\\' => '\\',
+                    '"' => '"',
+                    else => unreachable, // lexer guarantees only these four escapes reach here
+                };
+                i += 2;
+            } else {
+                buf[j] = c;
+                i += 1;
+            }
+            j += 1;
+        }
+        return buf[0..j];
+    }
+
     // ---- <program> ---------------------------------------------------
 
     /// <program> ::= { NEWLINE } { <top-level-decl> { NEWLINE } }
@@ -135,7 +170,7 @@ pub const Parser = struct {
     fn importDeclaration(self: *Parser) Error!ast.Stmt {
         _ = self.advance(); // 'import'
         const path_tok = try self.expect(.string, "expected a file path string after 'import'");
-        const path = path_tok.lexeme[1 .. path_tok.lexeme.len - 1];
+        const path = try self.unescapeString(path_tok.lexeme[1 .. path_tok.lexeme.len - 1]);
         try self.consumeEnd();
         return ast.Stmt{ .import_stmt = .{ .path = path } };
     }
@@ -532,9 +567,11 @@ pub const Parser = struct {
             },
             .string => {
                 _ = self.advance();
-                // Strip the surrounding quotes captured in the lexeme.
+                // Strip the surrounding quotes captured in the lexeme, then
+                // decode any \n/\t/\\/\" escapes (design note 3s).
                 const contents = tok.lexeme[1 .. tok.lexeme.len - 1];
-                return self.createExpr(.{ .literal = .{ .string = contents } });
+                const decoded = try self.unescapeString(contents);
+                return self.createExpr(.{ .literal = .{ .string = decoded } });
             },
             .kw_true => {
                 _ = self.advance();
@@ -749,7 +786,7 @@ pub const Parser = struct {
         if (!self.check(.rbrace)) {
             while (true) {
                 const key_tok = try self.expect(.string, "expected a string key in map literal");
-                const key = key_tok.lexeme[1 .. key_tok.lexeme.len - 1];
+                const key = try self.unescapeString(key_tok.lexeme[1 .. key_tok.lexeme.len - 1]);
                 _ = try self.expect(.colon, "expected ':' after map key");
                 const value = try self.expression();
                 try entries.append(self.allocator(), .{ .key = key, .value = value });
@@ -1511,6 +1548,50 @@ test "parses an import declaration" {
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
     try std.testing.expectEqualStrings("util.butter", result.program[0].import_stmt.path);
+}
+
+// ---- String escape sequences (GRAMMAR.bnf design note 3s) --------------
+
+test "a string literal with no backslash is unaffected" {
+    var result = try parseProgramSource(std.testing.allocator, "print \"hello\"\n");
+    defer result.parser.deinit();
+    try std.testing.expectEqualStrings("hello", result.program[0].print_stmt.literal.string);
+}
+
+test "decodes \\n, \\t, \\\\, and \\\" in a string literal" {
+    var result = try parseProgramSource(std.testing.allocator,
+        \\print "a\nb\tc\\d\"e"
+        \\
+    );
+    defer result.parser.deinit();
+    try std.testing.expectEqualStrings("a\nb\tc\\d\"e", result.program[0].print_stmt.literal.string);
+}
+
+test "an escaped quote inside a string literal is decoded, not a terminator" {
+    var result = try parseProgramSource(std.testing.allocator,
+        \\print "say \"hi\""
+        \\
+    );
+    defer result.parser.deinit();
+    try std.testing.expectEqualStrings("say \"hi\"", result.program[0].print_stmt.literal.string);
+}
+
+test "escapes decode in an import path the same as in an ordinary string literal" {
+    var result = try parseProgramSource(std.testing.allocator,
+        \\import "a\tb.butter"
+        \\
+    );
+    defer result.parser.deinit();
+    try std.testing.expectEqualStrings("a\tb.butter", result.program[0].import_stmt.path);
+}
+
+test "escapes decode in a map-literal string key" {
+    try expectExprSexpr(
+        \\{"a\nb": 1}
+    ,
+        \\(map ("a
+        \\b" 1))
+    );
 }
 
 test "a plain function declaration is not exported" {

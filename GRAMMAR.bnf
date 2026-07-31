@@ -28,7 +28,8 @@
 IDENTIFIER   ::= <alpha> { <alphanum> }
 INT          ::= <digit> { <digit> }
 FLOAT        ::= <digit> { <digit> } '.' <digit> { <digit> }
-STRING       ::= '"' { any character except '"' } '"'
+STRING       ::= '"' { <escape> | any character except '"' or '\' } '"'
+<escape>     ::= '\' ( 'n' | 't' | '\' | '"' )
 NEWLINE      ::= '\n'
 EOF          ::= (* end of input *)
 
@@ -51,8 +52,10 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    and aren't recognized inside a STRING. A lone '=' or '.' is a lexer
    error — '=' must be followed by '=', and '.' only ever appears as part
    of '..'. ':' can stand alone (a map literal's key/value separator); ':='
-   is its own two-character token. STRING has no escape-sequence syntax:
-   `"a\nb"` is the four literal characters a, \, n, b, never a newline. *)
+   is its own two-character token. STRING supports exactly four escape
+   sequences — `\n`, `\t`, `\\`, `\"` (design note 3s) — decoded when the
+   token's contents are read; any other character following a `\` is a
+   lexer error, and `\"` does not end the string early. *)
 
 
 (* --------------------------------------------------------------------------
@@ -342,6 +345,27 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      equality, above); this extends the other four comparison operators to
      match rather than leaving them numeric-only. A string operand paired
      with a non-string one is `RuntimeError.TypeMismatch`, same as `+`. *)
+
+(* --- String escape sequences (design note 3s) ---
+   - Four sequences are recognized inside a STRING: `\n` (newline), `\t`
+     (tab), `\\` (a literal backslash), and `\"` (a literal `"` that does
+     NOT end the literal) — the minimum viable set for multi-line/help text
+     and for embedding a quote or backslash at all, since without `\"`
+     there would be no way to put a `"` inside a string literal, and
+     without `\\` no way to unambiguously end a literal in one.
+   - Any other character following a `\` (`\x`, a bare `\` at end of
+     source, etc.) is a lexer error — there is no "pass the backslash
+     through literally" fallback, so a typo'd escape is caught at parse
+     time rather than silently producing an unintended two-character
+     sequence.
+   - Decoding happens once the surrounding quotes are stripped (src/parser.zig),
+     the same place INT/FLOAT lexemes are handed to
+     `std.fmt.parseInt`/`parseFloat` — the lexer (src/lexer.zig) only has to
+     recognize `\"`/`\\` well enough not to misidentify the closing quote;
+     it does not itself decode anything. A literal with no backslash at all
+     is unaffected and unallocated, same as before this feature existed.
+   - Applies uniformly everywhere a STRING token's contents become text:
+     an ordinary string literal, an `import` path, and a map-literal key. *)
 
 (* --- JSON ---
    - `json(buf, count)` parses `count` bytes of an `int` buffer as JSON text

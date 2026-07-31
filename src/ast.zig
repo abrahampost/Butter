@@ -1,7 +1,9 @@
 //! AST node definitions for Butter, matching section 2 (SYNTAX GRAMMAR) of
 //! GRAMMAR.bnf. Nodes are produced by `parser.Parser` into memory owned by
 //! its arena; they borrow string data (identifiers, string contents)
-//! directly from the source text.
+//! directly from the source text — except a string literal/import path/
+//! map key that actually uses a `\n`/`\t`/`\\`/`\"` escape (design note 3s),
+//! which is decoded into a fresh arena-owned buffer instead.
 
 const std = @import("std");
 

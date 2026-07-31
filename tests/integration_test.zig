@@ -149,6 +149,10 @@ test "parse_numbers: int(...)/float(...) parse strings into numbers" {
     try expectCaseOutput("parse_numbers");
 }
 
+test "escapes: \\n/\\t/\\\\/\\\" decode inside string literals" {
+    try expectCaseOutput("escapes");
+}
+
 test "args: the bare 'args' keyword sees the host's argv, in order" {
     try expectCaseOutputWithArgs("args", &.{ "alpha", "beta", "gamma" });
 }

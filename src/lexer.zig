@@ -141,6 +141,7 @@ pub const Error = error{
     UnterminatedString,
     MalformedNumber,
     LoneEqual,
+    InvalidEscapeSequence,
 };
 
 pub const Lexer = struct {
@@ -249,8 +250,27 @@ pub const Lexer = struct {
         return self.makeToken(token_type);
     }
 
+    /// Scans string content up to (not including) the closing '"'. The
+    /// lexeme still carries escape sequences un-decoded (`\n` stays the two
+    /// characters '\' and 'n') — `parser.zig` decodes them once the
+    /// surrounding quotes are stripped, mirroring how INT/FLOAT lexemes are
+    /// handed to `std.fmt.parseInt`/`parseFloat` there rather than here.
+    /// This scan still has to recognize `\"` and `\\` itself, though: an
+    /// escaped quote must not end the string early, and a `\\` immediately
+    /// before a real closing `"` must not be misread as `\"`.
     fn string(self: *Lexer) Error!Token {
-        while (self.peek() != '"' and !self.isAtEnd()) _ = self.advance();
+        while (!self.isAtEnd() and self.peek() != '"') {
+            if (self.peek() == '\\') {
+                _ = self.advance(); // consume '\'
+                if (self.isAtEnd()) break; // reported as UnterminatedString below
+                switch (self.peek()) {
+                    'n', 't', '\\', '"' => _ = self.advance(),
+                    else => return self.fail(Error.InvalidEscapeSequence, "invalid escape sequence (only \\n, \\t, \\\\, \\\" are supported)"),
+                }
+            } else {
+                _ = self.advance();
+            }
+        }
 
         if (self.isAtEnd()) return self.fail(Error.UnterminatedString, "unterminated string literal");
 
@@ -377,6 +397,54 @@ test "unterminated string is an error" {
     var lexer = Lexer.init("\"hello");
     try std.testing.expectError(Error.UnterminatedString, lexer.next());
     try std.testing.expect(lexer.diagnostic != null);
+}
+
+test "an escaped quote does not end the string early" {
+    var lexer = Lexer.init(
+        \\"a\"b"
+    );
+    const tok = try lexer.next();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings(
+        \\"a\"b"
+    , tok.lexeme);
+}
+
+test "a string ending in an escaped backslash is not mistaken for an escaped quote" {
+    // "a\\" is the two literal characters a, \ — the '"' right after ends
+    // the string; it must NOT be consumed as part of a (nonexistent) \" here.
+    var lexer = Lexer.init(
+        \\"a\\"
+    );
+    const tok = try lexer.next();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings(
+        \\"a\\"
+    , tok.lexeme);
+}
+
+test "a string ending right after a backslash is unterminated" {
+    var lexer = Lexer.init("\"a\\");
+    try std.testing.expectError(Error.UnterminatedString, lexer.next());
+}
+
+test "an unrecognized escape sequence is a lexer error" {
+    var lexer = Lexer.init(
+        \\"a\xb"
+    );
+    try std.testing.expectError(Error.InvalidEscapeSequence, lexer.next());
+    try std.testing.expect(lexer.diagnostic != null);
+}
+
+test "\\n, \\t, \\\\, and \\\" all scan as part of the same string token" {
+    var lexer = Lexer.init(
+        \\"\n\t\\\""
+    );
+    const tok = try lexer.next();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings(
+        \\"\n\t\\\""
+    , tok.lexeme);
 }
 
 test "keywords are recognized distinctly from identifiers" {

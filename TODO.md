@@ -89,16 +89,24 @@ and ISA.bnf's PARSE_INT entry. Covered by VM unit tests (positive,
 negative, exact-integer floats, values at/near i64's bounds, NaN/
 Infinity) and compiler-level/integration tests (`parse_numbers.butter`).
 
-### 8. Escape sequences in string literals
-Per GRAMMAR.bnf section 1, `STRING` has no escape syntax at all —
-`"a\nb"` is four literal characters. There's no way to embed a newline,
-tab, or literal quote in a string, which makes multi-line usage/help text
-awkward (must be built from multiple `print` calls).
-- Add `\n`, `\t`, `\\`, `\"` (minimum viable set) to the lexer's string
-  scanning in [src/lexer.zig](src/lexer.zig).
-- Update GRAMMAR.bnf's lexical grammar and the STRING production note.
-- Add lexer unit tests and at least one integration case using embedded
-  newlines/tabs.
+### 8. Escape sequences in string literals — DONE
+`\n`, `\t`, `\\`, and `\"` are now recognized inside a `STRING` (GRAMMAR.bnf
+design note 3s). [src/lexer.zig](src/lexer.zig)'s `string()` scan now
+treats `\"` as a non-terminating escaped quote (rather than ending the
+literal) and rejects any other character after a `\` as
+`Error.InvalidEscapeSequence`; the token's lexeme still carries the raw
+`\x` bytes un-decoded. Actual decoding happens in
+[src/parser.zig](src/parser.zig)'s new `unescapeString`, applied
+uniformly wherever a `STRING` token's contents become text — an ordinary
+string literal, an `import` path, and a map-literal key — via a fresh
+arena allocation; a literal with no backslash is returned unchanged
+(unallocated), same as before this feature existed. Documented in
+GRAMMAR.bnf's lexical grammar and design note 3s. Covered by lexer unit
+tests (escaped quote, escaped backslash before a real closing quote,
+unterminated-after-backslash, invalid escape) and parser unit tests
+(decoding in a literal/import path/map key, an escaped quote not ending
+the string), plus the `escapes` integration case under `tests/cases/`
+exercising embedded newlines and tabs end to end.
 
 ### 9. Error recovery (try/catch or Result-style handling)
 Every `RuntimeError` (`IndexOutOfBounds`, `KeyNotFound`, `TypeMismatch`,

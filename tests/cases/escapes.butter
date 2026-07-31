@@ -1,0 +1,17 @@
+string lines := "line1\nline2"
+print lines
+print len(lines)
+
+string tabbed := "a\tb\tc"
+print tabbed
+
+string quoted := "she said \"hi\""
+print quoted
+
+string backslash := "back\\slash"
+print backslash
+
+print "line1" + "\n" + "line2" == lines
+print len("\t") == 1
+print len("\\") == 1
+print len("\"") == 1
