@@ -103,7 +103,18 @@ pub fn main(init: std.process.Init) !void {
         error.OutOfMemory => return err,
         else => {
             const diag = loader.diagnostic.?;
-            std.debug.print("import error in '{s}': {s}\n", .{ diag.path, diag.message });
+            // A lex/parse failure carries the line it happened on — that's
+            // a syntax problem IN this file (worded like any other compile
+            // error, entry file or import alike). A `line`-less diagnostic
+            // is a genuine module-resolution problem (file not found,
+            // circular import, disallowed top-level code in an import) —
+            // there's no one line in `path` to blame, so it keeps the
+            // "import error" wording instead.
+            if (diag.line) |line| {
+                std.debug.print("compile error in '{s}' at line {d}: {s}\n", .{ diag.path, line, diag.message });
+            } else {
+                std.debug.print("import error in '{s}': {s}\n", .{ diag.path, diag.message });
+            }
             std.process.exit(1);
         },
     };
@@ -115,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
         error.OutOfMemory => return err,
         else => {
             const diag = compiler.diagnostic.?;
-            std.debug.print("compile error at line {d}: {s}: '{s}'\n", .{ diag.line, diag.message, diag.name });
+            std.debug.print("compile error in '{s}' at line {d}: {s}: '{s}'\n", .{ diag.path, diag.line, diag.message, diag.name });
             std.process.exit(1);
         },
     };

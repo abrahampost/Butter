@@ -56,6 +56,13 @@ pub const SemanticError = error{
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
 pub const Diagnostic = struct {
+    /// The `ModuleUnit.path` of whichever module was being compiled when
+    /// this diagnostic was raised (`Compiler.current_module_path`) — for
+    /// the single-file `compileProgram` convenience wrapper, always
+    /// `ModuleUnit`'s own default. The CLI (main.zig) surfaces this so a
+    /// compile error inside an imported file names that file, not just an
+    /// ambiguous line number relative to some unstated module.
+    path: []const u8,
     line: usize,
     name: []const u8,
     message: []const u8,
@@ -182,6 +189,13 @@ fn totalParamWidth(params: []const ast.Param) u32 {
 pub const ModuleUnit = struct {
     program: ast.Program,
     imports: []const usize = &.{},
+    /// This module's own path/name, purely for `Diagnostic.path` — the
+    /// module loader (module.zig) sets this to the same canonical path it
+    /// tracks its own diagnostics against, so a compile error inside an
+    /// imported file names that file, not the entry program. The default
+    /// is what `compileProgram`'s single-file wrapper (and every
+    /// hand-built `ModuleUnit` in this file's own tests) gets.
+    path: []const u8 = "<program>",
 };
 
 /// Compiles one `ast.Program` into one `chunk_mod.Program`. Not reusable
@@ -206,6 +220,9 @@ pub const Compiler = struct {
     /// its own functions is always visible regardless of `exported`
     /// (`functionVisible`'s same-module check).
     current_module: usize = 0,
+    /// `current_module`'s own `ModuleUnit.path`, stamped onto every
+    /// diagnostic `fail()` raises while it's compiling (`Diagnostic.path`).
+    current_module_path: []const u8 = "<program>",
     /// The modules `current_module` directly imports — a call to one of
     /// *their* functions is only visible if that function is `exported`
     /// (`functionVisible`). Borrowed from the `ModuleUnit` currently being
@@ -293,6 +310,7 @@ pub const Compiler = struct {
         }
 
         self.current_module = entry;
+        self.current_module_path = modules[entry].path;
         self.visible_imports = modules[entry].imports;
 
         // `main_chunk` and `compiled` are only handed to the caller (who
@@ -321,6 +339,7 @@ pub const Compiler = struct {
 
         for (modules, 0..) |m, mi| {
             self.current_module = mi;
+            self.current_module_path = m.path;
             self.visible_imports = m.imports;
             for (m.program) |*stmt| {
                 if (stmt.kind != .function_decl) continue;
@@ -412,7 +431,7 @@ pub const Compiler = struct {
     }
 
     fn fail(self: *Compiler, comptime err: SemanticError, name: []const u8, message: []const u8) CompileError {
-        self.diagnostic = .{ .line = self.current_line, .name = name, .message = message };
+        self.diagnostic = .{ .path = self.current_module_path, .line = self.current_line, .name = name, .message = message };
         return err;
     }
 

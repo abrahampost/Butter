@@ -25,6 +25,15 @@ pub const Diagnostic = struct {
     /// The canonical path of the file the error occurred in (or while
     /// trying to read).
     path: []const u8,
+    /// The source line the error occurred on, when there is one — a lex or
+    /// parse failure always has one (copied from `lexer.Diagnostic`/
+    /// `parser.Diagnostic`); a pure module-resolution problem
+    /// (`ImportReadFailed`/`CircularImport`/`ImportedFileHasTopLevelCode`)
+    /// doesn't point at any one line in `path`, so this stays `null`. The
+    /// CLI (main.zig) uses this to distinguish "a syntax error IN this
+    /// file" (a compile error) from "a problem locating/using this file AS
+    /// an import" (a genuine import error) when choosing how to word it.
+    line: ?usize = null,
     message: []const u8,
 };
 
@@ -131,13 +140,13 @@ pub const Loader = struct {
 
         var lex = lexer_mod.Lexer.init(source);
         const tokens = lex.tokenizeAll(self.allocator()) catch |err| {
-            self.diagnostic = .{ .path = key, .message = lex.diagnostic.?.message };
+            self.diagnostic = .{ .path = key, .line = lex.diagnostic.?.line, .message = lex.diagnostic.?.message };
             return err;
         };
 
         var parser = parser_mod.Parser.init(self.allocator(), tokens);
         const program = parser.parseProgram() catch |err| {
-            self.diagnostic = .{ .path = key, .message = parser.diagnostic.?.message };
+            self.diagnostic = .{ .path = key, .line = parser.diagnostic.?.line, .message = parser.diagnostic.?.message };
             return err;
         };
 
@@ -206,7 +215,7 @@ pub fn toCompilerUnits(allocator: std.mem.Allocator, order: []const *Module, ent
     for (order, 0..) |m, i| {
         const import_indices = try allocator.alloc(usize, m.imports.len);
         for (m.imports, 0..) |child, j| import_indices[j] = index_of.get(child).?;
-        units[i] = .{ .program = m.program, .imports = import_indices };
+        units[i] = .{ .program = m.program, .imports = import_indices, .path = m.path };
     }
     return .{ .entry_index = index_of.get(entry).?, .units = units };
 }
@@ -326,7 +335,7 @@ test "an imported file with top-level executable code is a load error" {
     );
 }
 
-test "importing a nonexistent file is a load error" {
+test "importing a nonexistent file is a load error, with no line (it's not a syntax problem)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -338,14 +347,15 @@ test "importing a nonexistent file is a load error" {
         LoadError.ImportReadFailed,
         loader.loadEntry("import \"nope.butter\"\n", "main.butter", "."),
     );
+    try std.testing.expectEqual(@as(?usize, null), loader.diagnostic.?.line);
 }
 
-test "a lex error in an imported file is reported against that file" {
+test "a lex error in an imported file is reported against that file, with its own line number" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeFile(tmp.dir, std.testing.io, "bad.butter", "export func f() -> int { return 1 @ }\n");
+    try writeFile(tmp.dir, std.testing.io, "bad.butter", "export func f() -> int {\n    return 1 @\n}\n");
 
     var loader = Loader.init(allocator, std.testing.io, tmp.dir);
     defer loader.deinit();
@@ -355,6 +365,23 @@ test "a lex error in an imported file is reported against that file" {
         loader.loadEntry("import \"bad.butter\"\n", "main.butter", "."),
     );
     try std.testing.expectEqualStrings("bad.butter", loader.diagnostic.?.path);
+    try std.testing.expectEqual(@as(?usize, 2), loader.diagnostic.?.line);
+}
+
+test "a lex/parse error in the ENTRY file itself is also reported with a path and line, same as an import's" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var loader = Loader.init(allocator, std.testing.io, tmp.dir);
+    defer loader.deinit();
+
+    try std.testing.expectError(
+        lexer_mod.Error.UnexpectedCharacter,
+        loader.loadEntry("print 1\nint a @ 2\n", "main.butter", "."),
+    );
+    try std.testing.expectEqualStrings("main.butter", loader.diagnostic.?.path);
+    try std.testing.expectEqual(@as(?usize, 2), loader.diagnostic.?.line);
 }
 
 test "toCompilerUnits translates a diamond import graph into index-based ModuleUnits" {
