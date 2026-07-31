@@ -169,6 +169,32 @@ const Frame = struct {
     return_width: usize,
 };
 
+/// The execution state one `run` threads through every `step`: which chunk
+/// is executing, where in it, and the call stack underneath. All of this was
+/// plain `run` locals until `step` was split out of it (see `step`'s own doc
+/// comment for why) — it lives in a struct now only because a called
+/// function can't reach its caller's locals, not because anything about the
+/// state itself changed.
+///
+/// Still entirely a `run` local: `frames` is the same 8 KiB array it was
+/// before, and nothing here is heap-allocated or kept on the `Vm` between
+/// runs.
+const Exec = struct {
+    program: *const chunk_mod.Program,
+    chunk: *const Chunk,
+    ip: usize = 0,
+    bp: usize = 0,
+    /// The CURRENTLY executing chunk's return width, restored from a `Frame`
+    /// on the way out of a call. Starts at 1 for the main chunk, which never
+    /// executes a RET of its own.
+    return_width: usize = 1,
+    frames: [frames_max]Frame = undefined,
+    frame_count: usize = 0,
+};
+
+/// What one `step` tells `run` to do next.
+const Flow = enum { running, halted };
+
 /// Most of a `Vm` needs no allocator at run time (section 2 of ISA.bnf): the
 /// stack is a fixed-size array of value-type `Value`s, and a borrowed STRING
 /// is never owned, so there is nothing to free. Maps and lists (section 11)
@@ -749,509 +775,538 @@ pub const Vm = struct {
     /// halted normally or failed, so buffered writes are never silently
     /// lost just because the program forgot to `close`.
     pub fn run(self: *Vm, program: *const chunk_mod.Program, host: Host) !void {
-        const writer = host.out;
         errdefer {
             self.closeAllFiles(host) catch {};
             self.decrefStack();
         }
-        var frames: [frames_max]Frame = undefined;
-        var frame_count: usize = 0;
 
-        var chunk: *const Chunk = &program.main;
-        var ip: usize = 0;
-        var bp: usize = 0;
-        var return_width: usize = 1;
-
+        var exec: Exec = .{ .program = program, .chunk = &program.main };
         while (true) {
-            const instr = chunk.code.items[ip];
-            ip += 1;
-            switch (instr.op) {
-                .push_const => {
-                    const v = chunk.constants.items[instr.operand];
-                    v.incref();
-                    try self.push(v);
-                },
-                .push_true => try self.push(.{ .boolean = true }),
-                .push_false => try self.push(.{ .boolean = false }),
-                .pop => {
-                    const v = try self.pop();
-                    v.decref(self.allocator);
-                },
-
-                .load_local => {
-                    const v = self.stack[bp + instr.operand];
-                    v.incref();
-                    try self.push(v);
-                },
-                .store_local => {
-                    const new_v = try self.peek(0);
-                    // Incref before decref: safe even for `x := x`, where the
-                    // old and new value are the same object — increffing
-                    // first means it can never be freed out from under
-                    // itself before the assignment finishes.
-                    new_v.incref();
-                    self.stack[bp + instr.operand].decref(self.allocator);
-                    self.stack[bp + instr.operand] = new_v;
-                },
-
-                .load_index => {
-                    const idx_val = try self.pop();
-                    if (idx_val != .int) return RuntimeError.TypeMismatch;
-                    const idx = chunk_mod.unpackIndexOperand(instr.operand);
-                    if (idx_val.int < 0 or idx_val.int >= idx.length) return RuntimeError.IndexOutOfBounds;
-                    const v = self.stack[bp + idx.slot + @as(usize, @intCast(idx_val.int))];
-                    v.incref();
-                    try self.push(v);
-                },
-                .store_index => {
-                    const v = try self.pop();
-                    const idx_val = try self.pop();
-                    if (idx_val != .int) return RuntimeError.TypeMismatch;
-                    const idx = chunk_mod.unpackIndexOperand(instr.operand);
-                    if (idx_val.int < 0 or idx_val.int >= idx.length) return RuntimeError.IndexOutOfBounds;
-                    v.incref();
-                    self.stack[bp + idx.slot + @as(usize, @intCast(idx_val.int))].decref(self.allocator);
-                    self.stack[bp + idx.slot + @as(usize, @intCast(idx_val.int))] = v;
-                    try self.push(v);
-                },
-
-                .make_array_ref => {
-                    const idx = chunk_mod.unpackIndexOperand(instr.operand);
-                    try self.push(.{ .array_ref = .{ .base = @intCast(bp + idx.slot), .len = idx.length } });
-                },
-                .load_index_ref => {
-                    const idx_val = try self.pop();
-                    if (idx_val != .int) return RuntimeError.TypeMismatch;
-                    const ref = self.stack[bp + instr.operand];
-                    if (ref != .array_ref) return RuntimeError.TypeMismatch;
-                    if (idx_val.int < 0 or idx_val.int >= ref.array_ref.len) return RuntimeError.IndexOutOfBounds;
-                    const v = self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))];
-                    v.incref();
-                    try self.push(v);
-                },
-                .store_index_ref => {
-                    const v = try self.pop();
-                    const idx_val = try self.pop();
-                    if (idx_val != .int) return RuntimeError.TypeMismatch;
-                    const ref = self.stack[bp + instr.operand];
-                    if (ref != .array_ref) return RuntimeError.TypeMismatch;
-                    if (idx_val.int < 0 or idx_val.int >= ref.array_ref.len) return RuntimeError.IndexOutOfBounds;
-                    v.incref();
-                    self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))].decref(self.allocator);
-                    self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))] = v;
-                    try self.push(v);
-                },
-                .load_ref_len => {
-                    const ref = self.stack[bp + instr.operand];
-                    if (ref != .array_ref) return RuntimeError.TypeMismatch;
-                    try self.push(.{ .int = ref.array_ref.len });
-                },
-
-                // ---- Maps, lists, and the heap (ISA.bnf section 11) ----
-
-                .make_list => {
-                    const n = instr.operand;
-                    var list: std.ArrayList(Value) = .empty;
-                    // A pure move: the n values already on the stack become
-                    // this list's own elements, so neither an incref (moving
-                    // in) nor a decref (the old stack slots, about to be
-                    // discarded via sp -= n) is needed for them.
-                    try list.appendSlice(self.allocator, self.stack[self.sp - n .. self.sp]);
-                    self.sp -= n;
-                    errdefer {
-                        for (list.items) |item| item.decref(self.allocator);
-                        list.deinit(self.allocator);
-                    }
-                    const obj = try Object.create(self.allocator, .{ .list = list });
-                    try self.push(.{ .object = obj });
-                },
-                .make_map => {
-                    const n = instr.operand;
-                    const base = self.sp - 2 * n;
-                    // Consumed up front: from here on, nothing in this range
-                    // is still visible to the outer stack-teardown decref
-                    // pass, so a failure partway through the loop below must
-                    // clean up whatever it hasn't gotten to yet itself.
-                    self.sp = base;
-                    const obj = try Object.create(self.allocator, .{ .map = .empty });
-                    errdefer (Value{ .object = obj }).decref(self.allocator);
-                    var i: usize = 0;
-                    errdefer {
-                        while (i < n) : (i += 1) {
-                            self.stack[base + 2 * i].decref(self.allocator);
-                            self.stack[base + 2 * i + 1].decref(self.allocator);
-                        }
-                    }
-                    while (i < n) : (i += 1) {
-                        const key_val = self.stack[base + 2 * i];
-                        const val = self.stack[base + 2 * i + 1];
-                        // Defense-in-depth: the compiler only ever emits a
-                        // string-literal key here (GRAMMAR.bnf design note
-                        // 3m), so this can't actually fail from compiled
-                        // Butter source today.
-                        const key = key_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
-                        try obj.mapSet(self.allocator, key, val); // moves val in
-                        key_val.decref(self.allocator); // the key Value itself is never retained
-                    }
-                    try self.push(.{ .object = obj });
-                },
-
-                .index_get => {
-                    const index_val = try self.pop();
-                    defer index_val.decref(self.allocator);
-                    const container = try self.pop();
-                    defer container.decref(self.allocator);
-                    const result = try indexGet(self.allocator, container, index_val);
-                    try self.push(result);
-                },
-                .index_slice => {
-                    const end_val = try self.pop();
-                    defer end_val.decref(self.allocator);
-                    const start_val = try self.pop();
-                    defer start_val.decref(self.allocator);
-                    const container = try self.pop();
-                    defer container.decref(self.allocator);
-                    const result = try indexSlice(self.allocator, container, start_val, end_val);
-                    try self.push(result);
-                },
-                .index_set => {
-                    const v = try self.pop();
-                    errdefer v.decref(self.allocator); // undo the stack's own claim if we never restore it below
-                    v.incref();
-                    errdefer v.decref(self.allocator); // undo the copy indexSet would store, if it fails first
-                    const index_val = try self.pop();
-                    defer index_val.decref(self.allocator);
-                    const container = try self.pop();
-                    defer container.decref(self.allocator);
-                    try indexSet(self.allocator, container, index_val, v);
-                    try self.push(v);
-                },
-
-                .list_push => {
-                    const v = try self.pop();
-                    errdefer v.decref(self.allocator); // undo if it never ends up in the list
-                    const container = try self.pop();
-                    defer container.decref(self.allocator);
-                    if (container != .object or container.object.payload != .list) return RuntimeError.TypeMismatch;
-                    try container.object.payload.list.append(self.allocator, v); // moves v in
-                    try self.push(.{ .int = @intCast(container.object.payload.list.items.len) });
-                },
-                .map_has => {
-                    const key_val = try self.pop();
-                    defer key_val.decref(self.allocator);
-                    const container = try self.pop();
-                    defer container.decref(self.allocator);
-                    if (container != .object or container.object.payload != .map) return RuntimeError.TypeMismatch;
-                    const key = key_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
-                    try self.push(.{ .boolean = container.object.mapGet(key) != null });
-                },
-                .map_delete => {
-                    const key_val = try self.pop();
-                    defer key_val.decref(self.allocator);
-                    const container = try self.pop();
-                    defer container.decref(self.allocator);
-                    if (container != .object or container.object.payload != .map) return RuntimeError.TypeMismatch;
-                    const key = key_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
-                    try self.push(.{ .boolean = container.object.mapDelete(self.allocator, key) });
-                },
-                .map_keys => {
-                    const container = try self.pop();
-                    defer container.decref(self.allocator);
-                    if (container != .object or container.object.payload != .map) return RuntimeError.TypeMismatch;
-                    var list: std.ArrayList(Value) = .empty;
-                    errdefer {
-                        for (list.items) |item| item.decref(self.allocator);
-                        list.deinit(self.allocator);
-                    }
-                    var it = container.object.payload.map.iterator();
-                    while (it.next()) |entry| {
-                        // Always a fresh copy — never a slice into the map's
-                        // own storage — so the returned list's lifetime is
-                        // fully independent of the map it came from.
-                        try list.append(self.allocator, try Value.newString(self.allocator, entry.key_ptr.*));
-                    }
-                    const result_obj = try Object.create(self.allocator, .{ .list = list });
-                    try self.push(.{ .object = result_obj });
-                },
-                .len_value => {
-                    const v = try self.pop();
-                    defer v.decref(self.allocator);
-                    if (v != .object) return RuntimeError.TypeMismatch;
-                    const len: usize = switch (v.object.payload) {
-                        .list => |list| list.items.len,
-                        .map => |map| map.count(),
-                        .string => |s| s.len,
-                    };
-                    try self.push(.{ .int = @intCast(len) });
-                },
-
-                // ---- JSON (ISA.bnf section 12) ----
-
-                .json_parse => {
-                    const count_val = try self.pop();
-                    const ref_val = try self.pop();
-                    if (count_val != .int or ref_val != .array_ref) return RuntimeError.TypeMismatch;
-                    const ref = ref_val.array_ref;
-                    try checkBufferRange(ref);
-                    if (count_val.int < 0 or count_val.int > ref.len) return RuntimeError.IndexOutOfBounds;
-                    const n: usize = @intCast(count_val.int);
-
-                    try self.gatherBytes(ref, n);
-                    const result = json_mod.parse(self.allocator, self.io_buffer[0..n]) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.JsonParseFailed => return self.failFile(RuntimeError.JsonParseFailed, "json", "", "malformed JSON input"),
-                    };
-                    try self.push(result);
-                },
-
-                .json_stringify => {
-                    const v = try self.pop();
-                    defer v.decref(self.allocator);
-                    const result = json_mod.stringify(self.allocator, v) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        // Same bare-tag convention as MAP_HAS/LIST_PUSH's own
-                        // TypeMismatch above — a stream or array reference
-                        // has no diagnostic detail worth carrying beyond
-                        // "wrong kind of value".
-                        error.Unstringifiable => return RuntimeError.TypeMismatch,
-                    };
-                    try self.push(result);
-                },
-
-                // ---- Numeric parsing (ISA.bnf section 13) ----
-
-                .parse_int => {
-                    const v = try self.pop();
-                    defer v.decref(self.allocator);
-                    if (v.asStringBytes()) |bytes| {
-                        const result = std.fmt.parseInt(i64, bytes, 10) catch return self.failFile(RuntimeError.NumberParseFailed, "int", "", "malformed integer literal");
-                        try self.push(.{ .int = result });
-                    } else if (v == .float) {
-                        try self.push(.{ .int = try checkedIntFromFloat(v.float) });
-                    } else {
-                        return RuntimeError.TypeMismatch;
-                    }
-                },
-                .parse_float => {
-                    const v = try self.pop();
-                    defer v.decref(self.allocator);
-                    const bytes = v.asStringBytes() orelse return RuntimeError.TypeMismatch;
-                    const result = std.fmt.parseFloat(f64, bytes) catch return self.failFile(RuntimeError.NumberParseFailed, "float", "", "malformed float literal");
-                    try self.push(.{ .float = result });
-                },
-
-                .add => try self.add(),
-                .sub => try self.sub(),
-                .mul => try self.mul(),
-                .div => try self.div(),
-                .mod => try self.mod(),
-                .pow => try self.pow(),
-
-                .neg => {
-                    const v = try self.pop();
-                    switch (v) {
-                        .int => |x| try self.push(.{ .int = -x }),
-                        .float => |x| try self.push(.{ .float = -x }),
-                        else => {
-                            // v is discarded either way (never numeric, so
-                            // never refcounted on the success path above —
-                            // but could be a heap object here, e.g. `-doc`).
-                            v.decref(self.allocator);
-                            return RuntimeError.TypeMismatch;
-                        },
-                    }
-                },
-                .not => {
-                    const v = try self.pop();
-                    if (v != .boolean) {
-                        v.decref(self.allocator);
-                        return RuntimeError.TypeMismatch;
-                    }
-                    try self.push(.{ .boolean = !v.boolean });
-                },
-
-                .eq => {
-                    const b = try self.pop();
-                    defer b.decref(self.allocator);
-                    const a = try self.pop();
-                    defer a.decref(self.allocator);
-                    try self.push(.{ .boolean = Value.eql(a, b) });
-                },
-                .neq => {
-                    const b = try self.pop();
-                    defer b.decref(self.allocator);
-                    const a = try self.pop();
-                    defer a.decref(self.allocator);
-                    try self.push(.{ .boolean = !Value.eql(a, b) });
-                },
-                .lt => try self.compare(.lt),
-                .lte => try self.compare(.lte),
-                .gt => try self.compare(.gt),
-                .gte => try self.compare(.gte),
-
-                .jump => ip = instr.operand,
-                .jump_if_false => {
-                    const cond = try self.peek(0);
-                    if (cond != .boolean) return RuntimeError.TypeMismatch;
-                    if (!cond.boolean) ip = instr.operand;
-                },
-
-                .call => {
-                    if (frame_count >= frames_max) return RuntimeError.CallStackOverflow;
-                    const func = &program.functions[instr.operand];
-                    frames[frame_count] = .{ .chunk = chunk, .ip = ip, .bp = bp, .return_width = return_width };
-                    frame_count += 1;
-                    bp = self.sp - func.arity;
-                    chunk = &func.chunk;
-                    ip = 0;
-                    return_width = func.return_width;
-                },
-                .ret => {
-                    // Everything the departing frame owns OTHER than the
-                    // return value itself — its locals, its arguments, any
-                    // temporaries — is being discarded, not moved anywhere,
-                    // so each needs a decref (safe even though this range can
-                    // overlap the copy-down destination below: this pass
-                    // only ever READS a slot strictly below src_start, and
-                    // the copy loop only ever WRITES into [bp, bp+return_width),
-                    // and bp <= src_start always — so nothing here is ever
-                    // double-decreffed or read after being overwritten).
-                    const src_start = self.sp - return_width;
-                    var discard_i: usize = bp;
-                    while (discard_i < src_start) : (discard_i += 1) self.stack[discard_i].decref(self.allocator);
-
-                    // Generalizes pop-then-push of a single scalar to `return_width`
-                    // slots: the return value already sits at the top of the
-                    // callee's own stack region (pushed by the return
-                    // expression), so it's copied down onto the frame's base
-                    // in place rather than popped into a temporary — this is
-                    // the same move for width 1 as the old pop/push was.
-                    // A pure move: the return value's ownership transfers to
-                    // the caller, so no incref/decref of it here either.
-                    var i: usize = 0;
-                    while (i < return_width) : (i += 1) self.stack[bp + i] = self.stack[src_start + i];
-                    self.sp = bp + return_width;
-
-                    frame_count -= 1;
-                    const frame = frames[frame_count];
-                    chunk = frame.chunk;
-                    ip = frame.ip;
-                    bp = frame.bp;
-                    return_width = frame.return_width;
-                },
-
-                .print => {
-                    const v = try self.pop();
-                    defer v.decref(self.allocator);
-                    try v.print(writer);
-                    try writer.writeAll("\n");
-                },
-
-                .push_args => {
-                    var list: std.ArrayList(Value) = .empty;
-                    errdefer {
-                        for (list.items) |item| item.decref(self.allocator);
-                        list.deinit(self.allocator);
-                    }
-                    try list.ensureTotalCapacity(self.allocator, host.args.len);
-                    for (host.args) |arg| list.appendAssumeCapacity(try Value.newString(self.allocator, arg));
-                    const obj = try Object.create(self.allocator, .{ .list = list });
-                    try self.push(.{ .object = obj });
-                },
-
-                .read => {
-                    const ref_val = try self.pop();
-                    const stream = try self.popStream();
-                    if (ref_val != .array_ref) return RuntimeError.TypeMismatch;
-                    const ref = ref_val.array_ref;
-                    try checkBufferRange(ref);
-
-                    // A null reader is stdin with no input supplied, i.e.
-                    // already at its end — a 0-byte read, not a failure.
-                    const reader = try self.readerFor(host, stream) orelse {
-                        try self.push(.{ .int = 0 });
-                        continue;
-                    };
-                    const n = try readInto(reader, self.io_buffer[0..ref.len]);
-                    self.scatterBytes(ref, n);
-                    try self.push(.{ .int = @intCast(n) });
-                },
-                .write => {
-                    const v = try self.pop();
-                    defer v.decref(self.allocator);
-                    const stream = try self.popStream();
-                    const n = try writeValue(v, try self.writerFor(host, stream));
-                    try self.push(.{ .int = @intCast(n) });
-                },
-                .write_bytes => {
-                    const count_val = try self.pop();
-                    const ref_val = try self.pop();
-                    const stream = try self.popStream();
-                    if (count_val != .int or ref_val != .array_ref) return RuntimeError.TypeMismatch;
-                    const ref = ref_val.array_ref;
-                    try checkBufferRange(ref);
-                    if (count_val.int < 0 or count_val.int > ref.len) return RuntimeError.IndexOutOfBounds;
-                    const n: usize = @intCast(count_val.int);
-
-                    try self.gatherBytes(ref, n);
-                    if (try self.writerFor(host, stream)) |w| {
-                        w.writeAll(self.io_buffer[0..n]) catch return RuntimeError.StreamWriteFailed;
-                    }
-                    try self.push(.{ .int = @intCast(n) });
-                },
-
-                .open => {
-                    const path_val = try self.pop();
-                    defer path_val.decref(self.allocator);
-                    const path = path_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
-                    const stream = try self.openFile(host, path, @enumFromInt(instr.operand));
-                    try self.push(stream);
-                },
-                .close => {
-                    const stream = try self.popStream();
-                    switch (stream) {
-                        .standard => return RuntimeError.CannotCloseStandardStream,
-                        .file => |slot| {
-                            _ = try self.fileEntry(slot); // StreamClosed if it isn't open
-                            const fs = host.fs orelse return RuntimeError.FilesUnavailable;
-                            try self.closeSlot(fs, slot);
-                        },
-                    }
-                },
-
-                // `exit <expr>` — halts immediately, exactly like HALT
-                // (same cleanup, same kind of `return` — success, not a
-                // RuntimeError, since `exit(0)` isn't a failure), except the
-                // requested code is stashed on `self.exit_code` first so
-                // `run`'s caller can propagate it. Reachable from anywhere,
-                // including mid-function or several call frames deep:
-                // `decrefStack`/`closeAllFiles` already handle that exact
-                // shape (see their own doc comments), since a RuntimeError
-                // unwinding through an active frame needs the same cleanup.
-                .exit => {
-                    const code_val = try self.pop();
-                    if (code_val != .int) return RuntimeError.TypeMismatch;
-                    if (code_val.int < 0 or code_val.int > 255) return RuntimeError.InvalidExitCode;
-                    try self.closeAllFiles(host);
-                    self.decrefStack();
-                    self.exit_code = @intCast(code_val.int);
-                    return;
-                },
-
-                // Closing here (rather than only in the errdefer above) is
-                // what lets a failed flush of the program's own output be
-                // reported instead of swallowed. A close failure returns
-                // through `try`, which triggers the errdefer above (closing
-                // — redundantly but harmlessly — and decreffing the stack);
-                // decrefStack is only called again, directly, on the
-                // ordinary success path, where the errdefer never fires.
-                .halt => {
-                    try self.closeAllFiles(host);
-                    self.decrefStack();
-                    return;
-                },
+            switch (try self.step(&exec, host)) {
+                .running => {},
+                .halted => return,
             }
         }
+    }
+
+    /// Fetches and executes exactly one instruction, reporting whether the
+    /// program is still running afterwards.
+    ///
+    /// This is a separate function from `run` rather than that loop's body
+    /// purely so that a failing instruction becomes an error `run` can
+    /// CATCH instead of one that unwinds straight out of the interpreter.
+    /// Nothing uses that yet — `run` still propagates every error exactly as
+    /// it did when this was one function — but it is the seam `try`/`catch`
+    /// needs (TODO #9): a handler can only resume a program if something is
+    /// still on the Zig stack to resume it, and until this split there was
+    /// no such point.
+    ///
+    /// `ex` is by pointer because most of what an instruction does is
+    /// mutate it — advancing `ip`, pushing and popping frames, switching
+    /// chunks on a call.
+    ///
+    /// `inline` IS LOAD-BEARING, not a hint. A real call per instruction
+    /// costs 30-50% on the dispatch-bound benchmarks (`zig build
+    /// test-performance -Doptimize=ReleaseFast`: loop_sum 234ms -> 316ms,
+    /// function_calls 145ms -> 207ms), because `ip`/`bp`/`chunk` stop being
+    /// registers the optimizer can keep across iterations and become memory
+    /// round-trips through `ex` instead. Inlined into `run`'s loop, `exec`
+    /// doesn't escape and those fields go back into registers — measured
+    /// back to baseline. There's exactly one call site, so this costs no
+    /// code size. Inlining does NOT weaken the seam described above: `try`
+    /// inside an inline function still yields its error to the CALL SITE,
+    /// which is the loop in `run`, which is precisely where a handler needs
+    /// to catch it.
+    inline fn step(self: *Vm, ex: *Exec, host: Host) !Flow {
+        const instr = ex.chunk.code.items[ex.ip];
+        ex.ip += 1;
+        switch (instr.op) {
+            .push_const => {
+                const v = ex.chunk.constants.items[instr.operand];
+                v.incref();
+                try self.push(v);
+            },
+            .push_true => try self.push(.{ .boolean = true }),
+            .push_false => try self.push(.{ .boolean = false }),
+            .pop => {
+                const v = try self.pop();
+                v.decref(self.allocator);
+            },
+
+            .load_local => {
+                const v = self.stack[ex.bp + instr.operand];
+                v.incref();
+                try self.push(v);
+            },
+            .store_local => {
+                const new_v = try self.peek(0);
+                // Incref before decref: safe even for `x := x`, where the
+                // old and new value are the same object — increffing
+                // first means it can never be freed out from under
+                // itself before the assignment finishes.
+                new_v.incref();
+                self.stack[ex.bp + instr.operand].decref(self.allocator);
+                self.stack[ex.bp + instr.operand] = new_v;
+            },
+
+            .load_index => {
+                const idx_val = try self.pop();
+                if (idx_val != .int) return RuntimeError.TypeMismatch;
+                const idx = chunk_mod.unpackIndexOperand(instr.operand);
+                if (idx_val.int < 0 or idx_val.int >= idx.length) return RuntimeError.IndexOutOfBounds;
+                const v = self.stack[ex.bp + idx.slot + @as(usize, @intCast(idx_val.int))];
+                v.incref();
+                try self.push(v);
+            },
+            .store_index => {
+                const v = try self.pop();
+                const idx_val = try self.pop();
+                if (idx_val != .int) return RuntimeError.TypeMismatch;
+                const idx = chunk_mod.unpackIndexOperand(instr.operand);
+                if (idx_val.int < 0 or idx_val.int >= idx.length) return RuntimeError.IndexOutOfBounds;
+                v.incref();
+                self.stack[ex.bp + idx.slot + @as(usize, @intCast(idx_val.int))].decref(self.allocator);
+                self.stack[ex.bp + idx.slot + @as(usize, @intCast(idx_val.int))] = v;
+                try self.push(v);
+            },
+
+            .make_array_ref => {
+                const idx = chunk_mod.unpackIndexOperand(instr.operand);
+                try self.push(.{ .array_ref = .{ .base = @intCast(ex.bp + idx.slot), .len = idx.length } });
+            },
+            .load_index_ref => {
+                const idx_val = try self.pop();
+                if (idx_val != .int) return RuntimeError.TypeMismatch;
+                const ref = self.stack[ex.bp + instr.operand];
+                if (ref != .array_ref) return RuntimeError.TypeMismatch;
+                if (idx_val.int < 0 or idx_val.int >= ref.array_ref.len) return RuntimeError.IndexOutOfBounds;
+                const v = self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))];
+                v.incref();
+                try self.push(v);
+            },
+            .store_index_ref => {
+                const v = try self.pop();
+                const idx_val = try self.pop();
+                if (idx_val != .int) return RuntimeError.TypeMismatch;
+                const ref = self.stack[ex.bp + instr.operand];
+                if (ref != .array_ref) return RuntimeError.TypeMismatch;
+                if (idx_val.int < 0 or idx_val.int >= ref.array_ref.len) return RuntimeError.IndexOutOfBounds;
+                v.incref();
+                self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))].decref(self.allocator);
+                self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))] = v;
+                try self.push(v);
+            },
+            .load_ref_len => {
+                const ref = self.stack[ex.bp + instr.operand];
+                if (ref != .array_ref) return RuntimeError.TypeMismatch;
+                try self.push(.{ .int = ref.array_ref.len });
+            },
+
+            // ---- Maps, lists, and the heap (ISA.bnf section 11) ----
+
+            .make_list => {
+                const n = instr.operand;
+                var list: std.ArrayList(Value) = .empty;
+                // A pure move: the n values already on the stack become
+                // this list's own elements, so neither an incref (moving
+                // in) nor a decref (the old stack slots, about to be
+                // discarded via sp -= n) is needed for them.
+                try list.appendSlice(self.allocator, self.stack[self.sp - n .. self.sp]);
+                self.sp -= n;
+                errdefer {
+                    for (list.items) |item| item.decref(self.allocator);
+                    list.deinit(self.allocator);
+                }
+                const obj = try Object.create(self.allocator, .{ .list = list });
+                try self.push(.{ .object = obj });
+            },
+            .make_map => {
+                const n = instr.operand;
+                const base = self.sp - 2 * n;
+                // Consumed up front: from here on, nothing in this range
+                // is still visible to the outer stack-teardown decref
+                // pass, so a failure partway through the loop below must
+                // clean up whatever it hasn't gotten to yet itself.
+                self.sp = base;
+                const obj = try Object.create(self.allocator, .{ .map = .empty });
+                errdefer (Value{ .object = obj }).decref(self.allocator);
+                var i: usize = 0;
+                errdefer {
+                    while (i < n) : (i += 1) {
+                        self.stack[base + 2 * i].decref(self.allocator);
+                        self.stack[base + 2 * i + 1].decref(self.allocator);
+                    }
+                }
+                while (i < n) : (i += 1) {
+                    const key_val = self.stack[base + 2 * i];
+                    const val = self.stack[base + 2 * i + 1];
+                    // Defense-in-depth: the compiler only ever emits a
+                    // string-literal key here (GRAMMAR.bnf design note
+                    // 3m), so this can't actually fail from compiled
+                    // Butter source today.
+                    const key = key_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                    try obj.mapSet(self.allocator, key, val); // moves val in
+                    key_val.decref(self.allocator); // the key Value itself is never retained
+                }
+                try self.push(.{ .object = obj });
+            },
+
+            .index_get => {
+                const index_val = try self.pop();
+                defer index_val.decref(self.allocator);
+                const container = try self.pop();
+                defer container.decref(self.allocator);
+                const result = try indexGet(self.allocator, container, index_val);
+                try self.push(result);
+            },
+            .index_slice => {
+                const end_val = try self.pop();
+                defer end_val.decref(self.allocator);
+                const start_val = try self.pop();
+                defer start_val.decref(self.allocator);
+                const container = try self.pop();
+                defer container.decref(self.allocator);
+                const result = try indexSlice(self.allocator, container, start_val, end_val);
+                try self.push(result);
+            },
+            .index_set => {
+                const v = try self.pop();
+                errdefer v.decref(self.allocator); // undo the stack's own claim if we never restore it below
+                v.incref();
+                errdefer v.decref(self.allocator); // undo the copy indexSet would store, if it fails first
+                const index_val = try self.pop();
+                defer index_val.decref(self.allocator);
+                const container = try self.pop();
+                defer container.decref(self.allocator);
+                try indexSet(self.allocator, container, index_val, v);
+                try self.push(v);
+            },
+
+            .list_push => {
+                const v = try self.pop();
+                errdefer v.decref(self.allocator); // undo if it never ends up in the list
+                const container = try self.pop();
+                defer container.decref(self.allocator);
+                if (container != .object or container.object.payload != .list) return RuntimeError.TypeMismatch;
+                try container.object.payload.list.append(self.allocator, v); // moves v in
+                try self.push(.{ .int = @intCast(container.object.payload.list.items.len) });
+            },
+            .map_has => {
+                const key_val = try self.pop();
+                defer key_val.decref(self.allocator);
+                const container = try self.pop();
+                defer container.decref(self.allocator);
+                if (container != .object or container.object.payload != .map) return RuntimeError.TypeMismatch;
+                const key = key_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                try self.push(.{ .boolean = container.object.mapGet(key) != null });
+            },
+            .map_delete => {
+                const key_val = try self.pop();
+                defer key_val.decref(self.allocator);
+                const container = try self.pop();
+                defer container.decref(self.allocator);
+                if (container != .object or container.object.payload != .map) return RuntimeError.TypeMismatch;
+                const key = key_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                try self.push(.{ .boolean = container.object.mapDelete(self.allocator, key) });
+            },
+            .map_keys => {
+                const container = try self.pop();
+                defer container.decref(self.allocator);
+                if (container != .object or container.object.payload != .map) return RuntimeError.TypeMismatch;
+                var list: std.ArrayList(Value) = .empty;
+                errdefer {
+                    for (list.items) |item| item.decref(self.allocator);
+                    list.deinit(self.allocator);
+                }
+                var it = container.object.payload.map.iterator();
+                while (it.next()) |entry| {
+                    // Always a fresh copy — never a slice into the map's
+                    // own storage — so the returned list's lifetime is
+                    // fully independent of the map it came from.
+                    try list.append(self.allocator, try Value.newString(self.allocator, entry.key_ptr.*));
+                }
+                const result_obj = try Object.create(self.allocator, .{ .list = list });
+                try self.push(.{ .object = result_obj });
+            },
+            .len_value => {
+                const v = try self.pop();
+                defer v.decref(self.allocator);
+                if (v != .object) return RuntimeError.TypeMismatch;
+                const len: usize = switch (v.object.payload) {
+                    .list => |list| list.items.len,
+                    .map => |map| map.count(),
+                    .string => |s| s.len,
+                };
+                try self.push(.{ .int = @intCast(len) });
+            },
+
+            // ---- JSON (ISA.bnf section 12) ----
+
+            .json_parse => {
+                const count_val = try self.pop();
+                const ref_val = try self.pop();
+                if (count_val != .int or ref_val != .array_ref) return RuntimeError.TypeMismatch;
+                const ref = ref_val.array_ref;
+                try checkBufferRange(ref);
+                if (count_val.int < 0 or count_val.int > ref.len) return RuntimeError.IndexOutOfBounds;
+                const n: usize = @intCast(count_val.int);
+
+                try self.gatherBytes(ref, n);
+                const result = json_mod.parse(self.allocator, self.io_buffer[0..n]) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.JsonParseFailed => return self.failFile(RuntimeError.JsonParseFailed, "json", "", "malformed JSON input"),
+                };
+                try self.push(result);
+            },
+
+            .json_stringify => {
+                const v = try self.pop();
+                defer v.decref(self.allocator);
+                const result = json_mod.stringify(self.allocator, v) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // Same bare-tag convention as MAP_HAS/LIST_PUSH's own
+                    // TypeMismatch above — a stream or array reference
+                    // has no diagnostic detail worth carrying beyond
+                    // "wrong kind of value".
+                    error.Unstringifiable => return RuntimeError.TypeMismatch,
+                };
+                try self.push(result);
+            },
+
+            // ---- Numeric parsing (ISA.bnf section 13) ----
+
+            .parse_int => {
+                const v = try self.pop();
+                defer v.decref(self.allocator);
+                if (v.asStringBytes()) |bytes| {
+                    const result = std.fmt.parseInt(i64, bytes, 10) catch return self.failFile(RuntimeError.NumberParseFailed, "int", "", "malformed integer literal");
+                    try self.push(.{ .int = result });
+                } else if (v == .float) {
+                    try self.push(.{ .int = try checkedIntFromFloat(v.float) });
+                } else {
+                    return RuntimeError.TypeMismatch;
+                }
+            },
+            .parse_float => {
+                const v = try self.pop();
+                defer v.decref(self.allocator);
+                const bytes = v.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                const result = std.fmt.parseFloat(f64, bytes) catch return self.failFile(RuntimeError.NumberParseFailed, "float", "", "malformed float literal");
+                try self.push(.{ .float = result });
+            },
+
+            .add => try self.add(),
+            .sub => try self.sub(),
+            .mul => try self.mul(),
+            .div => try self.div(),
+            .mod => try self.mod(),
+            .pow => try self.pow(),
+
+            .neg => {
+                const v = try self.pop();
+                switch (v) {
+                    .int => |x| try self.push(.{ .int = -x }),
+                    .float => |x| try self.push(.{ .float = -x }),
+                    else => {
+                        // v is discarded either way (never numeric, so
+                        // never refcounted on the success path above —
+                        // but could be a heap object here, e.g. `-doc`).
+                        v.decref(self.allocator);
+                        return RuntimeError.TypeMismatch;
+                    },
+                }
+            },
+            .not => {
+                const v = try self.pop();
+                if (v != .boolean) {
+                    v.decref(self.allocator);
+                    return RuntimeError.TypeMismatch;
+                }
+                try self.push(.{ .boolean = !v.boolean });
+            },
+
+            .eq => {
+                const b = try self.pop();
+                defer b.decref(self.allocator);
+                const a = try self.pop();
+                defer a.decref(self.allocator);
+                try self.push(.{ .boolean = Value.eql(a, b) });
+            },
+            .neq => {
+                const b = try self.pop();
+                defer b.decref(self.allocator);
+                const a = try self.pop();
+                defer a.decref(self.allocator);
+                try self.push(.{ .boolean = !Value.eql(a, b) });
+            },
+            .lt => try self.compare(.lt),
+            .lte => try self.compare(.lte),
+            .gt => try self.compare(.gt),
+            .gte => try self.compare(.gte),
+
+            .jump => ex.ip = instr.operand,
+            .jump_if_false => {
+                const cond = try self.peek(0);
+                if (cond != .boolean) return RuntimeError.TypeMismatch;
+                if (!cond.boolean) ex.ip = instr.operand;
+            },
+
+            .call => {
+                if (ex.frame_count >= frames_max) return RuntimeError.CallStackOverflow;
+                const func = &ex.program.functions[instr.operand];
+                ex.frames[ex.frame_count] = .{ .chunk = ex.chunk, .ip = ex.ip, .bp = ex.bp, .return_width = ex.return_width };
+                ex.frame_count += 1;
+                ex.bp = self.sp - func.arity;
+                ex.chunk = &func.chunk;
+                ex.ip = 0;
+                ex.return_width = func.return_width;
+            },
+            .ret => {
+                // Everything the departing frame owns OTHER than the
+                // return value itself — its locals, its arguments, any
+                // temporaries — is being discarded, not moved anywhere,
+                // so each needs a decref (safe even though this range can
+                // overlap the copy-down destination below: this pass
+                // only ever READS a slot strictly below src_start, and
+                // the copy loop only ever WRITES into [bp, bp+return_width),
+                // and bp <= src_start always — so nothing here is ever
+                // double-decreffed or read after being overwritten).
+                const src_start = self.sp - ex.return_width;
+                var discard_i: usize = ex.bp;
+                while (discard_i < src_start) : (discard_i += 1) self.stack[discard_i].decref(self.allocator);
+
+                // Generalizes pop-then-push of a single scalar to `return_width`
+                // slots: the return value already sits at the top of the
+                // callee's own stack region (pushed by the return
+                // expression), so it's copied down onto the frame's base
+                // in place rather than popped into a temporary — this is
+                // the same move for width 1 as the old pop/push was.
+                // A pure move: the return value's ownership transfers to
+                // the caller, so no incref/decref of it here either.
+                var i: usize = 0;
+                while (i < ex.return_width) : (i += 1) self.stack[ex.bp + i] = self.stack[src_start + i];
+                self.sp = ex.bp + ex.return_width;
+
+                ex.frame_count -= 1;
+                const frame = ex.frames[ex.frame_count];
+                ex.chunk = frame.chunk;
+                ex.ip = frame.ip;
+                ex.bp = frame.bp;
+                ex.return_width = frame.return_width;
+            },
+
+            .print => {
+                const v = try self.pop();
+                defer v.decref(self.allocator);
+                try v.print(host.out);
+                try host.out.writeAll("\n");
+            },
+
+            .push_args => {
+                var list: std.ArrayList(Value) = .empty;
+                errdefer {
+                    for (list.items) |item| item.decref(self.allocator);
+                    list.deinit(self.allocator);
+                }
+                try list.ensureTotalCapacity(self.allocator, host.args.len);
+                for (host.args) |arg| list.appendAssumeCapacity(try Value.newString(self.allocator, arg));
+                const obj = try Object.create(self.allocator, .{ .list = list });
+                try self.push(.{ .object = obj });
+            },
+
+            .read => {
+                const ref_val = try self.pop();
+                const stream = try self.popStream();
+                if (ref_val != .array_ref) return RuntimeError.TypeMismatch;
+                const ref = ref_val.array_ref;
+                try checkBufferRange(ref);
+
+                // A null reader is stdin with no input supplied, i.e.
+                // already at its end — a 0-byte read, not a failure.
+                const reader = try self.readerFor(host, stream) orelse {
+                    try self.push(.{ .int = 0 });
+                    return .running;
+                };
+                const n = try readInto(reader, self.io_buffer[0..ref.len]);
+                self.scatterBytes(ref, n);
+                try self.push(.{ .int = @intCast(n) });
+            },
+            .write => {
+                const v = try self.pop();
+                defer v.decref(self.allocator);
+                const stream = try self.popStream();
+                const n = try writeValue(v, try self.writerFor(host, stream));
+                try self.push(.{ .int = @intCast(n) });
+            },
+            .write_bytes => {
+                const count_val = try self.pop();
+                const ref_val = try self.pop();
+                const stream = try self.popStream();
+                if (count_val != .int or ref_val != .array_ref) return RuntimeError.TypeMismatch;
+                const ref = ref_val.array_ref;
+                try checkBufferRange(ref);
+                if (count_val.int < 0 or count_val.int > ref.len) return RuntimeError.IndexOutOfBounds;
+                const n: usize = @intCast(count_val.int);
+
+                try self.gatherBytes(ref, n);
+                if (try self.writerFor(host, stream)) |w| {
+                    w.writeAll(self.io_buffer[0..n]) catch return RuntimeError.StreamWriteFailed;
+                }
+                try self.push(.{ .int = @intCast(n) });
+            },
+
+            .open => {
+                const path_val = try self.pop();
+                defer path_val.decref(self.allocator);
+                const path = path_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                const stream = try self.openFile(host, path, @enumFromInt(instr.operand));
+                try self.push(stream);
+            },
+            .close => {
+                const stream = try self.popStream();
+                switch (stream) {
+                    .standard => return RuntimeError.CannotCloseStandardStream,
+                    .file => |slot| {
+                        _ = try self.fileEntry(slot); // StreamClosed if it isn't open
+                        const fs = host.fs orelse return RuntimeError.FilesUnavailable;
+                        try self.closeSlot(fs, slot);
+                    },
+                }
+            },
+
+            // `exit <expr>` — halts immediately, exactly like HALT
+            // (same cleanup, same kind of `return` — success, not a
+            // RuntimeError, since `exit(0)` isn't a failure), except the
+            // requested code is stashed on `self.exit_code` first so
+            // `run`'s caller can propagate it. Reachable from anywhere,
+            // including mid-function or several call frames deep:
+            // `decrefStack`/`closeAllFiles` already handle that exact
+            // shape (see their own doc comments), since a RuntimeError
+            // unwinding through an active frame needs the same cleanup.
+            .exit => {
+                const code_val = try self.pop();
+                if (code_val != .int) return RuntimeError.TypeMismatch;
+                if (code_val.int < 0 or code_val.int > 255) return RuntimeError.InvalidExitCode;
+                try self.closeAllFiles(host);
+                self.decrefStack();
+                self.exit_code = @intCast(code_val.int);
+                return .halted;
+            },
+
+            // Closing here (rather than only in the errdefer above) is
+            // what lets a failed flush of the program's own output be
+            // reported instead of swallowed. A close failure returns
+            // through `try`, which triggers the errdefer above (closing
+            // — redundantly but harmlessly — and decreffing the stack);
+            // decrefStack is only called again, directly, on the
+            // ordinary success path, where the errdefer never fires.
+            .halt => {
+                try self.closeAllFiles(host);
+                self.decrefStack();
+                return .halted;
+            },
+        }
+        return .running;
     }
 };
 
