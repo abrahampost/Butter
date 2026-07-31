@@ -179,6 +179,8 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <delete-expr>
                       | <json-expr>
                       | <stringify-expr>
+                      | <int-expr>
+                      | <float-expr>
                       | 'stdin' | 'stdout' | 'stderr'
                       | 'args'
                       | IDENTIFIER
@@ -217,6 +219,18 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <json-expr>         ::= 'json' '(' IDENTIFIER ',' <expression> ')'
 <stringify-expr>    ::= 'stringify' '(' <expression> ')'
+
+(* `int`/`float` double as TYPE keywords (<type>, above) and as this
+   call-like special form — never ambiguous, since <type> is only ever
+   consulted at the START of a <var-declaration>/<param>/return-type
+   position, never inside <expression>. The one surface wrinkle: `int(x)`
+   can't stand alone as a top-level <expr-stmt>, because <declaration>
+   dispatches on `kw_int`/`kw_float` BEFORE expression parsing ever begins
+   (design note 3r, below) — same as every other <atom> keyword-form here,
+   it's only reachable from inside a larger expression (`print int(x)`,
+   `y := int(x)`, ...). *)
+<int-expr>          ::= 'int' '(' <expression> ')'
+<float-expr>        ::= 'float' '(' <expression> ')'
 
 
 (* --------------------------------------------------------------------------
@@ -341,6 +355,66 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      has no JSON representation (`RuntimeError.TypeMismatch`). It's a
      special form because nothing else in the language lets a `func` build
      a string a piece at a time. *)
+
+(* --- Numeric parsing and the int(x) float cast (design note 3r) ---
+   - `int(s)`/`float(s)` parse a `string` into a number — the general
+     counterpart to `json(...)`'s "well-formed JSON only" parsing (`"42px"`
+     fails there rather than partially parsing; these do too). Special
+     forms, like `json`/`stringify` above, reusing the existing `int`/
+     `float` TYPE keywords as call syntax rather than introducing
+     `parseInt`/`parseFloat` names — never ambiguous with a <type> use,
+     since that position is only ever consulted at the very start of a
+     <var-declaration>/<param>/return-type, never while parsing an
+     <expression>.
+   - A malformed string (empty, non-numeric, internal/surrounding
+     whitespace, or — for `int(s)` specifically — a decimal point) is
+     `RuntimeError.NumberParseFailed`; there is no partial-parse fallback.
+   - LEADING/TRAILING WHITESPACE IS NOT TRIMMED: `int(" 42")` and
+     `int("42 ")` are both `NumberParseFailed`, matching `json(...)`'s own
+     strictness rather than `print`/shell-style permissiveness — a caller
+     that wants to tolerate surrounding whitespace trims it itself first
+     (e.g. via a slice).
+   - A leading `-` OR `+` is accepted for both (`int("-5")`, `int("+5")`,
+     `float("-3.2")`) — this is a thin wrapper over Zig's
+     `std.fmt.parseInt`/`parseFloat`, and inherits their sign handling
+     as-is.
+   - `int("3.5")` is `NumberParseFailed` — parsing a string never
+     truncates a decimal, even though `int(x)` on an already-numeric
+     `float` value (below) does exactly that. `float("42")` DOES succeed
+     (`42.0`) — any valid `int`-shaped text is also valid `float`-shaped
+     text.
+   - `float(s)` also inherits `std.fmt.parseFloat`'s recognition of
+     `"nan"`/`"inf"`/`"-inf"` (case-insensitive) as the corresponding
+     special `float` values, same as any other language wrapping the same
+     stdlib function would — not a Butter-specific extension. `int(s)` has
+     no equivalent, since `int` has no NaN/infinity to represent.
+
+   `int(x)`'s SECOND FORM — THE FLOAT CAST: unlike `float(s)`, which only
+   ever parses a `string`, `int(x)` also accepts an already-numeric
+   `float` directly (no `string` involved at all) — this is what actually
+   answers "how do I get an `int` out of a computed `float`?" (`floor`/
+   `ceil`/`round` in the math stdlib all return `float`, never `int`).
+   - TRUNCATES TOWARD ZERO, matching Zig's own `@intFromFloat` semantics:
+     `int(3.9)` is `3`, `int(-3.9)` is `-3` (not `-4` — this is
+     truncation, not `floor`). An exact-integer float truncates to
+     itself: `int(4.0)` is `4`.
+   - `RuntimeError.Overflow` (the same variant `+`/`-`/`*` already raise
+     on int-side overflow, ISA.bnf's ADD/SUB/MUL) if the float's integer
+     part doesn't fit in an `i64` — including `NaN` and `±Infinity`, which
+     have no integer part to speak of. There is no wrapping or clamping,
+     consistent with the rest of this VM's "checked, not trusted" stance.
+   - So `int(x)`'s ONE opcode (ISA.bnf's PARSE_INT) now branches on `x`'s
+     runtime shape: `string` parses text (`NumberParseFailed` on
+     malformed input), `float` truncates (`Overflow` out of range), and
+     anything else (`int`, `bool`, a stream, a map/list, ...) is
+     `RuntimeError.TypeMismatch` — an `int` argument is NOT accepted as a
+     no-op identity; there is no implicit "this is already an int"
+     shortcut, matching the rest of the language's no-implicit-conversion
+     stance (the Strings design notes' `+`/comparison operators take the
+     same position). `float(x)` has NO such second form: an `int` value
+     handed to `float(...)` is `RuntimeError.TypeMismatch`, not a
+     widening conversion — only the float-to-int direction is a cast
+     today; a symmetric `int`-to-`float` widening cast is not implemented. *)
 
 (* --- Program arguments ---
    - `args` is a bare keyword, like `stdin`/`stdout`/`stderr`, but unlike

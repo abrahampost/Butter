@@ -160,6 +160,16 @@ pub const Expr = union(enum) {
     /// `json_parse`'s buffer, this has no array-identifier restriction to
     /// inherit — it reads a value, it doesn't name a buffer to fill).
     json_stringify: *Expr,
+    /// `int(value)` (GRAMMAR.bnf design note 3r) — parses a `string` as a
+    /// base-10 integer, evaluating to an `int`. Reuses the `int` TYPE
+    /// keyword as call syntax, like `json`/`stringify` above; never
+    /// ambiguous with a `<type>` use since that position is only ever
+    /// consulted at the start of a var-declaration/param/return-type, never
+    /// while parsing an expression.
+    int_parse: *Expr,
+    /// `float(value)` — the `float` counterpart to `int_parse`, parsing a
+    /// `string` as a floating-point literal.
+    float_parse: *Expr,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -509,6 +519,16 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
         },
         .json_stringify => |e| {
             try writer.writeAll("(stringify ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .int_parse => |e| {
+            try writer.writeAll("(int ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .float_parse => |e| {
+            try writer.writeAll("(float ");
             try printExpr(writer, e);
             try writer.writeAll(")");
         },

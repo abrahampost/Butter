@@ -61,6 +61,13 @@ pub const RuntimeError = error{
     /// a fixed description, since the underlying parser's own error detail
     /// doesn't survive past `json.zig`'s simplified conversion.
     JsonParseFailed,
+    /// `int(...)`/`float(...)`'s (ISA.bnf section 13) string operand wasn't
+    /// a valid number in the target format — empty, a non-numeric byte,
+    /// surrounding whitespace, a leading `+`, an out-of-range magnitude, or
+    /// (for `int` specifically) a decimal point. `Vm.diagnostic` names which
+    /// of the two ("int"/"float") failed, mirroring `JsonParseFailed`'s own
+    /// fixed-description convention.
+    NumberParseFailed,
 
     /// `exit <expr>`'s value wasn't an INT in 0..255 — the range a process
     /// exit code can actually carry (`std.process.exit`'s own `u8`
@@ -331,6 +338,24 @@ pub const Vm = struct {
         const result, const overflow = @mulWithOverflow(x, y);
         if (overflow != 0) return RuntimeError.Overflow;
         return result;
+    }
+
+    /// Truncates `f` toward zero into an `i64` — `int(x)`'s float-cast form
+    /// (GRAMMAR.bnf design note 3r's addendum). `@intFromFloat` itself would
+    /// do the same truncation but is safety-checked UB if the integer part
+    /// doesn't fit; this checks first instead, the same "checked, not
+    /// trusted" stance `checkedAdd`/`checkedSub`/`checkedMul` already take
+    /// for int-side overflow. NaN, ±Infinity, and any magnitude that doesn't
+    /// fit in i64 are all `RuntimeError.Overflow`.
+    fn checkedIntFromFloat(f: f64) RuntimeError!i64 {
+        // 2^63 is exactly representable in f64 and is one past i64's true
+        // max (9223372036854775807, itself NOT exactly representable as
+        // f64) — the correct exclusive upper bound to compare a truncated
+        // float against before handing it to @intFromFloat.
+        const limit: f64 = 9223372036854775808.0;
+        const truncated = @trunc(f);
+        if (std.math.isNan(f) or truncated < -limit or truncated >= limit) return RuntimeError.Overflow;
+        return @intFromFloat(truncated);
     }
 
     /// `+` (GRAMMAR.bnf section 3, ISA.bnf ADD): numeric addition when both
@@ -991,6 +1016,28 @@ pub const Vm = struct {
                         error.Unstringifiable => return RuntimeError.TypeMismatch,
                     };
                     try self.push(result);
+                },
+
+                // ---- Numeric parsing (ISA.bnf section 13) ----
+
+                .parse_int => {
+                    const v = try self.pop();
+                    defer v.decref(self.allocator);
+                    if (v.asStringBytes()) |bytes| {
+                        const result = std.fmt.parseInt(i64, bytes, 10) catch return self.failFile(RuntimeError.NumberParseFailed, "int", "", "malformed integer literal");
+                        try self.push(.{ .int = result });
+                    } else if (v == .float) {
+                        try self.push(.{ .int = try checkedIntFromFloat(v.float) });
+                    } else {
+                        return RuntimeError.TypeMismatch;
+                    }
+                },
+                .parse_float => {
+                    const v = try self.pop();
+                    defer v.decref(self.allocator);
+                    const bytes = v.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                    const result = std.fmt.parseFloat(f64, bytes) catch return self.failFile(RuntimeError.NumberParseFailed, "float", "", "malformed float literal");
+                    try self.push(.{ .float = result });
                 },
 
                 .add => try self.add(),
@@ -3023,4 +3070,228 @@ test "json_stringify on a stream value is TypeMismatch" {
     _ = try chunk.emit(allocator, .halt);
 
     try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+// ---- Numeric parsing (ISA.bnf section 13) --------------------------------
+
+test "parse_int parses a well-formed integer string, including a negative one" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "-42"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .parse_int);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("-42\n", buf[0..len]);
+}
+
+test "parse_float parses a well-formed float string, including a negative one" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "-3.5"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .parse_float);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("-3.5\n", buf[0..len]);
+}
+
+test "parse_float accepts a plain integer-shaped string" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "42"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .parse_float);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("42\n", buf[0..len]);
+}
+
+test "parse_int on malformed input is NumberParseFailed" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "abc"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .parse_int);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.NumberParseFailed);
+}
+
+test "parse_int rejects a decimal string rather than truncating" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "3.5"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .parse_int);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.NumberParseFailed);
+}
+
+test "parse_int/parse_float reject leading or trailing whitespace" {
+    const allocator = std.testing.allocator;
+    {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+        const s = try chunk.addConstant(allocator, try Value.newString(allocator, " 42"));
+        _ = try chunk.emitWithOperand(allocator, .push_const, s);
+        _ = try chunk.emit(allocator, .parse_int);
+        _ = try chunk.emit(allocator, .halt);
+        try expectRuntimeError(&chunk, RuntimeError.NumberParseFailed);
+    }
+    {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+        const s = try chunk.addConstant(allocator, try Value.newString(allocator, "42 "));
+        _ = try chunk.emitWithOperand(allocator, .push_const, s);
+        _ = try chunk.emit(allocator, .parse_float);
+        _ = try chunk.emit(allocator, .halt);
+        try expectRuntimeError(&chunk, RuntimeError.NumberParseFailed);
+    }
+}
+
+test "parse_int/parse_float on an empty string are NumberParseFailed" {
+    const allocator = std.testing.allocator;
+    {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+        const s = try chunk.addConstant(allocator, try Value.newString(allocator, ""));
+        _ = try chunk.emitWithOperand(allocator, .push_const, s);
+        _ = try chunk.emit(allocator, .parse_int);
+        _ = try chunk.emit(allocator, .halt);
+        try expectRuntimeError(&chunk, RuntimeError.NumberParseFailed);
+    }
+    {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+        const s = try chunk.addConstant(allocator, try Value.newString(allocator, ""));
+        _ = try chunk.emitWithOperand(allocator, .push_const, s);
+        _ = try chunk.emit(allocator, .parse_float);
+        _ = try chunk.emit(allocator, .halt);
+        try expectRuntimeError(&chunk, RuntimeError.NumberParseFailed);
+    }
+}
+
+test "parse_int/parse_float on a non-string value is TypeMismatch" {
+    const allocator = std.testing.allocator;
+    {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+        _ = try chunk.emit(allocator, .push_true);
+        _ = try chunk.emit(allocator, .parse_int);
+        _ = try chunk.emit(allocator, .halt);
+        try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+    }
+    {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+        const n = try chunk.addConstant(allocator, .{ .int = 5 });
+        _ = try chunk.emitWithOperand(allocator, .push_const, n);
+        _ = try chunk.emit(allocator, .parse_float);
+        _ = try chunk.emit(allocator, .halt);
+        try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+    }
+}
+
+// ---- int(x)'s float-cast form (GRAMMAR.bnf design note 3r's addendum) ----
+
+test "parse_int on an INT operand is TypeMismatch (no implicit identity cast)" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const n = try chunk.addConstant(allocator, .{ .int = 5 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, n);
+    _ = try chunk.emit(allocator, .parse_int);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+fn expectParseIntFloat(f: f64, expected: i64) !void {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const n = try chunk.addConstant(allocator, .{ .float = f });
+    _ = try chunk.emitWithOperand(allocator, .push_const, n);
+    _ = try chunk.emit(allocator, .parse_int);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    var expected_buf: [32]u8 = undefined;
+    const expected_str = try std.fmt.bufPrint(&expected_buf, "{d}\n", .{expected});
+    try std.testing.expectEqualStrings(expected_str, buf[0..len]);
+}
+
+fn expectParseIntFloatOverflow(f: f64) !void {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const n = try chunk.addConstant(allocator, .{ .float = f });
+    _ = try chunk.emitWithOperand(allocator, .push_const, n);
+    _ = try chunk.emit(allocator, .parse_int);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.Overflow);
+}
+
+test "parse_int truncates a positive float toward zero" {
+    try expectParseIntFloat(3.9, 3);
+}
+
+test "parse_int truncates a negative float toward zero (not floor)" {
+    try expectParseIntFloat(-3.9, -3);
+}
+
+test "parse_int on an exact-integer float returns it unchanged" {
+    try expectParseIntFloat(4.0, 4);
+    try expectParseIntFloat(-4.0, -4);
+    try expectParseIntFloat(0.0, 0);
+}
+
+test "parse_int on a float just inside i64's range succeeds" {
+    // 2^62, comfortably inside i64's range and exactly representable in f64.
+    try expectParseIntFloat(4611686018427387904.0, 4611686018427387904);
+}
+
+test "parse_int on a float at or beyond i64's range is Overflow" {
+    // 2^63 exactly: the nearest f64 to i64's true max
+    // (9223372036854775807), but itself one past it.
+    try expectParseIntFloatOverflow(9223372036854775808.0);
+    // One f64 ULP below i64's exact min (-2^63) at this magnitude (ULP
+    // spacing here is 2^11 = 2048) — the next representable float past the
+    // valid range in the negative direction.
+    try expectParseIntFloatOverflow(-9223372036854777856.0);
+    try expectParseIntFloatOverflow(1e300);
+    try expectParseIntFloatOverflow(-1e300);
+}
+
+test "parse_int on NaN or infinity is Overflow" {
+    try expectParseIntFloatOverflow(std.math.nan(f64));
+    try expectParseIntFloatOverflow(std.math.inf(f64));
+    try expectParseIntFloatOverflow(-std.math.inf(f64));
 }

@@ -515,6 +515,7 @@ pub const Parser = struct {
     ///         | <map-literal> | <len-expr> | <read-expr> | <write-expr>
     ///         | <open-expr> | <push-expr> | <keys-expr> | <has-expr>
     ///         | <delete-expr> | <json-expr> | <stringify-expr>
+    ///         | <int-expr> | <float-expr>
     ///         | 'stdin' | 'stdout' | 'stderr' | 'args' | IDENTIFIER
     fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
@@ -570,6 +571,8 @@ pub const Parser = struct {
             .kw_delete => return self.deleteExpr(),
             .kw_json => return self.jsonExpr(),
             .kw_stringify => return self.stringifyExpr(),
+            .kw_int => return self.intParseExpr(),
+            .kw_float => return self.floatParseExpr(),
             .kw_stdin => {
                 _ = self.advance();
                 return self.createExpr(.{ .stream_literal = .stdin });
@@ -821,6 +824,29 @@ pub const Parser = struct {
         const value = try self.expression();
         _ = try self.expect(.rparen, "expected ')' after the value to stringify");
         return self.createExpr(.{ .json_stringify = value });
+    }
+
+    /// <int-expr> ::= 'int' '(' <expression> ')'
+    ///
+    /// Reached only from `atom` (an expression-position `.kw_int`) — a
+    /// statement-position `.kw_int` is `declaration`'s var-declaration
+    /// dispatch instead, which never reaches here (GRAMMAR.bnf design note
+    /// 3r: `int(x)` can't stand alone as a top-level statement).
+    fn intParseExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'int'
+        _ = try self.expect(.lparen, "expected '(' after 'int'");
+        const value = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the value to parse");
+        return self.createExpr(.{ .int_parse = value });
+    }
+
+    /// <float-expr> ::= 'float' '(' <expression> ')'
+    fn floatParseExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'float'
+        _ = try self.expect(.lparen, "expected '(' after 'float'");
+        const value = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the value to parse");
+        return self.createExpr(.{ .float_parse = value });
     }
 };
 
@@ -1286,6 +1312,42 @@ test "parses push/keys/has/delete/json/stringify as expressions" {
     try expectExprSexpr("delete(m, \"a\")", "(delete m \"a\")");
     try expectExprSexpr("json(buf, n)", "(json buf n)");
     try expectExprSexpr("stringify(m)", "(stringify m)");
+}
+
+test "parses int(...)/float(...) as expressions, reusing the type keywords" {
+    try expectExprSexpr("int(s)", "(int s)");
+    try expectExprSexpr("float(s)", "(float s)");
+    try expectExprSexpr("int(\"42\")", "(int \"42\")");
+}
+
+test "int(...)/float(...)'s argument may be an arbitrary expression" {
+    try expectExprSexpr("int(s[0..2])", "(int (slice s 0 2))");
+    try expectExprSexpr("float(a + b)", "(float (+ a b))");
+}
+
+test "int(x) cannot stand alone as a top-level statement (design note 3r)" {
+    // 'int' at statement position is always the START of a var-declaration
+    // (declaration()'s dispatch on kw_int); it never reaches intParseExpr,
+    // so this fails past the missing variable name rather than parsing a
+    // call.
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init("int(x)\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
+}
+
+test "int(...)/float(...) work fine nested inside a statement" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "print int(\"42\")\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.program.len);
+    try std.testing.expectEqualStrings("42", result.program[0].print_stmt.int_parse.literal.string);
 }
 
 test "parses 'null' as a literal" {

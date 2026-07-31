@@ -1,0 +1,21 @@
+list readings := ["3.5", "-2.25", "10", "-0.75"]
+float total := 0.0
+for i in 0..len(readings) {
+    total := total + float(readings[i])
+}
+print total
+
+string count_str := "4"
+int count := int(count_str)
+print count
+
+print total / count
+
+print float("42")
+print int("-7")
+print "parsed " + stringify(int("-7")) + " as an int"
+
+float average := total / count
+print int(average)
+print int(-average)
+print int(4.0)

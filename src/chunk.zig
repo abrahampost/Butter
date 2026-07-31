@@ -103,9 +103,15 @@ pub const OpCode = enum(u8) {
     map_keys,
     len_value,
 
-    // JSON (ISA.bnf sections 12 and 13).
+    // JSON (ISA.bnf section 12).
     json_parse,
     json_stringify,
+
+    // Numeric parsing (ISA.bnf section 13, GRAMMAR.bnf design note 3r). No
+    // operand: like JSON_STRINGIFY, the string to parse is an ordinary
+    // popped `Value`, not a compile-time constant.
+    parse_int,
+    parse_float,
 
     // `exit <expr>` (ISA.bnf's addendum to section 3). No operand: the
     // requested code is an ordinary popped `Value`, exactly like every
@@ -447,6 +453,21 @@ test "disassemble renders the operand-less map/list/json instructions" {
             "0004 map_delete\n0005 map_keys\n0006 len_value\n0007 json_parse\n",
         writer.buffered(),
     );
+}
+
+test "disassemble renders parse_int and parse_float" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .parse_int);
+    _ = try chunk.emit(allocator, .parse_float);
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 parse_int\n0001 parse_float\n", writer.buffered());
 }
 
 test "Program.deinit frees the main chunk and every function's chunk" {

@@ -145,6 +145,10 @@ test "strings: concatenation and lexicographic ordering, incl. a bubble sort" {
     try expectCaseOutput("strings");
 }
 
+test "parse_numbers: int(...)/float(...) parse strings into numbers" {
+    try expectCaseOutput("parse_numbers");
+}
+
 test "args: the bare 'args' keyword sees the host's argv, in order" {
     try expectCaseOutputWithArgs("args", &.{ "alpha", "beta", "gamma" });
 }
@@ -224,4 +228,21 @@ test "slicing a string with start > end is a runtime error" {
 test "assigning through a string index is a runtime error (strings are read-only)" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.TypeMismatch, run(allocator, "string s := \"hi\"\ns[0] := \"X\"\n"));
+}
+
+test "int(...) on a malformed string is a runtime error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.NumberParseFailed, run(allocator, "print int(\"not a number\")\n"));
+}
+
+test "float(...) on a non-string value is a runtime error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.TypeMismatch, run(allocator, "print float(true)\n"));
+}
+
+test "int(x) on a float outside i64's range is a runtime Overflow" {
+    // Butter float literals have no exponent syntax (GRAMMAR.bnf section 1),
+    // so this spells the out-of-range magnitude out in plain decimal.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.Overflow, run(allocator, "print int(99999999999999999999999999999999.0)\n"));
 }

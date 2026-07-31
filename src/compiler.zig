@@ -669,6 +669,14 @@ pub const Compiler = struct {
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .json_stringify);
             },
+            .int_parse => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .parse_int);
+            },
+            .float_parse => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .parse_float);
+            },
         }
     }
 
@@ -2824,5 +2832,106 @@ test "stringify(...) on a stream is a runtime TypeMismatch" {
     var buf: [64]u8 = undefined;
     try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
         \\print stringify(stdout)
+    , &buf));
+}
+
+test "int(...)/float(...) parse a string into a number" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\print int("42")
+        \\print int("-7")
+        \\print float("3.5")
+        \\print float("-2.25")
+        \\print float("42")
+    , &buf);
+    try std.testing.expectEqualStrings("42\n-7\n3.5\n-2.25\n42\n", output);
+}
+
+test "int(...)/float(...) compose with stringify/concatenation like any other expression" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int x := int("10")
+        \\print x + 5
+    , &buf);
+    try std.testing.expectEqualStrings("15\n", output);
+}
+
+test "int(...) on a malformed string is a runtime NumberParseFailed" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.NumberParseFailed, runProgram(allocator,
+        \\print int("abc")
+    , &buf));
+}
+
+test "int(...) rejects a decimal string (no truncation) as NumberParseFailed" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.NumberParseFailed, runProgram(allocator,
+        \\print int("3.5")
+    , &buf));
+}
+
+test "float(...) on a malformed string is a runtime NumberParseFailed" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.NumberParseFailed, runProgram(allocator,
+        \\print float("not a number")
+    , &buf));
+}
+
+test "int(...)/float(...) on a non-string value is TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\print int(5)
+    , &buf));
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\print float(true)
+    , &buf));
+}
+
+test "int(...)/float(...) reject surrounding whitespace" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.NumberParseFailed, runProgram(allocator,
+        \\print int(" 42")
+    , &buf));
+    try std.testing.expectError(vm_mod.RuntimeError.NumberParseFailed, runProgram(allocator,
+        \\print float("42 ")
+    , &buf));
+}
+
+test "int(x) truncates a computed float toward zero" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\float a := 7.0
+        \\float b := 2.0
+        \\print int(a / b)
+        \\print int(-a / b)
+        \\print int(4.0)
+    , &buf);
+    try std.testing.expectEqualStrings("3\n-3\n4\n", output);
+}
+
+test "int(x) on a float outside i64's range is a runtime Overflow" {
+    // Butter float literals have no exponent syntax (GRAMMAR.bnf section 1),
+    // so this spells the out-of-range magnitude out in plain decimal.
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.Overflow, runProgram(allocator,
+        \\print int(99999999999999999999999999999999.0)
+    , &buf));
+}
+
+test "int(x) on an already-int value is TypeMismatch (no implicit identity cast)" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\int x := 5
+        \\print int(x)
     , &buf));
 }

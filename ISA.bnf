@@ -900,4 +900,85 @@
    type (`string`) IS fixed, same as any `func`'s declared return type; what
    rules out an ordinary `func` here is that nothing else in the language
    lets a `func` body build a string a piece at a time.
+
+
+(* --------------------------------------------------------------------------
+   13. NUMERIC PARSING (int/float call-syntax — one opcode each, no new
+       value kind; GRAMMAR.bnf design note 3r)
+   -------------------------------------------------------------------------- *)
+
+   PARSE_INT                ( v -- int )      pops v; branches on its
+                                               runtime shape (`int(x)` is
+                                               ONE opcode covering both of
+                                               its forms, GRAMMAR.bnf design
+                                               note 3r):
+                                                 - STRING: parses its bytes
+                                                   as a base-10 signed
+                                                   integer literal via
+                                                   `std.fmt.parseInt(i64, ..,
+                                                   10)`. `RuntimeError.
+                                                   NumberParseFailed` (with a
+                                                   `Vm.diagnostic`, operation
+                                                   "int") for anything
+                                                   `parseInt` itself rejects:
+                                                   empty input, a non-digit
+                                                   byte, surrounding
+                                                   whitespace, a decimal
+                                                   point, or a magnitude
+                                                   outside i64. A leading '+'
+                                                   or '-' IS accepted
+                                                   (`parseInt`'s own sign
+                                                   handling).
+                                                 - FLOAT: truncates toward
+                                                   zero into an i64 (checked
+                                                   first against i64's
+                                                   representable range
+                                                   rather than trusting
+                                                   `@intFromFloat`'s own
+                                                   safety-checked-UB
+                                                   precondition —
+                                                   `Vm.checkedIntFromFloat`).
+                                                   `RuntimeError.Overflow`
+                                                   (the same variant ADD/SUB/
+                                                   MUL already use) for NaN,
+                                                   ±Infinity, or any
+                                                   magnitude whose integer
+                                                   part doesn't fit an i64.
+                                                 - Anything else (INT
+                                                   included — no implicit
+                                                   "already an int"
+                                                   identity): TypeMismatch.
+                                               Pushes the result as an INT.
+                                               What `int(x)` (GRAMMAR.bnf
+                                               design note 3r) compiles to.
+   PARSE_FLOAT               ( v -- float )   pops v (must be string-shaped;
+                                               TypeMismatch otherwise);
+                                               parses its bytes as a
+                                               floating-point literal via
+                                               `std.fmt.parseFloat(f64,
+                                               ..)`, pushing the result as a
+                                               FLOAT. `RuntimeError.
+                                               NumberParseFailed` (with a
+                                               `Vm.diagnostic`, operation
+                                               "float") for anything
+                                               `parseFloat` itself rejects
+                                               (empty input, a non-numeric
+                                               byte, surrounding
+                                               whitespace). What `float(s)`
+                                               compiles to. Unlike PARSE_INT,
+                                               a plain integer-shaped string
+                                               ("42") is valid input here
+                                               too, and so is "nan"/"inf"/
+                                               "-inf" (`parseFloat`'s own
+                                               special-value recognition,
+                                               case-insensitive).
+
+   Both are ordinary special forms parsed like JSON/STRINGIFY (section 12) —
+   `int`/`float` are also <type> keywords (section 2's VALUE REPRESENTATION
+   note doesn't change), but the parser never confuses the two: a <type> is
+   only ever consulted at the very start of a var-declaration/param/
+   return-type position, never while parsing an <expression> (GRAMMAR.bnf
+   design note 3r). Neither opcode touches the heap or any refcount beyond
+   decreffing its own popped string operand (`Vm.pop`'s usual convention) —
+   the pushed result is a plain scalar INT/FLOAT either way.
    ========================================================================== *)

@@ -60,29 +60,34 @@ landed; covered by the last line of the `strings` integration case
 
 ## P1 — significant gaps (workable around today, but painful)
 
-### 6. String → number parsing
-Only path is `json()`, which requires well-formed JSON and rejects
-anything else (`"42px"` fails rather than partially parsing). No general
-`parseInt`/`parseFloat`.
-- Add `int`/`float` conversion builtins (naming should mirror the
-  existing `type`-keyword style, e.g. reuse `int(s)`/`float(s)` as call
-  syntax) that parse a string and raise a `RuntimeError` (new or reused
-  variant) on malformed input.
-- Document in GRAMMAR.bnf/ISA.bnf; add tests for valid/invalid input,
-  leading/trailing whitespace, negative numbers.
+### 6. String → number parsing — DONE
+`int(s)`/`float(s)` are now special-form expressions (parsed like
+`json`/`stringify`, reusing the existing `int`/`float` type keywords as
+call syntax — GRAMMAR.bnf design note 3r) that parse a `string` into a
+number via new `PARSE_INT`/`PARSE_FLOAT` opcodes (ISA.bnf section 13) in
+[src/vm.zig](src/vm.zig), thin wrappers over `std.fmt.parseInt`/
+`parseFloat`. A non-string operand is `RuntimeError.TypeMismatch`;
+malformed content (empty, non-numeric, a decimal point for `int`
+specifically, internal/surrounding whitespace) is the new
+`RuntimeError.NumberParseFailed`. Documented in GRAMMAR.bnf/ISA.bnf.
+Covered by parser/compiler/VM unit tests (valid/invalid input,
+leading/trailing whitespace, negative numbers, non-string operands) and
+the `parse_numbers` integration case under `tests/cases/`.
 
-### 7. float → int cast
-No path exists anywhere in the VM (`@intFromFloat` is unused in the
-codebase — confirmed via grep). `floor`/`ceil`/`round` in
-[src/std/math.std.butter](src/std/math.std.butter) all return `float`;
-there is no way to obtain an actual `int` from a computed float.
-- Add an explicit cast builtin (e.g. `int(x)` for truncation, consistent
-  with task #6's naming if both land) with defined truncation-toward-zero
-  semantics.
-- Document rounding/truncation behavior explicitly in GRAMMAR.bnf.
-- Add tests: positive, negative, exact-integer floats, values near
-  i64 bounds (overflow behavior should match the existing `Overflow`
-  RuntimeError convention used by `add`/`sub`/etc.).
+### 7. float → int cast — DONE
+`int(x)` (task #6's special form) now has a second runtime branch: if `x`
+evaluates to a `float` rather than a `string`, `PARSE_INT` (ISA.bnf
+section 13) truncates it toward zero into an `i64` via the new
+`Vm.checkedIntFromFloat` in [src/vm.zig](src/vm.zig) — checked against
+i64's representable range up front rather than trusting
+`@intFromFloat`'s safety-checked-UB precondition, so NaN/±Infinity/an
+out-of-range magnitude are `RuntimeError.Overflow` (the same variant
+`add`/`sub`/`mul` already use), not a crash. An `int` operand is
+deliberately still `RuntimeError.TypeMismatch` — no implicit
+"already an int" identity cast. Documented in GRAMMAR.bnf design note 3r
+and ISA.bnf's PARSE_INT entry. Covered by VM unit tests (positive,
+negative, exact-integer floats, values at/near i64's bounds, NaN/
+Infinity) and compiler-level/integration tests (`parse_numbers.butter`).
 
 ### 8. Escape sequences in string literals
 Per GRAMMAR.bnf section 1, `STRING` has no escape syntax at all —
