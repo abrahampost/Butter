@@ -37,17 +37,19 @@ program's own args. Documented in GRAMMAR.bnf/ISA.bnf. Covered by lexer,
 parser, and VM unit tests, the `args` integration case under
 `tests/cases/`, and `examples/cli_args.butter`.
 
-### 4. Process exit code control
-Every successful run exits 0; every uncaught `RuntimeError` exits 1 with a
-fixed message ([src/main.zig:145](src/main.zig#L145)). A program has no
-way to signal a specific nonzero exit code (needed for `grep`/`diff`-style
-tools).
-- Add an `exit(code)` builtin/statement that halts the VM and propagates
-  the requested code out to `main.zig`'s `std.process.exit`.
-- Document in GRAMMAR.bnf (new statement or call form) and ISA.bnf (new
-  opcode, likely a variant of `halt`).
-- Add tests: normal halt still exits 0, `exit(n)` exits `n`, `exit` mid-
-  function skips remaining code.
+### 4. Process exit code control — DONE
+`exit <expression>` is now a statement (GRAMMAR.bnf design note 3q,
+alongside `close`) that halts the whole program immediately, from
+anywhere, via a new `EXIT` opcode (ISA.bnf) — `expression` must be an INT
+in 0..255 (`RuntimeError.TypeMismatch`/`InvalidExitCode` otherwise) and is
+stashed on `Vm.exit_code` before `run` returns normally (not as an error —
+`exit(0)` isn't a failure). [src/main.zig](src/main.zig) checks
+`vm.exit_code` after a successful run and calls `std.process.exit` with
+it; a program that never calls `exit` still exits 0 as before. Covered by
+lexer/parser/compiler/VM unit tests (including a nested-call case proving
+`exit` skips every remaining frame, not just its own) and the `exit_code`
+integration case under `tests/cases/` (a grep-style tool combining `args`
+and `exit`, exercising all three of its branches' real exit codes).
 
 ### 5. Number → string composition — DONE
 Verified `stringify(n) + " ..."` works end-to-end now that task #1 has

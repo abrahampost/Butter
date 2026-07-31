@@ -47,6 +47,7 @@ pub const TokenType = enum {
     kw_stringify,
     kw_null,
     kw_args,
+    kw_exit,
 
     // Operators and punctuation
     plus,
@@ -116,6 +117,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "stringify", .kw_stringify },
     .{ "null", .kw_null },
     .{ "args", .kw_args },
+    .{ "exit", .kw_exit },
 });
 
 pub const Token = struct {
@@ -499,6 +501,10 @@ test "the three stream names are recognized as keywords" {
 
 test "'args' is recognized as a keyword" {
     try expectTokenTypes("args argsx", &.{ .kw_args, .identifier, .eof });
+}
+
+test "'exit' is recognized as a keyword" {
+    try expectTokenTypes("exit exitx", &.{ .kw_exit, .identifier, .eof });
 }
 
 test "'#' starts a comment that runs to end of line" {

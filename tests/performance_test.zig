@@ -1,0 +1,118 @@
+//! Performance tests for the Butter language: each case here is a
+//! .butter program (tests/perf_cases/<name>.butter) chosen to lean on one
+//! "common action" a real program does a lot of — a tight arithmetic
+//! loop, recursive calls, array sorting, list/map growth, string
+//! concatenation, function-call overhead — run end to end through the
+//! same loader -> compiler -> VM pipeline tests/integration_test.zig
+//! uses, but timed instead of output-checked.
+//!
+//! Each test reports two numbers in milliseconds:
+//!   - compile: lexing + parsing + import resolution + bytecode codegen
+//!   - run:     executing the compiled bytecode in the VM
+//! printed to stderr so they're visible in `zig build test-performance`
+//! output. This is a baseline to optimize against, not a correctness
+//! check, so each test only asserts a generous upper bound (catches a
+//! catastrophic regression, e.g. an accidental O(n) -> O(n^2) change,
+//! without being flaky on a slower CI machine) rather than a tight one.
+//!
+//! Debug builds (the default for `zig build test-performance`) are much
+//! slower than release ones and not representative of real-world
+//! performance — run with `-Doptimize=ReleaseFast` for numbers worth
+//! comparing against other language implementations.
+
+const std = @import("std");
+const butter = @import("butter");
+
+const Timing = struct {
+    compile_ns: i96,
+    run_ns: i96,
+};
+
+/// Compiles and runs `source`, discarding its printed output, and returns
+/// how long each phase took. Mirrors integration_test.zig's `run`, split
+/// into its compile and execute halves so each can be timed separately.
+fn benchmark(allocator: std.mem.Allocator, source: []const u8) !Timing {
+    const io = std.testing.io;
+
+    const t0 = std.Io.Clock.now(.awake, io);
+
+    var loader = butter.module.Loader.init(allocator, io, std.Io.Dir.cwd());
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(source, "<bench>", ".");
+    const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry);
+
+    var compiler = butter.compiler.Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(modules.entry_index, modules.units);
+    defer compiled.deinit(allocator);
+
+    const t1 = std.Io.Clock.now(.awake, io);
+
+    // A Discarding writer so a benchmark that prints a lot (or a little)
+    // isn't measuring output-buffering cost instead of VM execution cost.
+    var discard_buffer: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&discard_buffer);
+
+    var vm = butter.vm.Vm.init(allocator);
+    try vm.run(&compiled, .{ .out = &discarding.writer });
+
+    const t2 = std.Io.Clock.now(.awake, io);
+
+    return .{
+        .compile_ns = t0.durationTo(t1).nanoseconds,
+        .run_ns = t1.durationTo(t2).nanoseconds,
+    };
+}
+
+fn msOf(ns: i96) f64 {
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
+}
+
+/// Runs tests/perf_cases/<name>.butter, prints its compile/run/total
+/// timings in milliseconds, and asserts the total stays under
+/// `max_total_ms` — a loose regression guard, not a performance target.
+fn expectCasePerformance(comptime name: []const u8, max_total_ms: f64) !void {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("perf_cases/" ++ name ++ ".butter");
+
+    const timing = try benchmark(allocator, source);
+    const compile_ms = msOf(timing.compile_ns);
+    const run_ms = msOf(timing.run_ns);
+    const total_ms = compile_ms + run_ms;
+
+    std.debug.print(
+        "{s:<16} compile={d:>9.3}ms  run={d:>9.3}ms  total={d:>9.3}ms\n",
+        .{ name, compile_ms, run_ms, total_ms },
+    );
+
+    try std.testing.expect(total_ms < max_total_ms);
+}
+
+test "loop_sum: a tight 4,000,000-iteration arithmetic loop" {
+    try expectCasePerformance("loop_sum", 5000.0);
+}
+
+test "fib_recursive: fib(27) via naive recursion (~832k calls)" {
+    try expectCasePerformance("fib_recursive", 5000.0);
+}
+
+test "bubble_sort: O(n^2) sort of a 600-element array" {
+    try expectCasePerformance("bubble_sort", 5000.0);
+}
+
+test "list_push: growing a list to 80,000 elements, then summing it" {
+    try expectCasePerformance("list_push", 5000.0);
+}
+
+test "map_ops: 8,000 map inserts followed by 8,000 has() lookups" {
+    try expectCasePerformance("map_ops", 5000.0);
+}
+
+test "string_concat: 3,000 rounds of O(n) string concatenation" {
+    try expectCasePerformance("string_concat", 5000.0);
+}
+
+test "function_calls: 2,000,000 calls to a trivial non-recursive function" {
+    try expectCasePerformance("function_calls", 5000.0);
+}

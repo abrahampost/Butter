@@ -164,4 +164,10 @@ pub fn main(init: std.process.Init) !void {
     };
     try stdout_writer.flush();
     try stderr_writer.flush();
+
+    // `exit(n)` (GRAMMAR.bnf design note 3q) sets this before `vm.run`
+    // returns; a program that never calls it falls off the end via HALT,
+    // leaving it null, which is exit code 0 — the same convention every
+    // shell uses for "ran to completion without calling exit itself".
+    if (vm.exit_code) |code| std.process.exit(code);
 }

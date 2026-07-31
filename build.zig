@@ -50,6 +50,22 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run the .butter program integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
+    const performance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/performance_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "butter", .module = mod },
+            },
+        }),
+    });
+    const run_performance_tests = b.addRunArtifact(performance_tests);
+    run_performance_tests.has_side_effects = true; // always rerun; timings shouldn't be cached
+
+    const performance_test_step = b.step("test-performance", "Run the timed .butter program performance benchmarks (add -Doptimize=ReleaseFast for representative numbers)");
+    performance_test_step.dependOn(&run_performance_tests.step);
+
     const test_step = b.step("test", "Run the full test suite (unit + integration)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_integration_tests.step);

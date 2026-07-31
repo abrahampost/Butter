@@ -1,0 +1,9 @@
+list xs
+for i in 0..80000 {
+    push(xs, i)
+}
+int total := 0
+for i in 0..len(xs) {
+    total := total + xs[i]
+}
+print total

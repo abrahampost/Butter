@@ -288,6 +288,13 @@ pub const Stmt = union(enum) {
     /// unlike `open`/`read`/`write`, it produces no value; `print` is the
     /// same shape for the same reason (design note 3l).
     close_stmt: *Expr,
+    /// `exit <expression>` (design note 3q) — halts the whole program
+    /// immediately, from anywhere (including deep inside nested calls, mid-
+    /// loop, mid-expression-statement), propagating `expression`'s value as
+    /// the process's own exit code. A statement, not an expression, for the
+    /// same reason `close`/`print` are: it produces no value to a caller
+    /// that, by definition, never gets to run.
+    exit_stmt: *Expr,
 
     pub const VarDecl = struct {
         type: ValueType,
@@ -629,6 +636,11 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
         .import_stmt => |i| try writer.print("(import \"{s}\")", .{i.path}),
         .close_stmt => |e| {
             try writer.writeAll("(close ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .exit_stmt => |e| {
+            try writer.writeAll("(exit ");
             try printExpr(writer, e);
             try writer.writeAll(")");
         },

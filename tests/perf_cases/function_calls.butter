@@ -1,0 +1,9 @@
+func add(int a, int b) -> int {
+    return a + b
+}
+
+int total := 0
+for i in 0..2000000 {
+    total := add(total, i)
+}
+print total

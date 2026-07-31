@@ -410,6 +410,10 @@ pub const Compiler = struct {
             .for_stmt => |f| try self.compileFor(f),
             .import_stmt => unreachable, // top-level only; compileModules never calls compileStmt on this
             .close_stmt => |e| try self.compileCloseStmt(e),
+            .exit_stmt => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .exit);
+            },
         }
     }
 
@@ -997,11 +1001,12 @@ pub const Compiler = struct {
     /// never changes (GRAMMAR.bnf design note 3e). A bare GENERIC array
     /// local instead emits LOAD_REF_LEN, reading the length out of the
     /// reference value at runtime (ISA.bnf section 6's generic-array
-    /// addendum). Anything else — a map/list (bare name or not), or any
-    /// other expression entirely — compiles as an ordinary expression
-    /// followed by LEN_VALUE, a genuine runtime operation
+    /// addendum). Anything else — a map/list/string (bare name or not), or
+    /// any other expression entirely — compiles as an ordinary expression
+    /// followed by LEN_VALUE, a genuine runtime operation returning element
+    /// count (list), entry count (map), or byte length (string)
     /// (`RuntimeError.TypeMismatch` if the value it's handed turns out not
-    /// to be a list or a map): unlike bracket-indexing, `len` on a
+    /// to be any of those): unlike bracket-indexing, `len` on a
     /// statically-known plain scalar local is deliberately NOT a compile
     /// error here, matching design note 3m's framing of this as a runtime
     /// question once anything past a bare fixed/generic array is involved.
@@ -1256,6 +1261,31 @@ test "compiles arithmetic precedence correctly" {
     var buf: [64]u8 = undefined;
     const output = try runProgram(allocator, "print 1 + 2 * 3\n", &buf);
     try std.testing.expectEqualStrings("7\n", output);
+}
+
+test "compiles 'exit', which halts immediately and sets the VM's exit_code" {
+    const allocator = std.testing.allocator;
+
+    var lex = lexer_mod.Lexer.init("print 1\nexit 2\nprint 3\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try vm.run(&compiled, .{ .out = &writer });
+
+    // "3" is never printed: exit halts the whole program right where it's
+    // called, not just the statement it's part of.
+    try std.testing.expectEqualStrings("1\n", writer.buffered());
+    try std.testing.expectEqual(@as(?u8, 2), vm.exit_code);
 }
 
 test "compiles if/else, taking the else branch" {
@@ -1644,6 +1674,18 @@ test "len(arr) can drive a for-loop's bound instead of a hardcoded size" {
         \\print total
     , &buf);
     try std.testing.expectEqualStrings("10\n", output);
+}
+
+test "len(s) on a string returns its byte length" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\string s := "hello"
+        \\print len(s)
+        \\print len("")
+        \\print len("Hello, " + "world")
+    , &buf);
+    try std.testing.expectEqualStrings("5\n0\n12\n", output);
 }
 
 test "len() on a non-array, non-collection local compiles fine but is a runtime TypeMismatch" {

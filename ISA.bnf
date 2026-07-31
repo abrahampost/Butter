@@ -366,6 +366,9 @@
                                                a bare fixed/generic-array
                                                identifier: list -> element
                                                count, map -> entry count,
+                                               string -> byte length (ISA.bnf
+                                               section 11's BYTE-indexed
+                                               convention, not codepoints),
                                                else TypeMismatch.
    JSON_PARSE               ( ref count -- v )  gathers `count` bytes from
                                                the buffer ref points at
@@ -384,9 +387,33 @@
                                                reference — neither has a
                                                JSON representation.
 
+   EXIT                     ( code -- )        pops code (must be INT;
+                                               TypeMismatch otherwise;
+                                               InvalidExitCode unless
+                                               0 <= code <= 255); flushes and
+                                               closes every open file exactly
+                                               like HALT, decrefs the entire
+                                               stack across every active
+                                               frame (same as HALT — `exit`
+                                               is reachable mid-function,
+                                               several call frames deep), and
+                                               stores code on `Vm.exit_code`
+                                               before returning. What `exit
+                                               <expression>` (GRAMMAR.bnf
+                                               design note 3q) compiles to.
+                                               Unlike every RuntimeError, this
+                                               is a NORMAL return from `run`
+                                               (`exit(0)` is not a failure) —
+                                               the embedder distinguishes it
+                                               from an ordinary HALT (which
+                                               leaves `Vm.exit_code` null)
+                                               purely by checking that field.
+
    HALT                                       stop execution (only ever
                                                appears in the main chunk, at
-                                               the very end)
+                                               the very end); `Vm.exit_code`
+                                               stays null, which the embedder
+                                               treats as exit code 0
 
 
 (* --------------------------------------------------------------------------

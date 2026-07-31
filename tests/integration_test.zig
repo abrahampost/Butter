@@ -72,6 +72,31 @@ fn expectCaseOutputWithArgs(comptime name: []const u8, args: []const []const u8)
     try std.testing.expectEqualStrings(expected, actual);
 }
 
+/// Runs `source` with `args` and returns both everything it printed and
+/// the process exit code it requested via `exit` (ISA.bnf's EXIT) — `null`
+/// for a program that falls off the end (an ordinary HALT) without ever
+/// calling `exit` itself. Caller owns `output`.
+fn runCapture(allocator: std.mem.Allocator, source: []const u8, args: []const []const u8) !struct { output: []u8, exit_code: ?u8 } {
+    var loader = butter.module.Loader.init(allocator, std.testing.io, std.Io.Dir.cwd());
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(source, "<test>", ".");
+    const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry);
+
+    var compiler = butter.compiler.Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(modules.entry_index, modules.units);
+    defer compiled.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    var vm = butter.vm.Vm.init(allocator);
+    try vm.run(&compiled, .{ .out = &out.writer, .args = args });
+
+    return .{ .output = try out.toOwnedSlice(), .exit_code = vm.exit_code };
+}
+
 test "fizzbuzz: Fizz/Buzz/FizzBuzz/number for 1..20" {
     try expectCaseOutput("fizzbuzz");
 }
@@ -129,6 +154,46 @@ test "args: with no host args, 'args' is an empty list" {
     const actual = try run(allocator, "print len(args)\n");
     defer allocator.free(actual);
     try std.testing.expectEqualStrings("0\n", actual);
+}
+
+// ---- exit_code: a grep-style tool built on `args` + `exit` ------------
+//
+// Same case source (tests/cases/exit_code.butter) run three ways — found,
+// not found, no argument at all — each asserting both what it printed and
+// the process exit code it requested, the way a shell script driving a
+// real `grep`/`diff`-style CLI tool would actually observe it.
+
+test "exit_code: the needle is found, prints a match and exits 0" {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("cases/exit_code.butter");
+
+    const result = try runCapture(allocator, source, &.{"cat"});
+    defer allocator.free(result.output);
+
+    try std.testing.expectEqualStrings("found: cat\n", result.output);
+    try std.testing.expectEqual(@as(?u8, 0), result.exit_code);
+}
+
+test "exit_code: the needle is absent, prints nothing found and exits 1" {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("cases/exit_code.butter");
+
+    const result = try runCapture(allocator, source, &.{"shark"});
+    defer allocator.free(result.output);
+
+    try std.testing.expectEqualStrings("not found: shark\n", result.output);
+    try std.testing.expectEqual(@as(?u8, 1), result.exit_code);
+}
+
+test "exit_code: no needle given, prints usage and exits 2" {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("cases/exit_code.butter");
+
+    const result = try runCapture(allocator, source, &.{});
+    defer allocator.free(result.output);
+
+    try std.testing.expectEqualStrings("usage: exit_code <needle>\n", result.output);
+    try std.testing.expectEqual(@as(?u8, 2), result.exit_code);
 }
 
 // ---- Error-path cases ------------------------------------------------

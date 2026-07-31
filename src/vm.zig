@@ -61,6 +61,14 @@ pub const RuntimeError = error{
     /// a fixed description, since the underlying parser's own error detail
     /// doesn't survive past `json.zig`'s simplified conversion.
     JsonParseFailed,
+
+    /// `exit <expr>`'s value wasn't an INT in 0..255 — the range a process
+    /// exit code can actually carry (`std.process.exit`'s own `u8`
+    /// parameter). Checked rather than silently wrapped (e.g. `exit(256)`
+    /// quietly becoming exit code 0), matching the "checked, not trusted"
+    /// stance the rest of this VM already takes (overflow-checked
+    /// arithmetic, `ByteOutOfRange` on WRITE_BYTES).
+    InvalidExitCode,
 };
 
 const stack_max = 1024;
@@ -177,6 +185,12 @@ pub const Vm = struct {
     /// Detail for the last file error raised, since a Zig error value can't
     /// carry a payload. Set only on the errors documented to have one.
     diagnostic: ?Diagnostic = null,
+    /// Set by EXIT just before it returns from `run` (a normal, non-error
+    /// return — `exit(0)` is not a failure). `null` after a run that ended
+    /// via HALT (falling off the end) instead, which the embedder should
+    /// treat as exit code 0, exactly as if `exit(0)` had been the program's
+    /// last statement.
+    exit_code: ?u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) Vm {
         return .{ .allocator = allocator };
@@ -941,7 +955,7 @@ pub const Vm = struct {
                     const len: usize = switch (v.object.payload) {
                         .list => |list| list.items.len,
                         .map => |map| map.count(),
-                        .string => return RuntimeError.TypeMismatch,
+                        .string => |s| s.len,
                     };
                     try self.push(.{ .int = @intCast(len) });
                 },
@@ -1158,6 +1172,25 @@ pub const Vm = struct {
                     }
                 },
 
+                // `exit <expr>` — halts immediately, exactly like HALT
+                // (same cleanup, same kind of `return` — success, not a
+                // RuntimeError, since `exit(0)` isn't a failure), except the
+                // requested code is stashed on `self.exit_code` first so
+                // `run`'s caller can propagate it. Reachable from anywhere,
+                // including mid-function or several call frames deep:
+                // `decrefStack`/`closeAllFiles` already handle that exact
+                // shape (see their own doc comments), since a RuntimeError
+                // unwinding through an active frame needs the same cleanup.
+                .exit => {
+                    const code_val = try self.pop();
+                    if (code_val != .int) return RuntimeError.TypeMismatch;
+                    if (code_val.int < 0 or code_val.int > 255) return RuntimeError.InvalidExitCode;
+                    try self.closeAllFiles(host);
+                    self.decrefStack();
+                    self.exit_code = @intCast(code_val.int);
+                    return;
+                },
+
                 // Closing here (rather than only in the errdefer above) is
                 // what lets a failed flush of the program's own output be
                 // reported instead of swallowed. A close failure returns
@@ -1189,6 +1222,139 @@ fn expectRuntimeError(chunk: *const Chunk, expected: RuntimeError) !void {
     var writer = std.Io.Writer.fixed(&buf);
     const program = chunk_mod.Program{ .main = chunk.*, .functions = &.{} };
     try std.testing.expectError(expected, vm.run(&program, .{ .out = &writer }));
+}
+
+test "exit halts immediately, before the next instruction runs" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const three = try chunk.addConstant(allocator, .{ .int = 3 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, three);
+    _ = try chunk.emit(allocator, .exit);
+    // Never reached: exit halts the whole program, not just this statement.
+    const ninety_nine = try chunk.addConstant(allocator, .{ .int = 99 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, ninety_nine);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var vm = Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const program = chunk_mod.Program{ .main = chunk, .functions = &.{} };
+    try vm.run(&program, .{ .out = &writer });
+
+    try std.testing.expectEqualStrings("", writer.buffered());
+    try std.testing.expectEqual(@as(?u8, 3), vm.exit_code);
+}
+
+test "a program that never calls exit leaves exit_code null (ordinary halt)" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+    _ = try chunk.emit(allocator, .halt);
+
+    var vm = Vm.init(allocator);
+    var writer = std.Io.Writer.fixed(&.{});
+    const program = chunk_mod.Program{ .main = chunk, .functions = &.{} };
+    try vm.run(&program, .{ .out = &writer });
+
+    try std.testing.expectEqual(@as(?u8, null), vm.exit_code);
+}
+
+test "exit with a non-int value is TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const idx = try chunk.addConstant(allocator, .{ .boolean = true });
+    _ = try chunk.emitWithOperand(allocator, .push_const, idx);
+    _ = try chunk.emit(allocator, .exit);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "exit with a negative code is InvalidExitCode" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const idx = try chunk.addConstant(allocator, .{ .int = -1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, idx);
+    _ = try chunk.emit(allocator, .exit);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.InvalidExitCode);
+}
+
+test "exit with a code above 255 is InvalidExitCode" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const idx = try chunk.addConstant(allocator, .{ .int = 256 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, idx);
+    _ = try chunk.emit(allocator, .exit);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.InvalidExitCode);
+}
+
+test "exit(255) is the top of the valid range, not an off-by-one error" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const idx = try chunk.addConstant(allocator, .{ .int = 255 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, idx);
+    _ = try chunk.emit(allocator, .exit);
+    _ = try chunk.emit(allocator, .halt);
+
+    var vm = Vm.init(allocator);
+    var writer = std.Io.Writer.fixed(&.{});
+    const program = chunk_mod.Program{ .main = chunk, .functions = &.{} };
+    try vm.run(&program, .{ .out = &writer });
+
+    try std.testing.expectEqual(@as(?u8, 255), vm.exit_code);
+}
+
+test "exit deep inside a nested call skips every remaining frame, not just its own" {
+    // Hand-assembled equivalent of:
+    //   func fail() -> int { exit 7 }
+    //   fail()
+    //   print 99   -- never reached
+    const allocator = std.testing.allocator;
+
+    var func_chunk: Chunk = .{};
+    const seven = try func_chunk.addConstant(allocator, .{ .int = 7 });
+    _ = try func_chunk.emitWithOperand(allocator, .push_const, seven);
+    _ = try func_chunk.emit(allocator, .exit);
+    // Never reached: exit unwinds the whole program, not just this frame,
+    // so there is no RET to skip back to the caller — the call below the
+    // .call it originated from never sees a result.
+    _ = try func_chunk.emit(allocator, .ret);
+
+    var main_chunk: Chunk = .{};
+    _ = try main_chunk.emitWithOperand(allocator, .call, 0);
+    _ = try main_chunk.emit(allocator, .pop);
+    const ninety_nine = try main_chunk.addConstant(allocator, .{ .int = 99 });
+    _ = try main_chunk.emitWithOperand(allocator, .push_const, ninety_nine);
+    _ = try main_chunk.emit(allocator, .print);
+    _ = try main_chunk.emit(allocator, .halt);
+
+    var functions: std.ArrayList(chunk_mod.Function) = .empty;
+    try functions.append(allocator, .{ .name = "fail", .arity = 0, .chunk = func_chunk });
+    var program = chunk_mod.Program{ .main = main_chunk, .functions = try functions.toOwnedSlice(allocator) };
+    defer program.deinit(allocator);
+
+    var vm = Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try vm.run(&program, .{ .out = &writer });
+
+    try std.testing.expectEqualStrings("", writer.buffered());
+    try std.testing.expectEqual(@as(?u8, 7), vm.exit_code);
 }
 
 test "push and pop basic arithmetic: 2 + 3 -> prints 5" {
@@ -2529,7 +2695,7 @@ test "map_keys preserves insertion order" {
     try std.testing.expectEqualStrings("a\nb\n", buf[0..len]);
 }
 
-test "len_value reads a list's and a map's length" {
+test "len_value reads a list's, a map's, and a string's length" {
     const allocator = std.testing.allocator;
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
@@ -2550,11 +2716,21 @@ test "len_value reads a list's and a map's length" {
     _ = try chunk.emitWithOperand(allocator, .make_map, 1);
     _ = try chunk.emit(allocator, .len_value);
     _ = try chunk.emit(allocator, .print); // 1
+
+    const hello = try chunk.addConstant(allocator, try Value.newString(allocator, "hello"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, hello);
+    _ = try chunk.emit(allocator, .len_value);
+    _ = try chunk.emit(allocator, .print); // 5
+
+    const empty = try chunk.addConstant(allocator, try Value.newString(allocator, ""));
+    _ = try chunk.emitWithOperand(allocator, .push_const, empty);
+    _ = try chunk.emit(allocator, .len_value);
+    _ = try chunk.emit(allocator, .print); // 0
     _ = try chunk.emit(allocator, .halt);
 
     var buf: [64]u8 = undefined;
     const len = try runSource(&chunk, &buf);
-    try std.testing.expectEqualStrings("3\n1\n", buf[0..len]);
+    try std.testing.expectEqualStrings("3\n1\n5\n0\n", buf[0..len]);
 }
 
 test "len_value on a plain scalar is TypeMismatch" {

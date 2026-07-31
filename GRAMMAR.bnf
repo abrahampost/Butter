@@ -38,7 +38,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'len' | 'read' | 'write' | 'open' | 'close'
                | 'stdin' | 'stdout' | 'stderr' | 'append'
                | 'map' | 'list' | 'push' | 'keys' | 'has' | 'delete'
-               | 'json' | 'stringify' | 'null' | 'args'
+               | 'json' | 'stringify' | 'null' | 'args' | 'exit'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -107,12 +107,15 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <statement>         ::= <print-stmt>
                       | <close-stmt>
+                      | <exit-stmt>
                       | <return-stmt>
                       | <expr-stmt>
 
 <print-stmt>        ::= 'print' <expression> <end>
 
 <close-stmt>        ::= 'close' <expression> <end>
+
+<exit-stmt>         ::= 'exit' <expression> <end>
 
 (* Legal anywhere a <statement> is, but a semantic error outside a function
    body. *)
@@ -349,6 +352,22 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    - Every `args` occurrence builds its own independent list — mutating one
      (`push`, index-assignment) never affects another read elsewhere in the
      same program, unlike aliasing a `list`/`map` local via `b := a`. *)
+
+(* --- Process exit code ---
+   - `exit <expression>` halts the entire program immediately, from
+     anywhere — the top level, mid-loop, mid-expression-statement, or
+     several function calls deep — and hands `expression`'s value to the
+     embedder as the process's own exit code (ISA.bnf's EXIT). Unlike
+     `return`, which only unwinds the current function, `exit` unwinds
+     everything at once; code after it, at any level, never runs.
+   - `expression` must evaluate to an INT in 0..255 (the range
+     `std.process.exit` itself accepts) — anything else is
+     `RuntimeError.TypeMismatch` (not an INT) or
+     `RuntimeError.InvalidExitCode` (out of range), never silently
+     truncated or wrapped.
+   - A program that never calls `exit` still exits 0 when it falls off the
+     end (the existing HALT behavior) — `exit 0` right before the last
+     statement changes nothing observable. *)
 
 (* --- The for-loop ---
    - Range-based only (`for v in start..end body`) — no C-style

@@ -320,6 +320,7 @@ pub const Parser = struct {
         if (self.check(.kw_print)) return self.printStatement();
         if (self.check(.kw_return)) return self.returnStatement();
         if (self.check(.kw_close)) return self.closeStatement();
+        if (self.check(.kw_exit)) return self.exitStatement();
         return self.exprStatement();
     }
 
@@ -340,6 +341,17 @@ pub const Parser = struct {
         const stream = try self.expression();
         try self.consumeEnd();
         return ast.Stmt{ .close_stmt = stream };
+    }
+
+    /// <exit-stmt> ::= 'exit' <expression> <end>
+    ///
+    /// A statement, not an expression, for the same reason `close` is —
+    /// nothing after it can ever run, so there is no result to hand back to.
+    fn exitStatement(self: *Parser) Error!ast.Stmt {
+        _ = self.advance(); // 'exit'
+        const code = try self.expression();
+        try self.consumeEnd();
+        return ast.Stmt{ .exit_stmt = code };
     }
 
     /// <return-stmt> ::= 'return' <expression> <end>
@@ -1408,6 +1420,26 @@ test "parses close as a statement" {
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
     try std.testing.expectEqualStrings("f", result.program[0].close_stmt.variable);
+}
+
+test "parses exit as a statement" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "exit 1\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.program.len);
+    try std.testing.expectEqual(@as(i64, 1), result.program[0].exit_stmt.literal.int);
+}
+
+test "exit takes an arbitrary expression, not just a literal" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "exit code + 1\n");
+    defer result.parser.deinit();
+
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try ast.printProgram(&writer, result.program);
+    try std.testing.expectEqualStrings("(exit (+ code 1))\n", writer.buffered());
 }
 
 test "parses an import declaration" {

@@ -107,6 +107,12 @@ pub const OpCode = enum(u8) {
     json_parse,
     json_stringify,
 
+    // `exit <expr>` (ISA.bnf's addendum to section 3). No operand: the
+    // requested code is an ordinary popped `Value`, exactly like every
+    // other opcode that acts on an expression result rather than a
+    // compile-time constant.
+    exit,
+
     halt,
 };
 

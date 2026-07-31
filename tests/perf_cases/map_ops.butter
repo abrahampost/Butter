@@ -1,0 +1,11 @@
+map m := {}
+for i in 0..8000 {
+    m[stringify(i)] := i
+}
+int found := 0
+for i in 0..8000 {
+    if has(m, stringify(i)) {
+        found := found + 1
+    }
+}
+print found

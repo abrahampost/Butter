@@ -1,0 +1,5 @@
+string s := ""
+for i in 0..3000 {
+    s := s + "x"
+}
+print len(s)

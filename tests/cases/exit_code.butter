@@ -1,0 +1,18 @@
+list argv := args
+list haystack := ["ant", "bee", "cat", "dog"]
+
+if len(argv) == 0 {
+    print "usage: exit_code <needle>"
+    exit 2
+}
+
+string needle := argv[0]
+for i in 0..len(haystack) {
+    if haystack[i] == needle {
+        print "found: " + haystack[i]
+        exit 0
+    }
+}
+
+print "not found: " + needle
+exit 1

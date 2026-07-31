@@ -1,0 +1,16 @@
+int[600] arr
+int n := len(arr)
+for i in 0..n {
+    arr[i] := n - i
+}
+for i in 0..n {
+    for j in 0..(n - i - 1) {
+        if arr[j] > arr[j + 1] {
+            int temp := arr[j]
+            arr[j] := arr[j + 1]
+            arr[j + 1] := temp
+        }
+    }
+}
+print arr[0]
+print arr[n - 1]
