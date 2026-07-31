@@ -42,6 +42,16 @@ pub const SemanticError = error{
     EscapingArrayReference,
     WrongStreamDirection,
     CannotCloseStandardStream,
+    /// A statically-known expression type doesn't fit where it's used —
+    /// a var-decl/array-literal-element initializer, an assignment, a call
+    /// argument, a return value, a binary/unary/logical operator's operand,
+    /// an if/while condition (must be `bool`), a for-loop bound (must be
+    /// `int`), or an `exit` code (must be `int`) — design note 3t. Only
+    /// raised when `inferType` can actually pin down the expression's type;
+    /// anything it can't (a map/list element, `json`'s parsed root, ...)
+    /// is left to the existing runtime `RuntimeError.TypeMismatch` checks,
+    /// same as before this feature existed.
+    TypeMismatch,
 };
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
@@ -83,6 +93,13 @@ const Local = struct {
     /// sliceable (INDEX_GET/INDEX_SLICE) but, unlike a map/list, never
     /// assignable through a bracket (no INDEX_SET case for it).
     is_string: bool = false,
+    /// This local's declared `<type>` — for an array-typed local, its
+    /// scalar ELEMENT type (design note 3e: an array's element is always a
+    /// plain scalar), not "array of N". Used by the static type checker
+    /// (design note 3t) to type-check a bare-variable read/write and, for
+    /// a bare-array-name index, the element type `compileIndex`'s
+    /// LOAD_INDEX/LOAD_INDEX_REF path produces.
+    value_type: ast.ValueType,
 };
 
 const CollectionKind = enum { map, list };
@@ -133,6 +150,12 @@ const FunctionInfo = struct {
     name: []const u8,
     params: []const ast.Param,
     return_array_size: ?ast.ArraySpec,
+    /// The declared return type — for an array-returning function, its
+    /// scalar ELEMENT type (same convention as `Local.value_type`). Used by
+    /// the static type checker (design note 3t) to type a `.call` expression
+    /// and to check an array-returning call's element type against a
+    /// declared array local's.
+    return_type: ast.ValueType,
     arity: u32,
     index: u32,
     module: usize,
@@ -194,6 +217,11 @@ pub const Compiler = struct {
     /// this to decide whether a `return` needs `compileArrayReturn` instead
     /// of a plain `compileExpr`.
     current_return_array_size: ?ast.ArraySpec = null,
+    /// Set for the duration of `compileFunctionBody` to the function
+    /// currently being compiled's declared return type (its scalar element
+    /// type when `current_return_array_size` isn't null) — a scalar
+    /// `return`'s static type check (design note 3t) is against this.
+    current_return_type: ast.ValueType = .int,
     /// The line number of the statement currently being compiled, used by
     /// `fail()` to stamp error diagnostics with accurate source locations.
     current_line: usize = 0,
@@ -255,6 +283,7 @@ pub const Compiler = struct {
                     .name = f.name,
                     .params = f.params,
                     .return_array_size = f.return_array_size,
+                    .return_type = f.return_type,
                     .arity = totalParamWidth(f.params),
                     .index = @intCast(self.functions.items.len),
                     .module = mi,
@@ -325,6 +354,7 @@ pub const Compiler = struct {
         self.next_slot = 0;
         self.in_function = true;
         self.current_return_array_size = f.return_array_size;
+        self.current_return_type = f.return_type;
         defer self.in_function = false;
         defer self.current_return_array_size = null;
 
@@ -336,6 +366,7 @@ pub const Compiler = struct {
                 .array = p.array_size,
                 .collection = collectionKind(p.type),
                 .is_string = p.type == .string,
+                .value_type = p.type,
             });
             self.next_slot += arraySpecWidth(p.array_size);
         }
@@ -385,6 +416,221 @@ pub const Compiler = struct {
         return err;
     }
 
+    // ---- Static type checking (design note 3t) ---------------------------
+    //
+    // Butter has no runtime concept of a local's "declared type" — a local
+    // is just a raw stack slot, and every fallible shape mismatch (wrong
+    // operand to `+`, a non-bool `if` condition, ...) has always been a
+    // `RuntimeError.TypeMismatch` the VM raises on the ACTUAL value it sees
+    // (ISA.bnf, "checked, not trusted"). What follows adds a purely
+    // compile-time, best-effort layer on top: wherever an expression's type
+    // can be pinned down from what's already known at compile time (a
+    // local's/parameter's/return's declared `<type>`, a literal, an
+    // operator's own semantics), a mismatch against a declared type is now
+    // `SemanticError.TypeMismatch` instead of waiting for the VM to notice.
+    // It deliberately does NOT reach into a map/list's element type or
+    // `json`'s parsed root — those stay fully dynamic, exactly as before.
+
+    /// A statically-known type, when one is determinable at compile time.
+    /// `.stream` doesn't correspond to any `<type>` keyword — Butter has no
+    /// syntax to declare a stream-typed local — but the established
+    /// convention throughout this codebase (examples/files.butter,
+    /// examples/json.butter) is to declare a variable holding an `open()`
+    /// result as `int`; `typeCompatible` honors that rather than breaking
+    /// every existing file-I/O example. `.null_type` is `null`'s own literal
+    /// type: it never satisfies any declared `<type>`, since there is no
+    /// nullable variant of any of the six.
+    const StaticType = union(enum) {
+        scalar: ast.ValueType,
+        stream,
+        null_type,
+    };
+
+    fn isNumericType(t: StaticType) bool {
+        return switch (t) {
+            .scalar => |v| v == .int or v == .float,
+            .stream, .null_type => false,
+        };
+    }
+
+    fn isScalarType(t: StaticType, v: ast.ValueType) bool {
+        return switch (t) {
+            .scalar => |s| s == v,
+            .stream, .null_type => false,
+        };
+    }
+
+    /// Whether a value of static type `actual` may be used where `expected`
+    /// (a declared `<type>`) is required: an exact scalar match, `int`
+    /// widening to `float` (matching the VM's existing runtime int->float
+    /// promotion in add/sub/mul/div/mod/pow — ISA.bnf), or a stream
+    /// satisfying `int` (the codebase's existing convention for holding an
+    /// `open()` result — see `StaticType`). Note that widening is a
+    /// compile-time ACCEPTANCE only, not a runtime conversion: `float x :=
+    /// 5` still stores a raw `Value.int` in `x`'s slot, same as it always
+    /// has — arithmetic already promotes int/float dynamically regardless
+    /// of what a local was declared as, so this changes nothing observable.
+    fn typeCompatible(expected: ast.ValueType, actual: StaticType) bool {
+        return switch (actual) {
+            .scalar => |v| v == expected or (expected == .float and v == .int),
+            .stream => expected == .int,
+            .null_type => false,
+        };
+    }
+
+    fn promoteNumeric(l: StaticType, r: StaticType) ast.ValueType {
+        if (isScalarType(l, .int) and isScalarType(r, .int)) return .int;
+        return .float;
+    }
+
+    /// Fails with `SemanticError.TypeMismatch` if `expr`'s statically-
+    /// inferred type can't be used where `expected` (a declared `<type>`)
+    /// is required (see `typeCompatible`). A `null` inference — the
+    /// expression's type genuinely depends on a runtime value this compiler
+    /// doesn't track, e.g. a map/list element or `json`'s parsed root — is
+    /// silently allowed here; the existing runtime checks remain the only
+    /// guard for those, same as before this feature existed.
+    fn checkExpectedType(self: *Compiler, expr: *const ast.Expr, expected: ast.ValueType, name: []const u8, message: []const u8) CompileError!void {
+        if (try self.inferType(expr)) |actual| {
+            if (!typeCompatible(expected, actual)) return self.fail(SemanticError.TypeMismatch, name, message);
+        }
+    }
+
+    /// Statically infers `expr`'s type where possible. Called both from the
+    /// specific "declared type" checkpoints (`checkExpectedType`'s callers:
+    /// a var-decl/array-literal-element initializer, an assignment, a call
+    /// argument, a return, an if/while condition, a for-loop bound, an exit
+    /// code) AND from `compileExpr`'s `.binary`/`.unary` arms on every such
+    /// node as it's compiled — which is what makes operator-operand
+    /// checking blanket-cover the whole program (a bad `+` buried inside a
+    /// `push(...)`/`read(...)`/anything-else argument is still visited by
+    /// ordinary codegen, which recurses into every expression node exactly
+    /// once) without this function needing to eagerly recurse into every
+    /// child of every non-operator expression itself.
+    fn inferType(self: *Compiler, expr: *const ast.Expr) CompileError!?StaticType {
+        return switch (expr.*) {
+            .literal => |lit| switch (lit) {
+                .int => StaticType{ .scalar = .int },
+                .float => StaticType{ .scalar = .float },
+                .string => StaticType{ .scalar = .string },
+                .boolean => StaticType{ .scalar = .bool },
+                .null_value => StaticType.null_type,
+            },
+            .variable => |name| blk: {
+                const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
+                if (local.array != null) return self.fail(SemanticError.ArrayUsedAsScalar, name, "an array must be indexed, not used as a plain value");
+                break :blk StaticType{ .scalar = local.value_type };
+            },
+            .unary => |u| blk: {
+                const rt = try self.inferType(u.right) orelse break :blk null;
+                switch (u.op) {
+                    .negate => {
+                        if (!isNumericType(rt)) return self.fail(SemanticError.TypeMismatch, "-", "'-' requires a numeric (int or float) operand");
+                        break :blk rt;
+                    },
+                    .not => {
+                        if (!isScalarType(rt, .bool)) return self.fail(SemanticError.TypeMismatch, "!", "'!' requires a bool operand");
+                        break :blk StaticType{ .scalar = .bool };
+                    },
+                }
+            },
+            .binary => |b| try self.inferBinaryType(b),
+            .grouping => |inner| try self.inferType(inner),
+            .assign => |a| try self.inferType(a.value),
+            .call => |c| blk: {
+                const info = self.findFunction(c.name) orelse break :blk null; // real error raised when this call is actually compiled
+                if (info.return_array_size != null) break :blk null; // likewise ArrayUsedAsScalar, raised there
+                break :blk StaticType{ .scalar = info.return_type };
+            },
+            .array_literal => StaticType{ .scalar = .list },
+            .map_literal => StaticType{ .scalar = .map },
+            .index => |ix| try self.inferIndexType(ix),
+            .index_assign => |ia| try self.inferType(ia.value),
+            .slice => StaticType{ .scalar = .string },
+            .len_of => StaticType{ .scalar = .int },
+            .stream_literal => StaticType.stream,
+            .args_literal => StaticType{ .scalar = .list },
+            .read_bytes => StaticType{ .scalar = .int },
+            .write_value => StaticType{ .scalar = .int },
+            .write_bytes => StaticType{ .scalar = .int },
+            .open_file => StaticType.stream,
+            .list_push => StaticType{ .scalar = .int },
+            .map_has => StaticType{ .scalar = .bool },
+            .map_delete => StaticType{ .scalar = .bool },
+            .map_keys => StaticType{ .scalar = .list },
+            .json_parse => null, // the parsed root can be any JSON shape
+            .json_stringify => StaticType{ .scalar = .string },
+            .int_parse => StaticType{ .scalar = .int },
+            .float_parse => StaticType{ .scalar = .float },
+        };
+    }
+
+    /// `<base>[index]`'s static type: a bare array-local name types to the
+    /// array's own scalar element type (design note 3e); a bare string-local
+    /// name (or, recursively, any other expression whose own type is
+    /// `string`) types to `string`, matching `s[i]`'s "always a fresh
+    /// length-1 STRING" rule (Strings design notes); a map/list index is
+    /// genuinely dynamic (`null`, unknown).
+    fn inferIndexType(self: *Compiler, ix: ast.Expr.Index) CompileError!?StaticType {
+        if (ix.base.* == .variable) {
+            const local = self.resolveLocal(ix.base.variable) orelse return null; // real error raised when this is actually compiled
+            if (local.array != null) return StaticType{ .scalar = local.value_type };
+            if (local.is_string) return StaticType{ .scalar = .string };
+            return null; // a map/list element is dynamically typed
+        }
+        if (try self.inferType(ix.base)) |bt| {
+            if (isScalarType(bt, .string)) return StaticType{ .scalar = .string };
+        }
+        return null;
+    }
+
+    /// `+`/`-`/`*`/`/`/`%`/`**`/`<`/`<=`/`>`/`>=`/`==`/`!=`/`and`/`or`'s
+    /// static type and operand validation, mirroring the VM's own runtime
+    /// rules (`add`/`compare` in vm.zig): `+` and the four ordering
+    /// comparisons accept two numbers OR two strings; every other
+    /// arithmetic operator requires two numbers; `and`/`or` require two
+    /// bools; `==`/`!=` are deliberately left unchecked here (they're valid,
+    /// and simply `false`, across any two types at runtime — vm.zig's
+    /// `Value.eql` — so there's nothing to reject). A `null` operand
+    /// inference (genuinely dynamic) skips validation for that operand
+    /// rather than failing, same as `checkExpectedType`.
+    fn inferBinaryType(self: *Compiler, b: ast.Expr.Binary) CompileError!?StaticType {
+        if (b.op == .logic_and or b.op == .logic_or) {
+            const op_name = ast.binaryOpLexeme(b.op);
+            if (try self.inferType(b.left)) |l| if (!isScalarType(l, .bool)) return self.fail(SemanticError.TypeMismatch, op_name, "'and'/'or' requires bool operands");
+            if (try self.inferType(b.right)) |r| if (!isScalarType(r, .bool)) return self.fail(SemanticError.TypeMismatch, op_name, "'and'/'or' requires bool operands");
+            return StaticType{ .scalar = .bool };
+        }
+        const lt = try self.inferType(b.left);
+        const rt = try self.inferType(b.right);
+        const op_name = ast.binaryOpLexeme(b.op);
+        switch (b.op) {
+            .add => {
+                const l = lt orelse return null;
+                const r = rt orelse return null;
+                if (isNumericType(l) and isNumericType(r)) return StaticType{ .scalar = promoteNumeric(l, r) };
+                if (isScalarType(l, .string) and isScalarType(r, .string)) return StaticType{ .scalar = .string };
+                return self.fail(SemanticError.TypeMismatch, op_name, "'+' requires two numbers or two strings");
+            },
+            .sub, .mul, .div, .mod, .pow => {
+                const l = lt orelse return null;
+                const r = rt orelse return null;
+                if (!isNumericType(l) or !isNumericType(r)) return self.fail(SemanticError.TypeMismatch, op_name, "arithmetic operators require two numbers");
+                return StaticType{ .scalar = promoteNumeric(l, r) };
+            },
+            .lt, .lte, .gt, .gte => {
+                if (lt) |l| if (rt) |r| {
+                    const both_numeric = isNumericType(l) and isNumericType(r);
+                    const both_string = isScalarType(l, .string) and isScalarType(r, .string);
+                    if (!both_numeric and !both_string) return self.fail(SemanticError.TypeMismatch, op_name, "comparison requires two numbers or two strings");
+                };
+                return StaticType{ .scalar = .bool };
+            },
+            .eq, .neq => return StaticType{ .scalar = .bool },
+            .logic_and, .logic_or => unreachable, // handled above
+        }
+    }
+
     fn compileStmt(self: *Compiler, stmt: *const ast.Stmt) CompileError!void {
         self.current_line = stmt.line;
         switch (stmt.kind) {
@@ -408,6 +654,7 @@ pub const Compiler = struct {
                         .generic => try self.compileGenericArrayReturn(e),
                     }
                 } else {
+                    try self.checkExpectedType(e, self.current_return_type, "return", "returned value's type does not match the function's declared return type");
                     try self.compileExpr(e);
                 }
                 _ = try self.chunk.emit(self.allocator, .ret);
@@ -417,6 +664,7 @@ pub const Compiler = struct {
             .import_stmt => unreachable, // top-level only; compileModules never calls compileStmt on this
             .close_stmt => |e| try self.compileCloseStmt(e),
             .exit_stmt => |e| {
+                try self.checkExpectedType(e, .int, "exit", "exit code must be an int");
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .exit);
             },
@@ -451,12 +699,13 @@ pub const Compiler = struct {
             // can't route through `defaultValue`+PUSH_CONST since it isn't a
             // compile-time constant.
             if (d.initializer) |init_expr| {
+                try self.checkExpectedType(init_expr, d.type, d.name, "initializer's type does not match the declared type");
                 try self.compileExpr(init_expr);
             } else switch (kind) {
                 .map => _ = try self.chunk.emitWithOperand(self.allocator, .make_map, 0),
                 .list => _ = try self.chunk.emitWithOperand(self.allocator, .make_list, 0),
             }
-            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .collection = kind });
+            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .collection = kind, .value_type = d.type });
             self.next_slot += 1;
             return;
         }
@@ -467,7 +716,10 @@ pub const Compiler = struct {
                         if (elems.len != len) {
                             return self.fail(SemanticError.ArrayLengthMismatch, d.name, "array literal length does not match the declared size");
                         }
-                        for (elems) |elem| try self.compileExpr(elem);
+                        for (elems) |elem| {
+                            try self.checkExpectedType(elem, d.type, d.name, "array literal element's type does not match the array's declared element type");
+                            try self.compileExpr(elem);
+                        }
                     },
                     .call => |c| {
                         const info = try self.compileCallCommon(c);
@@ -477,6 +729,7 @@ pub const Compiler = struct {
                             .generic => return self.fail(SemanticError.InvalidArrayInitializer, d.name, "a local array declaration needs a fixed size, but this function call returns a generic (unsized) array"),
                         };
                         if (ret_len != len) return self.fail(SemanticError.ArrayLengthMismatch, d.name, "the called function's returned array length does not match the declared size");
+                        if (!typeCompatible(d.type, StaticType{ .scalar = info.return_type })) return self.fail(SemanticError.TypeMismatch, d.name, "the called function's returned array's element type does not match the declared element type");
                     },
                     else => return self.fail(SemanticError.InvalidArrayInitializer, d.name, "an array declaration's initializer must be an array literal or a call to an array-returning function"),
                 }
@@ -485,16 +738,17 @@ pub const Compiler = struct {
                 var i: u32 = 0;
                 while (i < len) : (i += 1) _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             }
-            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .array = .{ .fixed = len } });
+            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .array = .{ .fixed = len }, .value_type = d.type });
             self.next_slot += len;
         } else {
             if (d.initializer) |init_expr| {
+                try self.checkExpectedType(init_expr, d.type, d.name, "initializer's type does not match the declared type");
                 try self.compileExpr(init_expr);
             } else {
                 const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, d.type));
                 _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             }
-            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .is_string = d.type == .string });
+            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .is_string = d.type == .string, .value_type = d.type });
             self.next_slot += 1;
         }
     }
@@ -525,6 +779,7 @@ pub const Compiler = struct {
     /// with a placeholder target, keep compiling, then patch the target
     /// once it's known.
     fn compileIf(self: *Compiler, i: ast.StmtKind.If) CompileError!void {
+        try self.checkExpectedType(i.condition, .bool, "if", "condition must be a bool");
         try self.compileExpr(i.condition);
         const then_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false, 0);
         _ = try self.chunk.emit(self.allocator, .pop);
@@ -540,6 +795,7 @@ pub const Compiler = struct {
 
     fn compileWhile(self: *Compiler, w: ast.StmtKind.While) CompileError!void {
         const loop_start = self.chunk.code.items.len;
+        try self.checkExpectedType(w.condition, .bool, "while", "condition must be a bool");
         try self.compileExpr(w.condition);
         const exit_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false, 0);
         _ = try self.chunk.emit(self.allocator, .pop);
@@ -562,14 +818,16 @@ pub const Compiler = struct {
     fn compileFor(self: *Compiler, f: ast.StmtKind.For) CompileError!void {
         self.scope_depth += 1;
 
+        try self.checkExpectedType(f.end, .int, f.var_name, "for-loop end must be an int");
         try self.compileExpr(f.end);
         const end_slot = self.next_slot;
-        try self.locals.append(self.allocator, .{ .name = "", .depth = self.scope_depth, .slot = end_slot });
+        try self.locals.append(self.allocator, .{ .name = "", .depth = self.scope_depth, .slot = end_slot, .value_type = .int });
         self.next_slot += 1;
 
+        try self.checkExpectedType(f.start, .int, f.var_name, "for-loop start must be an int");
         try self.compileExpr(f.start);
         const var_slot = self.next_slot;
-        try self.locals.append(self.allocator, .{ .name = f.var_name, .depth = self.scope_depth, .slot = var_slot });
+        try self.locals.append(self.allocator, .{ .name = f.var_name, .depth = self.scope_depth, .slot = var_slot, .value_type = .int });
         self.next_slot += 1;
 
         const loop_start = self.chunk.code.items.len;
@@ -601,15 +859,24 @@ pub const Compiler = struct {
             .literal => |lit| try self.compileLiteral(lit),
             .variable => |name| _ = try self.emitLocalOp(name, .load_local),
             .unary => |u| {
+                _ = try self.inferType(expr);
                 try self.compileExpr(u.right);
                 _ = try self.chunk.emit(self.allocator, switch (u.op) {
                     .negate => .neg,
                     .not => .not,
                 });
             },
-            .binary => |b| try self.compileBinary(b),
+            .binary => |b| {
+                _ = try self.inferType(expr);
+                try self.compileBinary(b);
+            },
             .grouping => |inner| try self.compileExpr(inner),
             .assign => |a| {
+                if (self.resolveLocal(a.name)) |local| {
+                    if (local.array == null) {
+                        try self.checkExpectedType(a.value, local.value_type, a.name, "assigned value's type does not match the variable's declared type");
+                    }
+                }
                 try self.compileExpr(a.value);
                 _ = try self.emitLocalOp(a.name, .store_local);
             },
@@ -724,6 +991,7 @@ pub const Compiler = struct {
                     .generic => try self.compileGenericArrayArgument(arg),
                 }
             } else {
+                try self.checkExpectedType(arg, param.type, c.name, "argument's type does not match the parameter's declared type");
                 try self.compileExpr(arg);
             }
         }
@@ -2940,4 +3208,140 @@ test "int(x) on an already-int value is TypeMismatch (no implicit identity cast)
         \\int x := 5
         \\print int(x)
     , &buf));
+}
+
+// ---- Static type checking (GRAMMAR.bnf design note 3t) -------------------
+
+test "a var-decl initializer's type must match the declared type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int a := \"apples\"\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "bool b := \"true\"\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "string s := 5\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "int a := null\n", SemanticError.TypeMismatch);
+}
+
+test "int widens to float, but float never narrows to int" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    // Widening is a compile-time acceptance only: the slot still holds a
+    // raw int value (nothing here emits a conversion), so it prints "5",
+    // not "5.0" — see `typeCompatible`'s doc comment.
+    const output = try runProgram(allocator, "float x := 5\nprint x\n", &buf);
+    try std.testing.expectEqualStrings("5\n", output);
+
+    try expectCompileError(allocator, "int a := 3.0\n", SemanticError.TypeMismatch);
+}
+
+test "map/list are checked exactly against each other, no cross-widening" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "map m := [1, 2]\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "list l := {\"a\": 1}\n", SemanticError.TypeMismatch);
+}
+
+test "a fixed-array literal's elements are checked against the declared element type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int[2] a := [1, \"x\"]\n", SemanticError.TypeMismatch);
+}
+
+test "a fixed-array initializer from a call is checked against the returned array's element type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\func giveFloats() -> float[2] {
+        \\    float[2] r := [1.0, 2.0]
+        \\    return r
+        \\}
+        \\int[2] a := giveFloats()
+    , SemanticError.TypeMismatch);
+}
+
+test "an assignment's value type must match the variable's declared type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int x := 1\nx := \"nope\"\n", SemanticError.TypeMismatch);
+}
+
+test "a call argument's type must match the parameter's declared type, but int still widens to float" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\func needsInt(int x) -> int {
+        \\    return x
+        \\}
+        \\print needsInt("nope")
+    , SemanticError.TypeMismatch);
+
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func needsFloat(float x) -> float {
+        \\    return x
+        \\}
+        \\print needsFloat(5)
+    , &buf);
+    try std.testing.expectEqualStrings("5\n", output);
+}
+
+test "a return value's type must match the function's declared return type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\func f() -> int {
+        \\    return "x"
+        \\}
+        \\print f()
+    , SemanticError.TypeMismatch);
+}
+
+test "if/while conditions must be bool" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "if 1 {\n  print 1\n}\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "while 1 {\n  print 1\n}\n", SemanticError.TypeMismatch);
+}
+
+test "for-loop bounds must be int" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "for i in \"a\"..\"b\" {\n  print i\n}\n", SemanticError.TypeMismatch);
+}
+
+test "exit's code must be int" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "exit \"x\"\n", SemanticError.TypeMismatch);
+}
+
+test "binary operators reject mismatched operand types" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "print 1 + true\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "print \"a\" - \"b\"\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "print \"a\" < 5\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "print 1 and true\n", SemanticError.TypeMismatch);
+}
+
+test "unary operators reject mismatched operand types" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "print -true\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "print !5\n", SemanticError.TypeMismatch);
+}
+
+test "an operator type error is caught even nested inside another expression form's argument" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "list l := []\npush(l, 1 + \"x\")\n", SemanticError.TypeMismatch);
+}
+
+test "indexing a map/list leaves the destination's declared type unchecked (genuinely dynamic)" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator, "map m := {\"k\": 5}\nint x := m[\"k\"]\nprint x\n", &buf);
+    try std.testing.expectEqualStrings("5\n", output);
+}
+
+test "open()'s stream result satisfies an int-declared local (the existing file-I/O convention)" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init("int f := open(\"x\", read)\nclose f\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileProgram(program);
+    defer compiled.deinit(allocator);
 }

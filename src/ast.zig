@@ -542,7 +542,9 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
     }
 }
 
-fn binaryOpLexeme(op: BinaryOp) []const u8 {
+/// Also used by compiler.zig's static type checker to name an operator in a
+/// `SemanticError.TypeMismatch` diagnostic.
+pub fn binaryOpLexeme(op: BinaryOp) []const u8 {
     return switch (op) {
         .add => "+",
         .sub => "-",

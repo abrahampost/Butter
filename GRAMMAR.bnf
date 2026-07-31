@@ -247,8 +247,9 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      'void'. Falling off the end without `return` yields the declared
      type's zero value; there is no "did every path return?" check.
    - A call's argument COUNT must match the callee's parameter count
-     exactly; argument types are not checked (no static type checking
-     anywhere in this language). *)
+     exactly, and (design note 3t) each argument's type must be usable
+     where the matching parameter's declared type is expected; a return
+     value is checked against the declared return type the same way. *)
 
 (* --- Arrays ---
    - Fixed size only, no nesting: an array's size is a compile-time INT
@@ -483,4 +484,50 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      entry program. Function names are unique across the whole compiled
      program, not just within one file. A dependency shared by more than
      one importer is compiled exactly once. *)
+
+(* --- Static type checking (design note 3t) ---
+   - Every `<type>`-checkable position in the language now has its
+     statically-known expression type (where one exists) checked at
+     compile time against what's expected there, `SemanticError.TypeMismatch`
+     otherwise: a var-declaration's initializer (and, for a fixed-size
+     array declaration, each array-literal element, or an initializing
+     call's returned array's element type); an assignment's value; a call
+     argument against its parameter; a `return` against the function's
+     declared return type; an `if`/`while` condition (must be `bool`); a
+     for-loop's `start`/`end` (must be `int`); an `exit` code (must be
+     `int`); and every binary/unary/logical operator's operand(s), mirroring
+     the VM's own runtime rules for that operator (`+` and the four
+     ordering comparisons accept two numbers OR two strings; every other
+     arithmetic operator and the two ordering-adjacent unary/logical forms
+     require exactly what the runtime already required — see the
+     Strings/Numeric-parsing notes above and ISA.bnf's ADD/CMP_*). `==`/`!=`
+     are deliberately NOT checked — they're valid, and simply `false`,
+     across any two types at runtime (`Value.eql`), so there's nothing to
+     reject.
+   - `int` widens to `float` wherever a `float` is expected (matching the
+     VM's existing runtime int/float promotion in `+`/`-`/`*`/`/`/`%`/`**`);
+     this is a compile-time ACCEPTANCE only, not an inserted runtime
+     conversion — `float x := 5` still stores a raw INT value in `x`'s slot,
+     exactly as it always has. `float` never narrows to `int` implicitly;
+     that still requires the explicit `int(x)` truncating cast (design note
+     3r). Every other pairing (`bool`, `string`, `map`, `list` against
+     anything but their own exact type) is rejected outright — no
+     coercions among those.
+   - A stream (`stdin`/`stdout`/`stderr`, or an `open(...)` result) has no
+     `<type>` keyword of its own — there's no syntax to declare a
+     stream-typed local — so, to avoid breaking the established convention
+     throughout this codebase and its examples of declaring a variable that
+     holds one as `int` (examples/files.butter, examples/json.butter), a
+     stream is accepted specifically where `int` is expected, and nowhere
+     else.
+   - `null` satisfies no declared `<type>` — there is no nullable variant of
+     any of the six, so `int a := null` (and the same for every other type)
+     is a `TypeMismatch`, not a special case.
+   - This checking is best-effort, not exhaustive: whenever an expression's
+     type genuinely depends on a runtime value this compiler doesn't
+     track — a map/list element (`m["k"]`, `xs[i]`), `json(...)`'s parsed
+     root, or a call to an unresolved/not-yet-checked function — it's left
+     unchecked here, and the existing runtime `RuntimeError.TypeMismatch`
+     checks remain the only guard for those, exactly as before this feature
+     existed. *)
    ========================================================================== *)
