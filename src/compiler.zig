@@ -52,6 +52,10 @@ pub const SemanticError = error{
     /// is left to the existing runtime `RuntimeError.TypeMismatch` checks,
     /// same as before this feature existed.
     TypeMismatch,
+    /// A statement the parser accepts but this compiler doesn't lower yet.
+    /// Temporary: `try`/`catch` is the only one, and step 5 of
+    /// DESIGN-error-recovery.md's plan removes both it and this variant.
+    UnsupportedStatement,
 };
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
@@ -687,6 +691,12 @@ pub const Compiler = struct {
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .exit);
             },
+            // Parsed (ast.Stmt.Try) but not yet compiled — step 5 of
+            // DESIGN-error-recovery.md's plan replaces this arm with the
+            // PUSH_HANDLER/POP_HANDLER codegen the VM already implements,
+            // and deletes `UnsupportedStatement` with it. Until then a
+            // `try` is a clean compile error rather than an `unreachable`.
+            .try_stmt => return self.fail(SemanticError.UnsupportedStatement, "try", "try/catch is not implemented yet"),
         }
     }
 

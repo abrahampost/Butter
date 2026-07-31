@@ -51,6 +51,17 @@ pub const OpCode = enum(u8) {
     jump,
     jump_if_false,
 
+    // Error handling (ISA.bnf section 14). PUSH_HANDLER's operand is the
+    // offset of the catch block's first instruction in the CURRENT chunk;
+    // everything else needed to resume there (the value-stack depth, base
+    // pointer, frame count and return width) is recorded from the live
+    // machine state instead, since none of it is known at compile time —
+    // the same instruction can be reached with any number of frames under
+    // it. POP_HANDLER takes no operand: discarding the innermost handler is
+    // all "the guarded block finished without failing" has to mean.
+    push_handler,
+    pop_handler,
+
     call,
     ret,
 
@@ -201,7 +212,7 @@ pub const Chunk = struct {
                     const idx = unpackIndexOperand(instr.operand);
                     try writer.print(" slot={d} len={d}\n", .{ idx.slot, idx.length });
                 },
-                .jump, .jump_if_false => try writer.print(" -> {d}\n", .{instr.operand}),
+                .jump, .jump_if_false, .push_handler => try writer.print(" -> {d}\n", .{instr.operand}),
                 .call, .make_list, .make_map => try writer.print(" #{d}\n", .{instr.operand}),
                 .open => {
                     const mode: value_mod.OpenMode = @enumFromInt(instr.operand);

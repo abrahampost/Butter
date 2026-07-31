@@ -185,6 +185,7 @@ pub const Parser = struct {
             .kw_if => self.ifStatement(),
             .kw_while => self.whileStatement(),
             .kw_for => self.forStatement(),
+            .kw_try => self.tryStatement(),
             else => self.statement(),
         };
     }
@@ -354,6 +355,40 @@ pub const Parser = struct {
         const end = try self.expression();
         const body = try self.createStmt(try self.declaration());
         return ast.Stmt{ .kind = .{ .for_stmt = .{ .var_name = name_tok.lexeme, .start = start, .end = end, .body = body } }, .line = line };
+    }
+
+    /// <try-stmt> ::= 'try' <block> { NEWLINE } 'catch' IDENTIFIER <block>
+    ///
+    /// Braces are mandatory on both halves — unlike `if`/`while`/`for`,
+    /// neither takes a bare `<declaration>` — because both are load-bearing
+    /// scopes (the catch block's is what the error binding lives in) and
+    /// because a braceless try body reads ambiguously next to the `catch`
+    /// that has to follow it. Both are checked for explicitly rather than
+    /// left to `block`'s generic "expected '{'", since "you wrote `try`
+    /// without braces" is the mistake worth naming.
+    ///
+    /// A NEWLINE between the two halves is allowed, matching how
+    /// `ifStatement` lets `else` start its own line. The binding is
+    /// mandatory: a program that doesn't want it writes `catch _ { ... }`.
+    fn tryStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
+        _ = self.advance(); // 'try'
+
+        if (!self.check(.lbrace)) return self.fail("expected '{' after 'try' — a try block always takes braces");
+        const body = try self.block();
+
+        self.skipNewlines();
+        _ = try self.expect(.kw_catch, "expected 'catch' after the try block");
+        const name_tok = try self.expect(.identifier, "expected a name to bind the caught error to after 'catch' (use '_' if unused)");
+
+        if (!self.check(.lbrace)) return self.fail("expected '{' after the caught error's name — a catch block always takes braces");
+        const handler = try self.block();
+
+        return ast.Stmt{ .kind = .{ .try_stmt = .{
+            .body = body.kind.block,
+            .error_var = name_tok.lexeme,
+            .handler = handler.kind.block,
+        } }, .line = line };
     }
 
     // ---- <statement> ---------------------------------------------------
@@ -1648,6 +1683,172 @@ test "import is only recognized at the top level" {
     defer parser.deinit();
 
     try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
+}
+
+// ---- try/catch (design note 3u) -------------------------------------
+
+/// Parses `source` as a whole program and asserts its FIRST statement
+/// renders as `expected`. Unlike `expectExprSexpr`, statements can't be
+/// parsed standalone, and a try/catch is too many lines to assert field by
+/// field without losing sight of the shape.
+fn expectFirstStmtSexpr(source: []const u8, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, source);
+    defer result.parser.deinit();
+
+    var buf: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try ast.printStmt(&writer, &result.program[0], 0);
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+}
+
+fn expectParseError(source: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
+}
+
+test "parses a try/catch statement" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\try {
+        \\    print 1
+        \\} catch e {
+        \\    print 2
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const t = result.program[0].kind.try_stmt;
+    try std.testing.expectEqual(@as(usize, 1), t.body.len);
+    try std.testing.expectEqualStrings("e", t.error_var);
+    try std.testing.expectEqual(@as(usize, 1), t.handler.len);
+    try std.testing.expectEqual(@as(i64, 1), t.body[0].kind.print_stmt.literal.int);
+    try std.testing.expectEqual(@as(i64, 2), t.handler[0].kind.print_stmt.literal.int);
+}
+
+test "printStmt renders a try/catch with both halves indented" {
+    try expectFirstStmtSexpr(
+        \\try {
+        \\    print 1
+        \\} catch e {
+        \\    print 2
+        \\}
+    ,
+        \\(try
+        \\  (print 1)
+        \\  (catch e
+        \\    (print 2)))
+    );
+}
+
+test "both halves of a try/catch may be empty" {
+    try expectFirstStmtSexpr("try {} catch _ {}\n",
+        \\(try
+        \\  (catch _))
+    );
+}
+
+test "'catch' may start its own line" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\try {
+        \\    print 1
+        \\}
+        \\catch e {
+        \\    print 2
+        \\}
+    );
+    defer result.parser.deinit();
+
+    try std.testing.expectEqualStrings("e", result.program[0].kind.try_stmt.error_var);
+}
+
+test "a try block's declarations parse like any other block's" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\try {
+        \\    int x := 1
+        \\    if x > 0 {
+        \\        print x
+        \\    }
+        \\} catch e {
+        \\    print e["message"]
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const t = result.program[0].kind.try_stmt;
+    try std.testing.expectEqual(@as(usize, 2), t.body.len);
+    try std.testing.expectEqualStrings("x", t.body[0].kind.var_decl.name);
+    try std.testing.expect(t.body[1].kind == .if_stmt);
+    // The binding is an ordinary variable reference in the handler.
+    const read = t.handler[0].kind.print_stmt.index;
+    try std.testing.expectEqualStrings("e", read.base.variable);
+    try std.testing.expectEqualStrings("message", read.index.literal.string);
+}
+
+test "try/catch nests" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\try {
+        \\    try {
+        \\        print 1
+        \\    } catch inner {
+        \\        print 2
+        \\    }
+        \\} catch outer {
+        \\    print 3
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const outer = result.program[0].kind.try_stmt;
+    try std.testing.expectEqualStrings("outer", outer.error_var);
+    try std.testing.expectEqualStrings("inner", outer.body[0].kind.try_stmt.error_var);
+}
+
+test "try/catch is legal inside a function body" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\func f() -> int {
+        \\    try {
+        \\        return 1
+        \\    } catch e {
+        \\        return 0
+        \\    }
+        \\}
+    );
+    defer result.parser.deinit();
+
+    try std.testing.expect(result.program[0].kind.function_decl.body[0].kind == .try_stmt);
+}
+
+test "a try block without braces is a parse error" {
+    try expectParseError("try print 1\ncatch e {}\n");
+}
+
+test "a catch block without braces is a parse error" {
+    try expectParseError("try { print 1 } catch e print 2\n");
+}
+
+test "a try with no catch is a parse error" {
+    try expectParseError("try { print 1 }\n");
+}
+
+test "the caught error's binding is mandatory" {
+    try expectParseError("try { print 1 } catch { print 2 }\n");
+}
+
+test "'try' and 'catch' are no longer usable as identifiers" {
+    try expectParseError("int try := 1\n");
+    try expectParseError("int catch := 1\n");
 }
 
 test "a for loop's range bounds may be arbitrary expressions" {

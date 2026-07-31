@@ -312,6 +312,12 @@ pub const StmtKind = union(enum) {
     /// same reason `close`/`print` are: it produces no value to a caller
     /// that, by definition, never gets to run.
     exit_stmt: *Expr,
+    /// `try <block> catch IDENTIFIER <block>` (design note 3u) — runs
+    /// `body`, and if a catchable runtime error is raised anywhere while it
+    /// does (including several call frames deep), abandons the rest of it
+    /// and runs `handler` instead, with `error_var` bound to a `map`
+    /// describing the failure.
+    try_stmt: Try,
 
     pub const VarDecl = struct {
         type: ValueType,
@@ -360,6 +366,21 @@ pub const StmtKind = union(enum) {
         start: *Expr,
         end: *Expr,
         body: *Stmt,
+    };
+
+    /// The two halves of a `try`/`catch`. Both are `[]Stmt` — a block's
+    /// contents — rather than the `*Stmt` `if`/`while`/`for` bodies are:
+    /// braces are mandatory on both sides (design note 3u), so there is no
+    /// braceless single-declaration form for either to represent.
+    ///
+    /// They are separate scopes, and `error_var` is a local of `handler`'s,
+    /// not of `body`'s: a local declared in `body` may never have been
+    /// initialized by the time `handler` runs, which is precisely the case
+    /// `handler` exists to deal with.
+    pub const Try = struct {
+        body: []Stmt,
+        error_var: []const u8,
+        handler: []Stmt,
     };
 
     /// `import "path/to/file.butter"` — only ever produced at the top level
@@ -672,6 +693,21 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
             try writer.writeAll("(exit ");
             try printExpr(writer, e);
             try writer.writeAll(")");
+        },
+        .try_stmt => |t| {
+            try writer.writeAll("(try");
+            for (t.body) |*s| {
+                try writer.writeAll("\n");
+                try printStmt(writer, s, depth + 1);
+            }
+            try writer.writeAll("\n");
+            try writer.splatByteAll(' ', (depth + 1) * 2);
+            try writer.print("(catch {s}", .{t.error_var});
+            for (t.handler) |*s| {
+                try writer.writeAll("\n");
+                try printStmt(writer, s, depth + 2);
+            }
+            try writer.writeAll("))");
         },
     }
 }

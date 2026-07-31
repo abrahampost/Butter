@@ -15,10 +15,17 @@ and why are in section 8.
 ## 1. Syntax
 
 ```ebnf
-<statement>   ::= ... | <try-stmt>
+<declaration> ::= ... | <try-stmt>
 
-<try-stmt>    ::= 'try' <block> 'catch' IDENTIFIER <block>
+<try-stmt>    ::= 'try' <block> { NEWLINE } 'catch' IDENTIFIER <block>
 ```
+
+It hangs off `<declaration>`, not `<statement>` as this section first
+sketched: `<statement>` in GRAMMAR.bnf is only the simple, `<end>`-terminated
+forms (`print`/`close`/`exit`/`return`/`expr`), while the compound ones that
+take a body — `<block>`, `<if-stmt>`, `<while-stmt>`, `<for-stmt>` — are all
+alternatives of `<declaration>`. A `{ NEWLINE }` between the two halves lets
+`catch` start its own line, exactly as `<if-stmt>` already allows for `else`.
 
 Two new keywords, `try` and `catch`, added to the KEYWORD list.
 
@@ -229,16 +236,61 @@ Suggested landing order, each step green before the next:
    be `run`'s locals; `run` is a three-line loop over it. Behavior is
    unchanged — `run` still propagates every error — but a handler now has a
    place to catch one. One wrinkle worth knowing before step 3: `step` must
-   stay `inline`, since a real call per instruction measured 30-50% slower
+   stay `inline`, since a real call per instruction measured 33-42% slower
    on the dispatch-bound benchmarks (its doc comment has the numbers).
    Inlining doesn't weaken the seam: `try` inside an inline function still
    yields its error to the call site, which is `run`'s loop.
-2. The reference-leak audit above, with a test per fixed site.
-3. `Vm` handler table, both opcodes, unwinding, `HandlerStackOverflow`, the
-   error map. VM unit tests over hand-built chunks, like the existing `.exit`
-   tests (src/vm.zig:1281+).
-4. Lexer (`try`/`catch`), ast.zig (`Try { body, error_var, handler }`),
-   parser — with their unit tests.
+
+2. ~~The reference-leak audit above, with a test per fixed site.~~ **DONE.**
+   Nine sites stranded a reference on a failing path: `popStream`, and the
+   `LOAD_INDEX`, `STORE_INDEX`, `LOAD_INDEX_REF`, `STORE_INDEX_REF`,
+   `JSON_PARSE`, `WRITE_BYTES`, `READ` and `EXIT` instructions. Ten tests
+   under `std.testing.allocator` (each forcing the discarded operand to be a
+   heap string) reproduced 24 leaked allocations before the fix and pass
+   after it. The invariant is written up on `Vm.pop`. Two idioms, chosen per
+   site rather than uniformly: release on the failing BRANCH where the type
+   check itself proves the value can't be an object past that point (this is
+   what keeps the release off the indexing hot path), and `defer` where a
+   second failure point — `popStream` — sits between the pop and that check.
+   Non-catchable errors (allocation failure, stack overflow) are explicitly
+   out of scope, since the run ends there regardless.
+3. ~~`Vm` handler table, both opcodes, unwinding, `HandlerStackOverflow`,
+   the error map.~~ **DONE.** `PUSH_HANDLER`/`POP_HANDLER` in chunk.zig; the
+   handler table on `Exec` beside `frames` (not on `Vm` as sketched in
+   section 5 — it is the same kind of state, and unwinding restores
+   `frames`' depth along with it); `catchable`, `unwindToHandler`,
+   `errorValue` and `mapSetText` in vm.zig; `run`'s loop now catches from
+   `step`. Twelve VM tests over hand-built chunks. No front end emits the
+   new opcodes yet, so nothing about running a `.butter` program changes.
+   Two findings worth carrying forward:
+   - A stale handler is **not** observable through the reported error alone.
+     A `return` out of a guarded block that left its handler installed sends
+     a later failure into the dead catch block, whose RET hands the error
+     map back as if the call had returned it — after which the caller
+     usually re-reaches the same failure and reports the identical error.
+     The test needed a marker print to detect it; verified by mutation.
+   - Perf is unchanged (controlled A/B): the per-RET handler check costs
+     nothing measurable, including on `function_calls`.
+4. ~~Lexer (`try`/`catch`), ast.zig (`Try { body, error_var, handler }`),
+   parser — with their unit tests.~~ **DONE.** `kw_try`/`kw_catch` in
+   lexer.zig; `ast.Stmt.Try` and its `printStmt` rendering; `tryStatement`
+   in parser.zig, dispatched from `declaration` beside `if`/`while`/`for`
+   (see the correction in section 1). One lexer test and twelve parser
+   tests — shape, rendering, empty halves, `catch` on its own line, nesting,
+   inside a function body, and five rejections (each half unbraced, a
+   missing `catch`, a missing binding, and `try`/`catch` no longer being
+   legal identifiers). Verified by mutation that dropping the
+   newline-skip before `catch` fails a test.
+
+   `Try.body`/`Try.handler` are `[]Stmt` (a block's contents), not the
+   `*Stmt` that `if`/`while`/`for` bodies use, since braces are mandatory
+   on both halves and there is no braceless single-declaration form to
+   represent.
+
+   compiler.zig carries a temporary `.try_stmt` arm raising a new
+   `SemanticError.UnsupportedStatement` ("try/catch is not implemented
+   yet") so a `try` program is a clean compile error rather than an
+   `unreachable` between this step and the next; step 5 deletes both.
 5. compiler.zig codegen, scope and slot handling, `map` typing for the
    binding.
 6. Docs: GRAMMAR.bnf KEYWORD list + `<try-stmt>` + design note 3u; ISA.bnf

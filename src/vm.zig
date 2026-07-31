@@ -13,6 +13,12 @@ pub const RuntimeError = error{
     StackOverflow,
     StackUnderflow,
     CallStackOverflow,
+    /// More `try` blocks active at once than the VM's fixed handler table
+    /// holds (ISA.bnf section 14). Like `CallStackOverflow` this is a hard
+    /// limit rather than a hint — there is no heap to grow the table with —
+    /// and like it, it is NOT itself catchable: a handler can only run if
+    /// there is room to record one.
+    HandlerStackOverflow,
     TypeMismatch,
     DivisionByZero,
     Overflow,
@@ -80,6 +86,14 @@ pub const RuntimeError = error{
 
 const stack_max = 1024;
 const frames_max = 256;
+
+/// How many `try` blocks may be active at once (ISA.bnf section 14). Fixed,
+/// like `frames_max` and `max_open_files`, because the VM has no allocator
+/// at run time. It has to be a RUNTIME limit rather than a compile-time one
+/// even though `try` nesting is lexical: a function containing a `try` can
+/// be called from inside another one's guarded block, recursively, so the
+/// depth a program actually reaches isn't visible in any one chunk.
+const max_handlers = 64;
 
 /// How many files a program may have open at once, and how much buffering
 /// each gets. Both are fixed because the VM has no allocator at run time
@@ -169,6 +183,26 @@ const Frame = struct {
     return_width: usize,
 };
 
+/// One active `try` block: everything needed to abandon whatever the
+/// guarded region was doing and resume at its catch block instead (ISA.bnf
+/// section 14). Recorded by PUSH_HANDLER from the live machine state rather
+/// than from the chunk, because none of it is a compile-time property — the
+/// same PUSH_HANDLER can execute with any number of frames beneath it.
+///
+/// `sp` is the value-stack depth to rewind to, which is also where the error
+/// map lands (making it the catch block's first local — see ISA.bnf section
+/// 14's codegen pattern). `frame_count` is what makes an error raised
+/// several calls deep resumable: it names the frame the `try` itself was
+/// running in, so unwinding can discard every frame entered since.
+const Handler = struct {
+    chunk: *const Chunk,
+    ip: usize,
+    sp: usize,
+    bp: usize,
+    frame_count: usize,
+    return_width: usize,
+};
+
 /// The execution state one `run` threads through every `step`: which chunk
 /// is executing, where in it, and the call stack underneath. All of this was
 /// plain `run` locals until `step` was split out of it (see `step`'s own doc
@@ -190,6 +224,12 @@ const Exec = struct {
     return_width: usize = 1,
     frames: [frames_max]Frame = undefined,
     frame_count: usize = 0,
+    /// The active `try` blocks, innermost last. Lives here beside `frames`
+    /// rather than on the `Vm` because it is the same kind of thing — where
+    /// execution can go next — and because unwinding restores `frames`'
+    /// depth along with everything else here.
+    handlers: [max_handlers]Handler = undefined,
+    handler_count: usize = 0,
 };
 
 /// What one `step` tells `run` to do next.
@@ -235,6 +275,29 @@ pub const Vm = struct {
         self.sp += 1;
     }
 
+    /// Hands the top value to the caller ALONG WITH the reference the stack
+    /// was holding for it. Only `sp` moves — the slot keeps its bits — so a
+    /// popped value is no longer reachable by `decrefStack`, which sweeps
+    /// only what is still below `sp`.
+    ///
+    /// The invariant that falls out of that, and which every instruction
+    /// owes: whatever you pop, you must either push back, store somewhere
+    /// that takes over the reference, or `decref` — **on the failing paths
+    /// as well as the successful one**. It's easy to miss because `decref`
+    /// is a no-op for a non-object, so an operand that's an INT in every
+    /// test you wrote will never expose the mistake; give it a `map`, `list`
+    /// or `string` and the reference is stranded for good. `errdefer` is
+    /// the right tool when the success path transfers ownership onward,
+    /// plain `defer` when the value is consumed either way.
+    ///
+    /// This used to be moot — a `RuntimeError` ended the process, so a
+    /// stranded reference died with it — but `try`/`catch` (TODO #9) will
+    /// resume execution from exactly these paths. See the
+    /// "Discarded-operand reference accounting" tests at the end of this
+    /// file. The one deliberate exception is the errors that stay
+    /// non-catchable: an allocation failure or a stack overflow still ends
+    /// the run, so the few paths that strand a reference on the way out of
+    /// those are left as they are.
     fn pop(self: *Vm) RuntimeError!Value {
         if (self.sp == 0) return RuntimeError.StackUnderflow;
         self.sp -= 1;
@@ -655,7 +718,14 @@ pub const Vm = struct {
 
     fn popStream(self: *Vm) RuntimeError!value_mod.Stream {
         const v = try self.pop();
-        if (v != .stream) return RuntimeError.TypeMismatch;
+        if (v != .stream) {
+            // A `Value.stream` is never refcounted, so the success path has
+            // nothing to release — but a rejected operand can be anything,
+            // including a heap object (`write(m["k"], ...)`), and it is
+            // discarded here rather than pushed back.
+            v.decref(self.allocator);
+            return RuntimeError.TypeMismatch;
+        }
         return v.stream;
     }
 
@@ -782,11 +852,142 @@ pub const Vm = struct {
 
         var exec: Exec = .{ .program = program, .chunk = &program.main };
         while (true) {
-            switch (try self.step(&exec, host)) {
+            const flow = self.step(&exec, host) catch |err| flow: {
+                if (!catchable(err) or exec.handler_count == 0) return err;
+                try self.unwindToHandler(&exec, err);
+                break :flow .running;
+            };
+            switch (flow) {
                 .running => {},
                 .halted => return,
             }
         }
+    }
+
+    /// Whether a `try` block is allowed to intercept `err` (GRAMMAR.bnf
+    /// design note 3u). This list IS the specification of what a Butter
+    /// program can recover from, so it names every variant explicitly
+    /// rather than testing membership of `RuntimeError` — adding a variant
+    /// should be a decision, not an inheritance.
+    fn catchable(err: anyerror) bool {
+        return switch (err) {
+            // Program conditions: things a program did, and could do
+            // differently.
+            error.TypeMismatch,
+            error.DivisionByZero,
+            error.Overflow,
+            error.IndexOutOfBounds,
+            error.ByteOutOfRange,
+            error.StreamReadFailed,
+            error.StreamWriteFailed,
+            error.FileOpenFailed,
+            error.TooManyOpenFiles,
+            error.FileCloseFailed,
+            error.StreamNotReadable,
+            error.StreamNotWritable,
+            error.StreamClosed,
+            error.CannotCloseStandardStream,
+            error.FilesUnavailable,
+            error.KeyNotFound,
+            error.JsonParseFailed,
+            error.NumberParseFailed,
+            error.InvalidExitCode,
+            => true,
+
+            // VM-integrity failures. Not a program condition, and running a
+            // catch block needs the very room these report having run out
+            // of. `error.OutOfMemory` and any host I/O failure fall in the
+            // same bucket via the `else` below — the first because building
+            // the error map allocates, so a handler for it could not run.
+            error.StackOverflow,
+            error.StackUnderflow,
+            error.CallStackOverflow,
+            error.HandlerStackOverflow,
+            => false,
+
+            else => false,
+        };
+    }
+
+    /// Abandons whatever the innermost `try` block was doing and resumes at
+    /// its catch block, with the error map (see `errorValue`) pushed where
+    /// the catch block expects its binding. The caller has already checked
+    /// that a handler exists and that `err` is catchable.
+    ///
+    /// Note what is NOT undone: files opened inside the guarded block stay
+    /// open (GRAMMAR.bnf design note 3u — a stream can outlive the block
+    /// that opened it, and nothing here can tell that case apart from a
+    /// leak), and `Vm.diagnostic` is cleared rather than kept, so a later
+    /// uncaught error can't report detail belonging to this one.
+    fn unwindToHandler(self: *Vm, ex: *Exec, err: anyerror) !void {
+        ex.handler_count -= 1;
+        const handler = ex.handlers[ex.handler_count];
+
+        // Everything the abandoned region pushed is discarded — across as
+        // many frames as it spans, since the value stack is one flat array
+        // regardless of how many calls are layered on it (the same reason
+        // `decrefStack` can sweep it in a single pass).
+        var i = handler.sp;
+        while (i < self.sp) : (i += 1) self.stack[i].decref(self.allocator);
+        self.sp = handler.sp;
+
+        ex.chunk = handler.chunk;
+        ex.ip = handler.ip;
+        ex.bp = handler.bp;
+        ex.frame_count = handler.frame_count;
+        ex.return_width = handler.return_width;
+
+        // Built before `diagnostic` is cleared, since that's where the
+        // operation/path detail comes from. If this fails (only OOM can),
+        // the error propagates out of `run` with the stack already rewound —
+        // harmless, since the errdefer there sweeps whatever is left.
+        const info = try self.errorValue(err);
+        self.diagnostic = null;
+        try self.push(info);
+    }
+
+    /// The `map` a catch block binds: four keys, always all present, so a
+    /// program can read any of them without guarding with `has()` first
+    /// (GRAMMAR.bnf design note 3u).
+    ///
+    ///   error     - the `RuntimeError` tag name, the stable thing to
+    ///               branch on ("KeyNotFound").
+    ///   message   - human-readable, worded exactly as the CLI words an
+    ///               uncaught error, so a caught-and-reported failure reads
+    ///               identically to one that got away.
+    ///   operation - what was being attempted ("open"), or "" for the
+    ///               errors that carry no `Diagnostic`.
+    ///   path      - the file involved, or "" likewise.
+    fn errorValue(self: *Vm, err: anyerror) !Value {
+        const obj = try Object.create(self.allocator, .{ .map = .empty });
+        const result = Value{ .object = obj };
+        errdefer result.decref(self.allocator);
+
+        try self.mapSetText(obj, "error", @errorName(err));
+
+        if (self.diagnostic) |d| {
+            const message = if (d.path.len > 0)
+                try std.fmt.allocPrint(self.allocator, "{s} '{s}': {s}", .{ d.operation, d.path, d.cause })
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ d.operation, d.cause });
+            defer self.allocator.free(message);
+            try self.mapSetText(obj, "message", message);
+            try self.mapSetText(obj, "operation", d.operation);
+            try self.mapSetText(obj, "path", d.path);
+        } else {
+            try self.mapSetText(obj, "message", @errorName(err));
+            try self.mapSetText(obj, "operation", "");
+            try self.mapSetText(obj, "path", "");
+        }
+        return result;
+    }
+
+    /// Sets `key` to a fresh string copy of `text`. `mapSet` takes over the
+    /// value on success, so the errdefer only covers it failing first.
+    fn mapSetText(self: *Vm, obj: *Object, key: []const u8, text: []const u8) !void {
+        const v = try Value.newString(self.allocator, text);
+        errdefer v.decref(self.allocator);
+        try obj.mapSet(self.allocator, key, v);
     }
 
     /// Fetches and executes exactly one instruction, reporting whether the
@@ -806,9 +1007,11 @@ pub const Vm = struct {
     /// chunks on a call.
     ///
     /// `inline` IS LOAD-BEARING, not a hint. A real call per instruction
-    /// costs 30-50% on the dispatch-bound benchmarks (`zig build
-    /// test-performance -Doptimize=ReleaseFast`: loop_sum 234ms -> 316ms,
-    /// function_calls 145ms -> 207ms), because `ip`/`bp`/`chunk` stop being
+    /// costs 33-42% on the dispatch-bound benchmarks — measured back to
+    /// back with only this keyword changed (`zig build test-performance
+    /// -Doptimize=ReleaseFast`: loop_sum 244ms -> 338ms, function_calls
+    /// 157ms -> 223ms, bubble_sort 28.8ms -> 38.4ms; the allocation-bound
+    /// map_ops is unaffected) — because `ip`/`bp`/`chunk` stop being
     /// registers the optimizer can keep across iterations and become memory
     /// round-trips through `ex` instead. Inlined into `run`'s loop, `exec`
     /// doesn't escape and those fields go back into registers — measured
@@ -851,7 +1054,16 @@ pub const Vm = struct {
 
             .load_index => {
                 const idx_val = try self.pop();
-                if (idx_val != .int) return RuntimeError.TypeMismatch;
+                if (idx_val != .int) {
+                    // The ONLY path where a discarded index can still be
+                    // holding a heap reference (`xs[m["k"]]` with a string
+                    // under the key): past this check it is an INT, which
+                    // `decref` would treat as a no-op anyway. Releasing it
+                    // here rather than under a `defer` keeps the release off
+                    // the hot path entirely — this is indexing.
+                    idx_val.decref(self.allocator);
+                    return RuntimeError.TypeMismatch;
+                }
                 const idx = chunk_mod.unpackIndexOperand(instr.operand);
                 if (idx_val.int < 0 or idx_val.int >= idx.length) return RuntimeError.IndexOutOfBounds;
                 const v = self.stack[ex.bp + idx.slot + @as(usize, @intCast(idx_val.int))];
@@ -860,8 +1072,17 @@ pub const Vm = struct {
             },
             .store_index => {
                 const v = try self.pop();
+                // The value being stored, unlike the index, can be a heap
+                // object on EVERY failing path, and on the successful one
+                // its popped reference is handed to the array slot below —
+                // which is exactly `errdefer`, and costs nothing when no
+                // error happens.
+                errdefer v.decref(self.allocator);
                 const idx_val = try self.pop();
-                if (idx_val != .int) return RuntimeError.TypeMismatch;
+                if (idx_val != .int) {
+                    idx_val.decref(self.allocator); // as in LOAD_INDEX above
+                    return RuntimeError.TypeMismatch;
+                }
                 const idx = chunk_mod.unpackIndexOperand(instr.operand);
                 if (idx_val.int < 0 or idx_val.int >= idx.length) return RuntimeError.IndexOutOfBounds;
                 v.incref();
@@ -876,7 +1097,10 @@ pub const Vm = struct {
             },
             .load_index_ref => {
                 const idx_val = try self.pop();
-                if (idx_val != .int) return RuntimeError.TypeMismatch;
+                if (idx_val != .int) {
+                    idx_val.decref(self.allocator); // as in LOAD_INDEX above
+                    return RuntimeError.TypeMismatch;
+                }
                 const ref = self.stack[ex.bp + instr.operand];
                 if (ref != .array_ref) return RuntimeError.TypeMismatch;
                 if (idx_val.int < 0 or idx_val.int >= ref.array_ref.len) return RuntimeError.IndexOutOfBounds;
@@ -886,8 +1110,12 @@ pub const Vm = struct {
             },
             .store_index_ref => {
                 const v = try self.pop();
+                errdefer v.decref(self.allocator); // undone only if the store never happens, same as STORE_INDEX
                 const idx_val = try self.pop();
-                if (idx_val != .int) return RuntimeError.TypeMismatch;
+                if (idx_val != .int) {
+                    idx_val.decref(self.allocator); // as in LOAD_INDEX above
+                    return RuntimeError.TypeMismatch;
+                }
                 const ref = self.stack[ex.bp + instr.operand];
                 if (ref != .array_ref) return RuntimeError.TypeMismatch;
                 if (idx_val.int < 0 or idx_val.int >= ref.array_ref.len) return RuntimeError.IndexOutOfBounds;
@@ -1045,7 +1273,14 @@ pub const Vm = struct {
             .json_parse => {
                 const count_val = try self.pop();
                 const ref_val = try self.pop();
-                if (count_val != .int or ref_val != .array_ref) return RuntimeError.TypeMismatch;
+                if (count_val != .int or ref_val != .array_ref) {
+                    // Past this check neither can be a heap object, so this
+                    // is the only path that has to release them — same
+                    // reasoning as LOAD_INDEX above.
+                    count_val.decref(self.allocator);
+                    ref_val.decref(self.allocator);
+                    return RuntimeError.TypeMismatch;
+                }
                 const ref = ref_val.array_ref;
                 try checkBufferRange(ref);
                 if (count_val.int < 0 or count_val.int > ref.len) return RuntimeError.IndexOutOfBounds;
@@ -1151,6 +1386,27 @@ pub const Vm = struct {
                 if (!cond.boolean) ex.ip = instr.operand;
             },
 
+            .push_handler => {
+                if (ex.handler_count >= max_handlers) return RuntimeError.HandlerStackOverflow;
+                ex.handlers[ex.handler_count] = .{
+                    .chunk = ex.chunk,
+                    .ip = instr.operand,
+                    .sp = self.sp,
+                    .bp = ex.bp,
+                    .frame_count = ex.frame_count,
+                    .return_width = ex.return_width,
+                };
+                ex.handler_count += 1;
+            },
+            .pop_handler => {
+                // Defense-in-depth: the compiler emits POP_HANDLER only to
+                // match a PUSH_HANDLER it already emitted, so this can't
+                // actually happen from compiled Butter source — same spirit
+                // as MAKE_MAP's key check.
+                if (ex.handler_count == 0) return RuntimeError.StackUnderflow;
+                ex.handler_count -= 1;
+            },
+
             .call => {
                 if (ex.frame_count >= frames_max) return RuntimeError.CallStackOverflow;
                 const func = &ex.program.functions[instr.operand];
@@ -1193,6 +1449,17 @@ pub const Vm = struct {
                 ex.ip = frame.ip;
                 ex.bp = frame.bp;
                 ex.return_width = frame.return_width;
+
+                // A `return` out of a guarded block leaves that block's
+                // handler behind, pointing at a catch block in a chunk this
+                // frame is no longer running — so every handler the
+                // departing frame installed goes with it. Done here rather
+                // than by having the compiler emit POP_HANDLER before each
+                // in-try `return` because this covers every way out of a
+                // frame at once, by construction.
+                while (ex.handler_count > 0 and ex.handlers[ex.handler_count - 1].frame_count > ex.frame_count) {
+                    ex.handler_count -= 1;
+                }
             },
 
             .print => {
@@ -1216,6 +1483,11 @@ pub const Vm = struct {
 
             .read => {
                 const ref_val = try self.pop();
+                // `defer` rather than LOAD_INDEX's release-on-the-failing-
+                // branch, because `popStream` below can fail FIRST, while
+                // this is still potentially a heap object — two exits to
+                // cover here, not one.
+                defer ref_val.decref(self.allocator);
                 const stream = try self.popStream();
                 if (ref_val != .array_ref) return RuntimeError.TypeMismatch;
                 const ref = ref_val.array_ref;
@@ -1240,7 +1512,12 @@ pub const Vm = struct {
             },
             .write_bytes => {
                 const count_val = try self.pop();
+                // Both `defer`red for the same reason as READ's operand
+                // above: `popStream` sits between these pops and the type
+                // check that would otherwise prove them non-objects.
+                defer count_val.decref(self.allocator);
                 const ref_val = try self.pop();
+                defer ref_val.decref(self.allocator);
                 const stream = try self.popStream();
                 if (count_val != .int or ref_val != .array_ref) return RuntimeError.TypeMismatch;
                 const ref = ref_val.array_ref;
@@ -1285,7 +1562,13 @@ pub const Vm = struct {
             // unwinding through an active frame needs the same cleanup.
             .exit => {
                 const code_val = try self.pop();
-                if (code_val != .int) return RuntimeError.TypeMismatch;
+                if (code_val != .int) {
+                    // `exit doc` — already popped, so `decrefStack` below
+                    // would never reach it. Past here it's an INT, and the
+                    // range check needs no release of its own.
+                    code_val.decref(self.allocator);
+                    return RuntimeError.TypeMismatch;
+                }
                 if (code_val.int < 0 or code_val.int > 255) return RuntimeError.InvalidExitCode;
                 try self.closeAllFiles(host);
                 self.decrefStack();
@@ -3349,4 +3632,518 @@ test "parse_int on NaN or infinity is Overflow" {
     try expectParseIntFloatOverflow(std.math.nan(f64));
     try expectParseIntFloatOverflow(std.math.inf(f64));
     try expectParseIntFloatOverflow(-std.math.inf(f64));
+}
+
+// ---- Discarded-operand reference accounting (TODO #9, step 2) ------------
+//
+// An instruction that fails must not strand a heap reference. `pop` only
+// moves `sp`; it doesn't clear the slot, and the stack teardown on the way
+// out of `run` (`decrefStack`) only covers slots BELOW `sp` — so a popped
+// object that an error path drops without decreffing is leaked outright.
+//
+// That was invisible while every runtime error killed the process, but
+// `try`/`catch` is going to resume from these paths, so each one has to
+// balance its own references. `Value.decref` is a no-op on a non-object, so
+// only pops that CAN yield a string/map/list matter — which is what every
+// test below forces, by making the discarded operand a heap string and
+// letting `std.testing.allocator` fail the test if its refcount never
+// reaches zero.
+
+test "a non-stream operand is released, not leaked, when close rejects it" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "not a stream"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .close);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "a non-int index is released, not leaked, when load_index rejects it" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "not an index"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, one); // slot 0: the array
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emitWithOperand(allocator, .load_index, chunk_mod.packIndexOperand(0, 1));
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "both operands are released, not leaked, when store_index rejects its index" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    const key = try chunk.addConstant(allocator, try Value.newString(allocator, "not an index"));
+    const val = try chunk.addConstant(allocator, try Value.newString(allocator, "the value"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, one); // slot 0: the array
+    _ = try chunk.emitWithOperand(allocator, .push_const, key);
+    _ = try chunk.emitWithOperand(allocator, .push_const, val);
+    _ = try chunk.emitWithOperand(allocator, .store_index, chunk_mod.packIndexOperand(0, 1));
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "the stored value is released, not leaked, when store_index is out of bounds" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    const seven = try chunk.addConstant(allocator, .{ .int = 7 });
+    const val = try chunk.addConstant(allocator, try Value.newString(allocator, "the value"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, one); // slot 0: the array
+    _ = try chunk.emitWithOperand(allocator, .push_const, seven); // out of bounds
+    _ = try chunk.emitWithOperand(allocator, .push_const, val);
+    _ = try chunk.emitWithOperand(allocator, .store_index, chunk_mod.packIndexOperand(0, 1));
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.IndexOutOfBounds);
+}
+
+test "a non-int index is released, not leaked, when load_index_ref rejects it" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const zero = try chunk.addConstant(allocator, .{ .int = 0 });
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "not an index"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero); // slot 0: the array
+    _ = try chunk.emitWithOperand(allocator, .make_array_ref, chunk_mod.packIndexOperand(0, 1)); // slot 1: the ref
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emitWithOperand(allocator, .load_index_ref, 1);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "both operands are released, not leaked, when store_index_ref rejects its index" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const zero = try chunk.addConstant(allocator, .{ .int = 0 });
+    const key = try chunk.addConstant(allocator, try Value.newString(allocator, "not an index"));
+    const val = try chunk.addConstant(allocator, try Value.newString(allocator, "the value"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero); // slot 0: the array
+    _ = try chunk.emitWithOperand(allocator, .make_array_ref, chunk_mod.packIndexOperand(0, 1)); // slot 1: the ref
+    _ = try chunk.emitWithOperand(allocator, .push_const, key);
+    _ = try chunk.emitWithOperand(allocator, .push_const, val);
+    _ = try chunk.emitWithOperand(allocator, .store_index_ref, 1);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "a non-int count is released, not leaked, when json rejects it" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const zero = try chunk.addConstant(allocator, .{ .int = 0 });
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "not a count"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero); // slot 0: the buffer
+    _ = try chunk.emitWithOperand(allocator, .make_array_ref, chunk_mod.packIndexOperand(0, 1));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .json_parse);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "a non-int count is released, not leaked, when write_bytes rejects it" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "not a count"));
+    try emitBufferFor(&chunk, allocator, .stdout, 1); // buffer, stream, ref
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .write_bytes);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "a non-buffer operand is released, not leaked, when read rejects it" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "not a buffer"));
+    try emitStream(&chunk, allocator, .stdin);
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .read);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+// ---- Error handling: handlers and unwinding (ISA.bnf section 14) --------
+//
+// These drive the runtime directly, the way `tests/cases/` will drive it
+// through `try`/`catch` source once the front end lands. Every chunk here is
+// hand-assembled into the codegen shape ISA.bnf section 14 specifies:
+//
+//     PUSH_HANDLER catch_target / <guarded> / POP_HANDLER / JUMP end
+//   catch_target:
+//     <catch block, with the error map already pushed as its first local>
+//   end:
+
+/// Emits PUSH_HANDLER with a placeholder target, returning its index for
+/// `closeGuard` to patch.
+fn openGuard(chunk: *Chunk, allocator: std.mem.Allocator) !usize {
+    return try chunk.emitWithOperand(allocator, .push_handler, 0);
+}
+
+/// Closes a guarded region: POP_HANDLER and a JUMP over the catch block,
+/// patching the handler's target to the instruction that comes next (where
+/// the caller then emits the catch block). Returns the JUMP's index, to be
+/// patched once the catch block ends.
+fn closeGuard(chunk: *Chunk, allocator: std.mem.Allocator, push_at: usize) !usize {
+    _ = try chunk.emit(allocator, .pop_handler);
+    const jump_at = try chunk.emitWithOperand(allocator, .jump, 0);
+    chunk.patchOperand(push_at, @intCast(chunk.code.items.len));
+    return jump_at;
+}
+
+/// Emits `print <map at `slot`>[key]` — how these tests read the error map
+/// a handler bound, without a DUP opcode to work with: LOAD_LOCAL makes the
+/// extra reference INDEX_GET consumes, leaving the map itself in place.
+fn emitPrintKey(chunk: *Chunk, allocator: std.mem.Allocator, slot: u32, key: []const u8) !void {
+    _ = try chunk.emitWithOperand(allocator, .load_local, slot);
+    const k = try chunk.addConstant(allocator, try Value.newString(allocator, key));
+    _ = try chunk.emitWithOperand(allocator, .push_const, k);
+    _ = try chunk.emit(allocator, .index_get);
+    _ = try chunk.emit(allocator, .print);
+}
+
+/// `1 / 0` — a compact, reliably catchable failure.
+fn emitDivByZero(chunk: *Chunk, allocator: std.mem.Allocator) !void {
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    const zero = try chunk.addConstant(allocator, .{ .int = 0 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero);
+    _ = try chunk.emit(allocator, .div);
+}
+
+test "a handler catches a runtime error and resumes at its catch block" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const push = try openGuard(&chunk, allocator);
+    try emitDivByZero(&chunk, allocator);
+    _ = try chunk.emit(allocator, .print); // never reached
+    const jump = try closeGuard(&chunk, allocator, push);
+    try emitPrintKey(&chunk, allocator, 0, "error");
+    chunk.patchOperand(jump, @intCast(chunk.code.items.len));
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("DivisionByZero\n", buf[0..len]);
+}
+
+test "the error map describes an error that carries no diagnostic" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const push = try openGuard(&chunk, allocator);
+    try emitDivByZero(&chunk, allocator);
+    const jump = try closeGuard(&chunk, allocator, push);
+    try emitPrintKey(&chunk, allocator, 0, "error");
+    try emitPrintKey(&chunk, allocator, 0, "message");
+    try emitPrintKey(&chunk, allocator, 0, "operation");
+    try emitPrintKey(&chunk, allocator, 0, "path");
+    chunk.patchOperand(jump, @intCast(chunk.code.items.len));
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [128]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    // operation/path are empty rather than absent, so a program can read
+    // them unconditionally (GRAMMAR.bnf design note 3u).
+    try std.testing.expectEqualStrings("DivisionByZero\nDivisionByZero\n\n\n", buf[0..len]);
+}
+
+test "the error map carries the operation and path of a file failure" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    // No `fs` on the Host (runSource supplies none), so this is
+    // FilesUnavailable — one of the errors that sets `Vm.diagnostic`.
+    const push = try openGuard(&chunk, allocator);
+    const path = try chunk.addConstant(allocator, try Value.newString(allocator, "data.txt"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, path);
+    _ = try chunk.emitWithOperand(allocator, .open, @intFromEnum(value_mod.OpenMode.read));
+    const jump = try closeGuard(&chunk, allocator, push);
+    try emitPrintKey(&chunk, allocator, 0, "error");
+    try emitPrintKey(&chunk, allocator, 0, "message");
+    try emitPrintKey(&chunk, allocator, 0, "operation");
+    try emitPrintKey(&chunk, allocator, 0, "path");
+    chunk.patchOperand(jump, @intCast(chunk.code.items.len));
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [256]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings(
+        \\FilesUnavailable
+        \\open 'data.txt': this program was run without filesystem access
+        \\open
+        \\data.txt
+        \\
+    , buf[0..len]);
+}
+
+test "a guarded block that finishes normally leaves no handler behind" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const push = try openGuard(&chunk, allocator);
+    const ok = try chunk.addConstant(allocator, .{ .int = 7 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, ok);
+    _ = try chunk.emit(allocator, .pop);
+    const jump = try closeGuard(&chunk, allocator, push);
+    _ = try chunk.emit(allocator, .print); // catch block, must not run
+    chunk.patchOperand(jump, @intCast(chunk.code.items.len));
+    // The handler is spent, so this one has nothing to catch it.
+    try emitDivByZero(&chunk, allocator);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.DivisionByZero);
+}
+
+test "an error raised inside a catch block is not caught by its own handler" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const push = try openGuard(&chunk, allocator);
+    try emitDivByZero(&chunk, allocator);
+    const jump = try closeGuard(&chunk, allocator, push);
+    // The handler was consumed on the way in here, so this second failure
+    // has nowhere to go.
+    try emitDivByZero(&chunk, allocator);
+    chunk.patchOperand(jump, @intCast(chunk.code.items.len));
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.DivisionByZero);
+}
+
+test "the innermost of two nested handlers is the one that catches" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const inner_label = try chunk.addConstant(allocator, try Value.newString(allocator, "inner"));
+    const outer_label = try chunk.addConstant(allocator, try Value.newString(allocator, "outer"));
+
+    const outer_push = try openGuard(&chunk, allocator);
+    const inner_push = try openGuard(&chunk, allocator);
+    try emitDivByZero(&chunk, allocator);
+    const inner_jump = try closeGuard(&chunk, allocator, inner_push);
+    _ = try chunk.emitWithOperand(allocator, .push_const, inner_label);
+    _ = try chunk.emit(allocator, .print);
+    chunk.patchOperand(inner_jump, @intCast(chunk.code.items.len));
+    const outer_jump = try closeGuard(&chunk, allocator, outer_push);
+    _ = try chunk.emitWithOperand(allocator, .push_const, outer_label);
+    _ = try chunk.emit(allocator, .print);
+    chunk.patchOperand(outer_jump, @intCast(chunk.code.items.len));
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("inner\n", buf[0..len]);
+}
+
+test "everything the abandoned region pushed is released, not leaked" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    // Two heap strings are live on the stack when the failure happens; the
+    // testing allocator is what checks unwinding released them.
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "still on the stack"));
+    const b = try chunk.addConstant(allocator, try Value.newString(allocator, "and so is this"));
+    const push = try openGuard(&chunk, allocator);
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emitWithOperand(allocator, .push_const, b);
+    try emitDivByZero(&chunk, allocator);
+    const jump = try closeGuard(&chunk, allocator, push);
+    try emitPrintKey(&chunk, allocator, 0, "error");
+    chunk.patchOperand(jump, @intCast(chunk.code.items.len));
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("DivisionByZero\n", buf[0..len]);
+}
+
+test "an error several frames deep unwinds to the handler's own frame" {
+    const allocator = std.testing.allocator;
+
+    // func fails() -> int { return 1 / 0 }   (via a second frame, to prove
+    // unwinding crosses more than one)
+    var inner_chunk: Chunk = .{};
+    try emitDivByZero(&inner_chunk, allocator);
+    _ = try inner_chunk.emit(allocator, .ret);
+
+    var outer_chunk: Chunk = .{};
+    _ = try outer_chunk.emitWithOperand(allocator, .call, 0);
+    _ = try outer_chunk.emit(allocator, .ret);
+
+    var main_chunk: Chunk = .{};
+    const push = try openGuard(&main_chunk, allocator);
+    _ = try main_chunk.emitWithOperand(allocator, .call, 1);
+    _ = try main_chunk.emit(allocator, .pop);
+    const jump = try closeGuard(&main_chunk, allocator, push);
+    try emitPrintKey(&main_chunk, allocator, 0, "error");
+    main_chunk.patchOperand(jump, @intCast(main_chunk.code.items.len));
+    _ = try main_chunk.emit(allocator, .halt);
+
+    var functions: std.ArrayList(chunk_mod.Function) = .empty;
+    try functions.append(allocator, .{ .name = "inner", .arity = 0, .chunk = inner_chunk });
+    try functions.append(allocator, .{ .name = "outer", .arity = 0, .chunk = outer_chunk });
+    var program = chunk_mod.Program{ .main = main_chunk, .functions = try functions.toOwnedSlice(allocator) };
+    defer program.deinit(allocator);
+
+    var vm = Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try vm.run(&program, .{ .out = &writer });
+    try std.testing.expectEqualStrings("DivisionByZero\n", writer.buffered());
+}
+
+test "returning out of a guarded block takes its handler with it" {
+    const allocator = std.testing.allocator;
+
+    // func f() -> int { try { return 0 } catch e { print "caught"; return e } }
+    // — the handler is installed and then abandoned by the `return`.
+    //
+    // The marker print is what gives this test teeth. A stale handler is
+    // NOT observable through the error alone: main's failure would resume
+    // in f's dead catch block, whose RET hands the error map back to main
+    // as if the original call had returned it, and main then reaches the
+    // very same division a second time — reporting DivisionByZero either
+    // way. Only the catch block having run at all distinguishes them.
+    var func_chunk: Chunk = .{};
+    const push = try openGuard(&func_chunk, allocator);
+    const zero = try func_chunk.addConstant(allocator, .{ .int = 0 });
+    _ = try func_chunk.emitWithOperand(allocator, .push_const, zero);
+    _ = try func_chunk.emit(allocator, .ret);
+    const jump = try closeGuard(&func_chunk, allocator, push);
+    const marker = try func_chunk.addConstant(allocator, try Value.newString(allocator, "caught"));
+    _ = try func_chunk.emitWithOperand(allocator, .push_const, marker);
+    _ = try func_chunk.emit(allocator, .print);
+    _ = try func_chunk.emit(allocator, .ret);
+    func_chunk.patchOperand(jump, @intCast(func_chunk.code.items.len));
+
+    var main_chunk: Chunk = .{};
+    _ = try main_chunk.emitWithOperand(allocator, .call, 0);
+    _ = try main_chunk.emit(allocator, .pop);
+    try emitDivByZero(&main_chunk, allocator);
+    _ = try main_chunk.emit(allocator, .halt);
+
+    var functions: std.ArrayList(chunk_mod.Function) = .empty;
+    try functions.append(allocator, .{ .name = "f", .arity = 0, .chunk = func_chunk });
+    var program = chunk_mod.Program{ .main = main_chunk, .functions = try functions.toOwnedSlice(allocator) };
+    defer program.deinit(allocator);
+
+    var vm = Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try std.testing.expectError(RuntimeError.DivisionByZero, vm.run(&program, .{ .out = &writer }));
+    try std.testing.expectEqualStrings("", writer.buffered());
+}
+
+test "a VM-integrity failure escapes even with a handler installed" {
+    const allocator = std.testing.allocator;
+
+    // func recurse() -> int { return recurse() }
+    var func_chunk: Chunk = .{};
+    _ = try func_chunk.emitWithOperand(allocator, .call, 0);
+    _ = try func_chunk.emit(allocator, .ret);
+
+    var main_chunk: Chunk = .{};
+    const push = try openGuard(&main_chunk, allocator);
+    _ = try main_chunk.emitWithOperand(allocator, .call, 0);
+    const jump = try closeGuard(&main_chunk, allocator, push);
+    _ = try main_chunk.emit(allocator, .print); // catch block, must not run
+    main_chunk.patchOperand(jump, @intCast(main_chunk.code.items.len));
+    _ = try main_chunk.emit(allocator, .halt);
+
+    var functions: std.ArrayList(chunk_mod.Function) = .empty;
+    try functions.append(allocator, .{ .name = "recurse", .arity = 0, .chunk = func_chunk });
+    var program = chunk_mod.Program{ .main = main_chunk, .functions = try functions.toOwnedSlice(allocator) };
+    defer program.deinit(allocator);
+
+    var vm = Vm.init(allocator);
+    var buf: [16]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try std.testing.expectError(RuntimeError.CallStackOverflow, vm.run(&program, .{ .out = &writer }));
+}
+
+test "more nested handlers than the table holds is HandlerStackOverflow" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    // One past the table's capacity — and not catchable by any of the 64
+    // handlers already installed.
+    var i: usize = 0;
+    while (i <= max_handlers) : (i += 1) _ = try chunk.emitWithOperand(allocator, .push_handler, 0);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.HandlerStackOverflow);
+}
+
+test "exit inside a guarded block still exits, uncatchably" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const push = try openGuard(&chunk, allocator);
+    const code = try chunk.addConstant(allocator, .{ .int = 3 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, code);
+    _ = try chunk.emit(allocator, .exit);
+    const jump = try closeGuard(&chunk, allocator, push);
+    _ = try chunk.emit(allocator, .print); // catch block, must not run
+    chunk.patchOperand(jump, @intCast(chunk.code.items.len));
+    _ = try chunk.emit(allocator, .halt);
+
+    var vm = Vm.init(allocator);
+    var buf: [16]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const program = chunk_mod.Program{ .main = chunk, .functions = &.{} };
+    try vm.run(&program, .{ .out = &writer });
+    // `exit` is not an error, so no handler ever sees it (GRAMMAR.bnf
+    // design note 3u).
+    try std.testing.expectEqual(@as(?u8, 3), vm.exit_code);
+    try std.testing.expectEqualStrings("", writer.buffered());
+}
+
+test "a non-int exit code is released, not leaked, when exit rejects it" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "not a code"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .exit);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
 }
