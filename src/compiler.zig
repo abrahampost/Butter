@@ -581,6 +581,10 @@ pub const Compiler = struct {
             .json_stringify => StaticType{ .scalar = .string },
             .int_parse => StaticType{ .scalar = .int },
             .float_parse => StaticType{ .scalar = .float },
+            // Always a string, even for a variable that isn't set — an
+            // unset one reads as `""`, never `null` (design note 3v).
+            .env_get => StaticType{ .scalar = .string },
+            .env_has => StaticType{ .scalar = .bool },
         };
     }
 
@@ -1029,6 +1033,14 @@ pub const Compiler = struct {
             .float_parse => |e| {
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .parse_float);
+            },
+            .env_get => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .get_env);
+            },
+            .env_has => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .has_env);
             },
         }
     }
@@ -3288,6 +3300,117 @@ test "int(x) on an already-int value is TypeMismatch (no implicit identity cast)
         \\int x := 5
         \\print int(x)
     , &buf));
+}
+
+// ---- Environment variables (GRAMMAR.bnf design note 3v) -----------------
+
+/// `runProgram` with an environment available to `getenv`/`hasenv`.
+fn runProgramWithEnv(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    env: []const vm_mod.Host.EnvVar,
+    buf: []u8,
+) ![]const u8 {
+    var lex = lexer_mod.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var writer = std.Io.Writer.fixed(buf);
+    try vm.run(&compiled, .{ .out = &writer, .env = env });
+    return writer.buffered();
+}
+
+const compiler_test_env = [_]vm_mod.Host.EnvVar{
+    .{ .name = "EDITOR", .value = "vi" },
+    .{ .name = "QUIET", .value = "" },
+};
+
+test "getenv(...) reads a set variable and hasenv(...) reports it present" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgramWithEnv(allocator,
+        \\print getenv("EDITOR")
+        \\print hasenv("EDITOR")
+    , &compiler_test_env, &buf);
+    try std.testing.expectEqualStrings("vi\ntrue\n", output);
+}
+
+test "getenv(...) on an unset variable is \"\", and hasenv(...) is false" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgramWithEnv(allocator,
+        \\print "[" + getenv("NOPE") + "]"
+        \\print hasenv("NOPE")
+    , &compiler_test_env, &buf);
+    try std.testing.expectEqualStrings("[]\nfalse\n", output);
+}
+
+test "hasenv(...) is what tells an empty-valued variable from a missing one" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgramWithEnv(allocator,
+        \\print getenv("QUIET") == getenv("NOPE")
+        \\print hasenv("QUIET")
+        \\print hasenv("NOPE")
+    , &compiler_test_env, &buf);
+    try std.testing.expectEqualStrings("true\ntrue\nfalse\n", output);
+}
+
+test "getenv/hasenv's static types let them initialize a string/bool local" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgramWithEnv(allocator,
+        \\string editor := getenv("EDITOR")
+        \\bool present := hasenv("EDITOR")
+        \\print editor + " " + stringify(present)
+    , &compiler_test_env, &buf);
+    try std.testing.expectEqualStrings("vi true\n", output);
+}
+
+test "getenv/hasenv's static types are checked against the declared type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int n := getenv(\"EDITOR\")\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "string s := hasenv(\"EDITOR\")\n", SemanticError.TypeMismatch);
+}
+
+test "getenv's name may be any expression, not just a literal" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgramWithEnv(allocator,
+        \\string prefix := "EDIT"
+        \\print getenv(prefix + "OR")
+    , &compiler_test_env, &buf);
+    try std.testing.expectEqualStrings("vi\n", output);
+}
+
+test "getenv/hasenv on a non-string name is a runtime TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\print getenv(5)
+    , &buf));
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\print hasenv(true)
+    , &buf));
+}
+
+test "a program run with no environment sees every variable as unset" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    // `runProgram` supplies no `Host.env` at all — the embedder default.
+    const output = try runProgram(allocator,
+        \\print hasenv("EDITOR")
+        \\print len(getenv("EDITOR"))
+    , &buf);
+    try std.testing.expectEqualStrings("false\n0\n", output);
 }
 
 // ---- Static type checking (GRAMMAR.bnf design note 3t) -------------------

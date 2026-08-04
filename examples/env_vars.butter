@@ -1,0 +1,41 @@
+# Reading configuration from the environment (GRAMMAR.bnf design note 3v).
+#
+# The pattern every CLI tool uses: a built-in default that an environment
+# variable overrides. `hasenv` is what makes it correct rather than merely
+# close — a variable exported as empty is a deliberate setting, and `getenv`
+# alone reads that identically to one that was never set at all.
+
+string editor := "nano"
+if hasenv("EDITOR") {
+    editor := getenv("EDITOR")
+}
+print "editor:   " + editor
+
+# `getenv` on something almost certainly unset, to show the "" default.
+print "unset:    [" + getenv("BUTTER_NOT_SET_ANYWHERE") + "]"
+print "is set:   " + stringify(hasenv("BUTTER_NOT_SET_ANYWHERE"))
+
+# A setting still arrives as text, so a numeric one goes through int(...) —
+# wrapped in try/catch, since the value comes from outside the program and
+# nothing guarantees it's a number (design note 3u).
+int width := 80
+if hasenv("BUTTER_WIDTH") {
+    try {
+        width := int(getenv("BUTTER_WIDTH"))
+    } catch e {
+        print "BUTTER_WIDTH isn't a number, keeping the default (" + e["error"] + ")"
+    }
+}
+print "width:    " + stringify(width)
+
+# The name is an ordinary expression, so a prefixed namespace of settings
+# can be swept in a loop rather than written out one lookup at a time.
+list settings := ["WIDTH", "HEIGHT", "DEPTH"]
+for i in 0..len(settings) {
+    string key := "BUTTER_" + settings[i]
+    if hasenv(key) {
+        print key + "=" + getenv(key)
+    } else {
+        print key + " unset"
+    }
+}

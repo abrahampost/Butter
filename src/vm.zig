@@ -130,6 +130,20 @@ pub const Host = struct {
     /// embedder that never sets it gets an empty `args`, exactly like a
     /// program run with no arguments.
     args: []const []const u8 = &.{},
+    /// The environment `getenv`/`hasenv` (GRAMMAR.bnf design note 3v) see —
+    /// a flat slice rather than a map because it is read a handful of times
+    /// per run at most, never in a loop the way a stack slot is, and this
+    /// keeps the whole `Host` plain injected data (the same shape `args`
+    /// has) instead of a container the VM would have to own. A repeated
+    /// name resolves to its FIRST entry.
+    ///
+    /// Absent by default, which is an EMPTY environment: every variable is
+    /// unset, so `getenv` is `""` and `hasenv` is `false` for all of them.
+    /// Deliberately not a null-vs-empty capability gate like `fs` — a
+    /// program can't tell the two apart, and there's nothing to refuse:
+    /// unlike opening a file, reading a variable that isn't there does
+    /// nothing observable outside the VM.
+    env: []const EnvVar = &.{},
 
     /// The filesystem as the program sees it: `io` performs the operations,
     /// and `dir` is what a relative path in `open` resolves against.
@@ -137,6 +151,29 @@ pub const Host = struct {
         io: std.Io,
         dir: std.Io.Dir,
     };
+
+    /// One environment variable. Both fields are borrowed for the duration
+    /// of `run` — GET_ENV copies the value into a fresh heap string rather
+    /// than aliasing it, so nothing the program holds outlives this slice.
+    pub const EnvVar = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+
+    /// The value of `name`, or null if it isn't set. A linear scan: see the
+    /// `env` field's own note on why this isn't a hash map.
+    ///
+    /// Comparison is BYTE-EXACT on every platform, including Windows, whose
+    /// own environment lookup is case-insensitive — a deliberate choice, so
+    /// that one Butter program behaves identically everywhere rather than
+    /// having `getenv("path")` succeed on one host and not another
+    /// (GRAMMAR.bnf design note 3v).
+    pub fn lookup(self: Host, name: []const u8) ?[]const u8 {
+        for (self.env) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.value;
+        }
+        return null;
+    }
 };
 
 /// Which file, doing what, and why it failed — the detail `RuntimeError`'s
@@ -1328,6 +1365,26 @@ pub const Vm = struct {
                 const bytes = v.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 const result = std.fmt.parseFloat(f64, bytes) catch return self.failFile(RuntimeError.NumberParseFailed, "float", "", "malformed float literal");
                 try self.push(.{ .float = result });
+            },
+
+            // ---- Environment variables (ISA.bnf section 15) ----
+
+            .get_env => {
+                const name_val = try self.pop();
+                defer name_val.decref(self.allocator);
+                const name = name_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                // An unset variable is `""`, not an error and not `null` —
+                // `hasenv` is how a program tells "unset" from "set to the
+                // empty string" (GRAMMAR.bnf design note 3v). Always a
+                // fresh copy, never a slice into `Host.env`, so the result
+                // outlives the host slice exactly like PUSH_ARGS's strings.
+                try self.push(try Value.newString(self.allocator, host.lookup(name) orelse ""));
+            },
+            .has_env => {
+                const name_val = try self.pop();
+                defer name_val.decref(self.allocator);
+                const name = name_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                try self.push(.{ .boolean = host.lookup(name) != null });
             },
 
             .add => try self.add(),
@@ -3632,6 +3689,124 @@ test "parse_int on NaN or infinity is Overflow" {
     try expectParseIntFloatOverflow(std.math.nan(f64));
     try expectParseIntFloatOverflow(std.math.inf(f64));
     try expectParseIntFloatOverflow(-std.math.inf(f64));
+}
+
+// ---- Environment variables (ISA.bnf section 15) --------------------------
+
+/// Runs a one-instruction GET_ENV/HAS_ENV program looking up `name` against
+/// `env`, and returns what it printed. `op` is the opcode under test.
+fn runEnvLookup(
+    buf: []u8,
+    op: chunk_mod.OpCode,
+    name: []const u8,
+    env: []const Host.EnvVar,
+) ![]const u8 {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const name_const = try chunk.addConstant(allocator, try Value.newString(allocator, name));
+    _ = try chunk.emitWithOperand(allocator, .push_const, name_const);
+    _ = try chunk.emit(allocator, op);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var vm = Vm.init(allocator);
+    var writer = std.Io.Writer.fixed(buf);
+    const program = chunk_mod.Program{ .main = chunk, .functions = &.{} };
+    try vm.run(&program, .{ .out = &writer, .env = env });
+    return buf[0..writer.end];
+}
+
+const test_env = [_]Host.EnvVar{
+    .{ .name = "BUTTER_HOME", .value = "/opt/butter" },
+    .{ .name = "BUTTER_EMPTY", .value = "" },
+};
+
+test "get_env returns a set variable's value" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("/opt/butter\n", try runEnvLookup(&buf, .get_env, "BUTTER_HOME", &test_env));
+}
+
+test "get_env on an unset variable is the empty string, not an error" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\n", try runEnvLookup(&buf, .get_env, "BUTTER_MISSING", &test_env));
+}
+
+// The pair get_env alone can't tell apart, and the whole reason has_env
+// exists (GRAMMAR.bnf design note 3v).
+test "has_env distinguishes a variable set to \"\" from one that is unset" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\n", try runEnvLookup(&buf, .get_env, "BUTTER_EMPTY", &test_env));
+    try std.testing.expectEqualStrings("true\n", try runEnvLookup(&buf, .has_env, "BUTTER_EMPTY", &test_env));
+    try std.testing.expectEqualStrings("false\n", try runEnvLookup(&buf, .has_env, "BUTTER_MISSING", &test_env));
+}
+
+test "get_env/has_env with no host env at all see every variable as unset" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\n", try runEnvLookup(&buf, .get_env, "BUTTER_HOME", &.{}));
+    try std.testing.expectEqualStrings("false\n", try runEnvLookup(&buf, .has_env, "BUTTER_HOME", &.{}));
+}
+
+test "get_env matches names byte-exactly, including case" {
+    var buf: [64]u8 = undefined;
+    // Windows' own environment lookup is case-insensitive; Butter's is not,
+    // deliberately, so a program reads the same everywhere.
+    try std.testing.expectEqualStrings("\n", try runEnvLookup(&buf, .get_env, "butter_home", &test_env));
+    try std.testing.expectEqualStrings("false\n", try runEnvLookup(&buf, .has_env, "butter_home", &test_env));
+}
+
+test "a repeated name resolves to its first entry" {
+    var buf: [64]u8 = undefined;
+    const dupes = [_]Host.EnvVar{
+        .{ .name = "SHADOWED", .value = "first" },
+        .{ .name = "SHADOWED", .value = "second" },
+    };
+    try std.testing.expectEqualStrings("first\n", try runEnvLookup(&buf, .get_env, "SHADOWED", &dupes));
+}
+
+test "get_env's result is an ordinary heap string, not a borrowed view" {
+    // Concatenating it proves it's a real refcounted string value (the same
+    // kind `add` builds), not a slice aliasing `Host.env`'s own storage —
+    // `Value.newString` is the single choke point that guarantees the copy,
+    // and `std.testing.allocator` catches the leak if the extra reference
+    // this creates is ever mishandled.
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const name_const = try chunk.addConstant(allocator, try Value.newString(allocator, "BUTTER_HOME"));
+    const suffix = try chunk.addConstant(allocator, try Value.newString(allocator, "/bin"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, name_const);
+    _ = try chunk.emit(allocator, .get_env);
+    _ = try chunk.emitWithOperand(allocator, .push_const, suffix);
+    _ = try chunk.emit(allocator, .add);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var vm = Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const program = chunk_mod.Program{ .main = chunk, .functions = &.{} };
+    try vm.run(&program, .{ .out = &writer, .env = &test_env });
+    try std.testing.expectEqualStrings("/opt/butter/bin\n", buf[0..writer.end]);
+}
+
+test "get_env/has_env on a non-string name is TypeMismatch, with no leak" {
+    const allocator = std.testing.allocator;
+    for ([_]chunk_mod.OpCode{ .get_env, .has_env }) |op| {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+
+        // A map, so a rejected operand that isn't decreffed leaks a heap
+        // object `std.testing.allocator` will catch.
+        _ = try chunk.emitWithOperand(allocator, .make_map, 0);
+        _ = try chunk.emit(allocator, op);
+        _ = try chunk.emit(allocator, .halt);
+
+        var buf: [64]u8 = undefined;
+        try std.testing.expectError(RuntimeError.TypeMismatch, runSource(&chunk, &buf));
+    }
 }
 
 // ---- Discarded-operand reference accounting (TODO #9, step 2) ------------

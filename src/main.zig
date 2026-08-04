@@ -32,6 +32,14 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
     const args = try init.minimal.args.toSlice(gpa);
 
+    // The process's own environment, flattened into the plain slice
+    // `Vm.Host` takes (see its `env` field). Snapshotted once here rather
+    // than read per lookup, so a program's view of it can't shift mid-run.
+    const env_vars = try gpa.alloc(butter.vm.Host.EnvVar, init.environ_map.count());
+    for (init.environ_map.keys(), init.environ_map.values(), 0..) |name, value, i| {
+        env_vars[i] = .{ .name = name, .value = value };
+    }
+
     var disassemble = false;
     var use_stdin = false;
     var file_path: ?[]const u8 = null;
@@ -157,6 +165,9 @@ pub fn main(init: std.process.Init) !void {
         // that wants a sandboxed program simply passes no `fs` at all.
         .fs = .{ .io = init.io, .dir = std.Io.Dir.cwd() },
         .args = program_args,
+        // A program run from the CLI inherits this process's environment
+        // whole, the same way it inherits the current directory for `open`.
+        .env = env_vars,
     }) catch |err| {
         // Flush whatever the program managed to produce before the error,
         // so a partial run's output isn't swallowed by the diagnostic.

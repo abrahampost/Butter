@@ -124,6 +124,14 @@ pub const OpCode = enum(u8) {
     parse_int,
     parse_float,
 
+    // Environment variables (ISA.bnf section 15, GRAMMAR.bnf design note
+    // 3v). No operand, for the same reason PUSH_ARGS has none: the
+    // environment lives on the Host passed to `Vm.run`, not in the chunk.
+    // The NAME to look up is an ordinary popped `Value`, so it can be
+    // computed rather than written out as a literal.
+    get_env,
+    has_env,
+
     // `exit <expr>` (ISA.bnf's addendum to section 3). No operand: the
     // requested code is an ordinary popped `Value`, exactly like every
     // other opcode that acts on an expression result rather than a
@@ -479,6 +487,21 @@ test "disassemble renders parse_int and parse_float" {
     try chunk.disassemble(&writer);
 
     try std.testing.expectEqualStrings("0000 parse_int\n0001 parse_float\n", writer.buffered());
+}
+
+test "disassemble renders get_env and has_env" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .get_env);
+    _ = try chunk.emit(allocator, .has_env);
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 get_env\n0001 has_env\n", writer.buffered());
 }
 
 test "Program.deinit frees the main chunk and every function's chunk" {

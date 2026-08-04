@@ -1119,3 +1119,62 @@
    containing no `try` is emitted byte-for-byte as it was before this
    feature existed, and the benchmarks are unchanged.
    ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   15. ENVIRONMENT VARIABLES (GET_ENV, HAS_ENV — one opcode each, no new
+       value kind, no new runtime table; GRAMMAR.bnf design note 3v)
+   -------------------------------------------------------------------------- *)
+
+   GET_ENV                  ( name -- string )  pops name (must be
+                                               string-shaped; TypeMismatch
+                                               otherwise), looks it up in
+                                               `Host.env` (vm.zig) and pushes
+                                               its value as a FRESH heap
+                                               string (section 11). A name
+                                               that isn't set pushes `""` —
+                                               NOT an error, and not NULL, so
+                                               this opcode's result is
+                                               unconditionally a string and
+                                               the compiler can type it as
+                                               one. What `getenv(name)`
+                                               compiles to.
+   HAS_ENV                  ( name -- bool )   pops name (same TypeMismatch
+                                               rule), pushes whether it is
+                                               SET. The only way to tell a
+                                               variable set to the empty
+                                               string from one that doesn't
+                                               exist, since GET_ENV reads
+                                               both as `""` — the same split
+                                               MAP_HAS gives a map (section
+                                               11). What `hasenv(name)`
+                                               compiles to.
+
+   NEITHER TAKES AN OPERAND, for the reason PUSH_ARGS doesn't: the
+   environment is live `Vm.run` state rather than anything in the chunk, so
+   there is nothing for the compiler to fold. The NAME is likewise an
+   ordinary popped value, not a constant-pool index, which is what lets it
+   be computed (`getenv("BUTTER_" + setting)`).
+
+   `Host.env` IS A FLAT SLICE of name/value pairs, not a hash map, and
+   lookup is a linear scan. A program reads a handful of variables at
+   startup, never one per loop iteration the way it reads a stack slot, so
+   the constant factor is irrelevant and this keeps the whole `Host` plain
+   injected data. A repeated name resolves to its FIRST entry. Comparison is
+   byte-exact on every platform, Windows included (GRAMMAR.bnf design note
+   3v explains why).
+
+   REFCOUNTS. Each pops and decrefs its own name operand (`Vm.pop`'s usual
+   convention, section 14's addendum). GET_ENV's result is a fresh copy of
+   the value, never a slice aliasing `Host.env`'s own storage — the same
+   guarantee PUSH_ARGS's strings carry, and what lets the returned string
+   outlive the slice the embedder passed in. HAS_ENV touches the heap not at
+   all: its result is a plain scalar BOOL.
+
+   NOT A CAPABILITY GATE, unlike `Host.fs` (section 10). An absent
+   `Host.env` is simply an EMPTY environment — every variable unset — rather
+   than a refusal like FilesUnavailable, because a program cannot tell the
+   two apart and there is nothing to refuse: reading a variable that isn't
+   there has no effect outside the VM. There is no SET_ENV counterpart;
+   these two opcodes are read-only, and the environment cannot be enumerated.
+   ========================================================================== *)

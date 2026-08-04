@@ -598,6 +598,7 @@ pub const Parser = struct {
     ///         | <open-expr> | <push-expr> | <keys-expr> | <has-expr>
     ///         | <delete-expr> | <json-expr> | <stringify-expr>
     ///         | <int-expr> | <float-expr>
+    ///         | <getenv-expr> | <hasenv-expr>
     ///         | 'stdin' | 'stdout' | 'stderr' | 'args' | IDENTIFIER
     fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
@@ -657,6 +658,8 @@ pub const Parser = struct {
             .kw_stringify => return self.stringifyExpr(),
             .kw_int => return self.intParseExpr(),
             .kw_float => return self.floatParseExpr(),
+            .kw_getenv => return self.getenvExpr(),
+            .kw_hasenv => return self.hasenvExpr(),
             .kw_stdin => {
                 _ = self.advance();
                 return self.createExpr(.{ .stream_literal = .stdin });
@@ -931,6 +934,29 @@ pub const Parser = struct {
         const value = try self.expression();
         _ = try self.expect(.rparen, "expected ')' after the value to parse");
         return self.createExpr(.{ .float_parse = value });
+    }
+
+    /// <getenv-expr> ::= 'getenv' '(' <expression> ')'
+    ///
+    /// Unlike `int`/`float` above, `getenv` is a keyword in expression
+    /// position ONLY — nothing dispatches on it before expression parsing
+    /// begins — so a bare `getenv("HOME")` is a legal (if pointless)
+    /// <expr-stmt> too, the same as `keys(m)` is.
+    fn getenvExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'getenv'
+        _ = try self.expect(.lparen, "expected '(' after 'getenv'");
+        const name = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the variable name");
+        return self.createExpr(.{ .env_get = name });
+    }
+
+    /// <hasenv-expr> ::= 'hasenv' '(' <expression> ')'
+    fn hasenvExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'hasenv'
+        _ = try self.expect(.lparen, "expected '(' after 'hasenv'");
+        const name = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the variable name");
+        return self.createExpr(.{ .env_has = name });
     }
 };
 
@@ -1432,6 +1458,25 @@ test "int(...)/float(...) work fine nested inside a statement" {
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
     try std.testing.expectEqualStrings("42", result.program[0].kind.print_stmt.int_parse.literal.string);
+}
+
+test "parses getenv(...)/hasenv(...) as expressions" {
+    try expectExprSexpr("getenv(\"HOME\")", "(getenv \"HOME\")");
+    try expectExprSexpr("hasenv(\"HOME\")", "(hasenv \"HOME\")");
+    try expectExprSexpr("getenv(name)", "(getenv name)");
+    try expectExprSexpr("getenv(\"BUTTER_\" + suffix)", "(getenv (+ \"BUTTER_\" suffix))");
+}
+
+test "getenv(x) CAN stand alone as a top-level statement, unlike int(x)" {
+    // Nothing dispatches on kw_getenv before expression parsing begins (it
+    // isn't a <type> keyword the way `int`/`float` are), so this reaches
+    // exprStatement and parses as an ordinary discarded expression.
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "getenv(\"HOME\")\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.program.len);
+    try std.testing.expectEqualStrings("HOME", result.program[0].kind.expr_stmt.env_get.literal.string);
 }
 
 test "parses 'null' as a literal" {

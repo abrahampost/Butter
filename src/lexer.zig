@@ -47,6 +47,8 @@ pub const TokenType = enum {
     kw_stringify,
     kw_null,
     kw_args,
+    kw_getenv,
+    kw_hasenv,
     kw_exit,
     kw_try,
     kw_catch,
@@ -119,6 +121,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "stringify", .kw_stringify },
     .{ "null", .kw_null },
     .{ "args", .kw_args },
+    .{ "getenv", .kw_getenv },
+    .{ "hasenv", .kw_hasenv },
     .{ "exit", .kw_exit },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
@@ -573,6 +577,12 @@ test "the three stream names are recognized as keywords" {
 
 test "'args' is recognized as a keyword" {
     try expectTokenTypes("args argsx", &.{ .kw_args, .identifier, .eof });
+}
+
+test "'getenv' and 'hasenv' are recognized as keywords" {
+    try expectTokenTypes("getenv hasenv getenvx hasenvx env", &.{
+        .kw_getenv, .kw_hasenv, .identifier, .identifier, .identifier, .eof,
+    });
 }
 
 test "'exit' is recognized as a keyword" {

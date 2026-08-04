@@ -172,6 +172,19 @@ pub const Expr = union(enum) {
     /// `float(value)` — the `float` counterpart to `int_parse`, parsing a
     /// `string` as a floating-point literal.
     float_parse: *Expr,
+    /// `getenv(name)` (GRAMMAR.bnf design note 3v) — the value of the
+    /// environment variable `name`, as a fresh heap `string`, or `""` when
+    /// it isn't set. Like `args_literal` this reads live `Host` state at run
+    /// time (GET_ENV, ISA.bnf section 15) rather than anything the compiler
+    /// could fold; unlike it, it takes an operand, so it's shaped like the
+    /// `json`/`stringify`/`int`/`float` special forms above instead of being
+    /// a bare keyword.
+    env_get: *Expr,
+    /// `hasenv(name)` — whether that variable is SET, which `env_get` alone
+    /// can't answer: a variable set to the empty string and one that doesn't
+    /// exist both read as `""`. The same split `map_has` gives a map
+    /// (GRAMMAR.bnf design note 3v).
+    env_has: *Expr,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -557,6 +570,16 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
         },
         .float_parse => |e| {
             try writer.writeAll("(float ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .env_get => |e| {
+            try writer.writeAll("(getenv ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .env_has => |e| {
+            try writer.writeAll("(hasenv ");
             try printExpr(writer, e);
             try writer.writeAll(")");
         },

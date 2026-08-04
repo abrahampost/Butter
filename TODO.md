@@ -138,13 +138,40 @@ live leak once a handler resumes. The invariant is documented on `Vm.pop`.
 
 ## P2 — meaningful but not blocking
 
-### 10. Environment variable access
-No `getenv`-equivalent exists anywhere in the stdlib or VM.
-- Add a `getenv(name)` builtin (returning `string`, with a defined
-  behavior for an unset variable — e.g. empty string, or paired with a
-  `hasenv`-style check).
-- Document in GRAMMAR.bnf/ISA.bnf; add an integration test that sets an
-  env var before invoking the test binary.
+### 10. Environment variable access — DONE
+`getenv(name)` and `hasenv(name)` are now special-form expressions (parsed
+like `json`/`stringify`, GRAMMAR.bnf design note 3v) compiling to new
+`GET_ENV`/`HAS_ENV` opcodes (ISA.bnf section 15). `getenv` evaluates to a
+fresh `string` — `""` for an unset variable, never `null` and never an
+error, so its static type is unconditionally `string`; `hasenv` evaluates to
+`bool` and is the only way to tell an exported-but-empty variable from an
+absent one (the `has(map, key)` split, taken for the same reason —
+`KeyNotFound` was rejected because a missing variable is the common case,
+and the default-then-override pattern would otherwise need a `try`/`catch`
+per lookup). The name is an arbitrary expression, so a prefixed namespace of
+settings can be swept in a loop; a non-string name is
+`RuntimeError.TypeMismatch`.
+
+The environment is injected as `Vm.Host.env` (a flat name/value slice, the
+same shape `Host.args` has), snapshotted before the program starts;
+[src/main.zig](src/main.zig) hands over this process's environment whole.
+An embedder that supplies none gets an empty environment rather than a
+refusal — deliberately not a capability gate like `Host.fs`, since a program
+can't tell the two apart and reading an absent variable has no effect
+outside the VM. Lookup is byte-exact on every platform, Windows included, so
+one program reads the same everywhere. Read-only: there is no `setenv`, and
+the environment can't be enumerated.
+
+Covered by lexer/parser/compiler/VM unit tests (set/unset/set-but-empty,
+computed names, case sensitivity, first-wins on a repeated name, non-string
+names released rather than leaked, static types checked against a declared
+type) and the `env` integration case under `tests/cases/`, plus
+`examples/env_vars.butter`. The integration case injects its environment
+through the `Host` rather than exporting a variable into the test process —
+the same way the `args` cases inject argv — so it stays deterministic
+regardless of what the machine running the suite has exported; the real
+process-environment path through `main.zig` was verified by running the
+built binary with a variable set.
 
 ### 11. Subprocess/exec support
 No way to shell out to another program. This blocks a large class of CLI

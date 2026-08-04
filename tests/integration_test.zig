@@ -72,6 +72,49 @@ fn expectCaseOutputWithArgs(comptime name: []const u8, args: []const []const u8)
     try std.testing.expectEqualStrings(expected, actual);
 }
 
+/// Same as `run`, but with `env` available to the program via
+/// `getenv`/`hasenv` (ISA.bnf section 15) instead of the default empty
+/// environment.
+///
+/// Injected rather than set on this test process: the VM never reads a
+/// process-wide environment itself (`Vm.Host`'s whole point), so a case
+/// driven this way is deterministic and can't be perturbed by whatever the
+/// machine running the suite happens to have exported — the same reason
+/// `runWithArgs` hands `args` over directly instead of re-invoking the CLI.
+fn runWithEnv(allocator: std.mem.Allocator, source: []const u8, env: []const butter.vm.Host.EnvVar) ![]u8 {
+    var loader = butter.module.Loader.init(allocator, std.testing.io, std.Io.Dir.cwd());
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(source, "<test>", ".");
+    const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry);
+
+    var compiler = butter.compiler.Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(modules.entry_index, modules.units);
+    defer compiled.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    var vm = butter.vm.Vm.init(allocator);
+    try vm.run(&compiled, .{ .out = &out.writer, .env = env });
+
+    return out.toOwnedSlice();
+}
+
+/// Same as `expectCaseOutput`, but running with `env` available to the
+/// program as `getenv`/`hasenv`.
+fn expectCaseOutputWithEnv(comptime name: []const u8, env: []const butter.vm.Host.EnvVar) !void {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("cases/" ++ name ++ ".butter");
+    const expected = @embedFile("cases/" ++ name ++ ".expected");
+
+    const actual = try runWithEnv(allocator, source, env);
+    defer allocator.free(actual);
+
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
 /// Runs tests/cases/<name>.butter with a real filesystem available to it,
 /// rooted at a scratch directory of its own that is deleted afterward.
 ///
@@ -211,6 +254,22 @@ test "args: with no host args, 'args' is an empty list" {
     const actual = try run(allocator, "print len(args)\n");
     defer allocator.free(actual);
     try std.testing.expectEqualStrings("0\n", actual);
+}
+
+test "env: getenv/hasenv drive an override-the-default config pattern" {
+    try expectCaseOutputWithEnv("env", &.{
+        .{ .name = "EDITOR", .value = "vim" },
+        .{ .name = "QUIET", .value = "" },
+        .{ .name = "BUTTER_WIDTH", .value = "40" },
+        .{ .name = "HOME", .value = "/home/ada" },
+    });
+}
+
+test "env: with no host env, every variable is unset" {
+    const allocator = std.testing.allocator;
+    const actual = try run(allocator, "print hasenv(\"HOME\")\nprint len(getenv(\"HOME\"))\n");
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings("false\n0\n", actual);
 }
 
 // ---- exit_code: a grep-style tool built on `args` + `exit` ------------

@@ -40,7 +40,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'stdin' | 'stdout' | 'stderr' | 'append'
                | 'map' | 'list' | 'push' | 'keys' | 'has' | 'delete'
                | 'json' | 'stringify' | 'null' | 'args' | 'exit'
-               | 'try' | 'catch'
+               | 'try' | 'catch' | 'getenv' | 'hasenv'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -191,6 +191,8 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <stringify-expr>
                       | <int-expr>
                       | <float-expr>
+                      | <getenv-expr>
+                      | <hasenv-expr>
                       | 'stdin' | 'stdout' | 'stderr'
                       | 'args'
                       | IDENTIFIER
@@ -241,6 +243,13 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    `y := int(x)`, ...). *)
 <int-expr>          ::= 'int' '(' <expression> ')'
 <float-expr>        ::= 'float' '(' <expression> ')'
+
+(* Environment variables (design note 3v). Unlike `int`/`float`, neither of
+   these is also a <type> keyword, so nothing dispatches on them before
+   expression parsing begins and a bare `getenv("X")` IS a legal <expr-stmt>
+   — same as `keys(m)`. *)
+<getenv-expr>       ::= 'getenv' '(' <expression> ')'
+<hasenv-expr>       ::= 'hasenv' '(' <expression> ')'
 
 
 (* --------------------------------------------------------------------------
@@ -458,6 +467,37 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    - Every `args` occurrence builds its own independent list — mutating one
      (`push`, index-assignment) never affects another read elsewhere in the
      same program, unlike aliasing a `list`/`map` local via `b := a`. *)
+
+(* --- Environment variables (design note 3v) ---
+   - `getenv(name)` evaluates to the value of the environment variable
+     `name` as a fresh `string`, and `hasenv(name)` to whether it is SET
+     (ISA.bnf section 15). Both take an <expression>, not a literal, so a
+     computed name (`getenv("BUTTER_" + setting)`) works — which is what
+     makes sweeping a prefixed namespace of settings in a loop possible.
+   - AN UNSET VARIABLE READS AS `""`, never `null` and never an error, so
+     `getenv` alone cannot tell "unset" from "set to the empty string".
+     That distinction is real (an exported-but-empty variable is a
+     deliberate setting on every shell), so `hasenv` exists to answer it —
+     exactly the split `has(map, key)` gives a map, and for the same reason.
+     `getenv` was NOT made to raise `KeyNotFound` instead: unlike a map
+     read, a missing variable is the overwhelmingly common case, and the
+     default-then-override pattern every CLI tool uses would otherwise need
+     a `try`/`catch` around each lookup.
+   - `name` must be a `string` at run time (`RuntimeError.TypeMismatch`
+     otherwise). It isn't checked at COMPILE time, matching `has`/`delete`'s
+     own key argument, which isn't either.
+   - LOOKUP IS BYTE-EXACT ON EVERY PLATFORM, including Windows, whose own
+     environment is case-insensitive: `getenv("path")` finds nothing on any
+     host where the variable is spelled `Path`. Deliberate — one Butter
+     program should read the same everywhere, and a case rule that varies by
+     host is a portability trap that only shows up on the other machine.
+   - The environment is whatever the embedder supplies (`Vm.Host.env`),
+     snapshotted before the program starts rather than read live, so it
+     cannot shift mid-run. The CLI (src/main.zig) hands over this process's
+     environment whole, the same way it hands over the current directory for
+     `open`. An embedder that supplies none gets an empty environment: every
+     variable unset. There is no way for a program to SET a variable, list
+     every name, or affect its own parent — reading is the whole feature. *)
 
 (* --- Process exit code ---
    - `exit <expression>` halts the entire program immediately, from
