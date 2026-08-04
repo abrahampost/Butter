@@ -108,24 +108,31 @@ unterminated-after-backslash, invalid escape) and parser unit tests
 the string), plus the `escapes` integration case under `tests/cases/`
 exercising embedded newlines and tabs end to end.
 
-### 9. Error recovery (try/catch or Result-style handling)
-Every `RuntimeError` (`IndexOutOfBounds`, `KeyNotFound`, `TypeMismatch`,
-`JsonParseFailed`, divide-by-zero, etc.) aborts the whole process
-immediately — see the `RuntimeError` enum and its call sites throughout
-[src/vm.zig](src/vm.zig). There's no way for a program to attempt a
-fallible operation and continue on failure, beyond manually guarding with
-`has()` before a map read.
-- This is a genuine language-design task, not a small addition — treat it
-  as its own design spike before implementation. Options to weigh:
-  a `try <expr> else <block>` statement form, a checked-variant of each
-  fallible builtin (`tryOpen`, etc.) returning a sentinel, or a minimal
-  `Result`-shaped map convention built entirely in stdlib.
-- Write a short design note (comparable to the existing GRAMMAR.bnf
-  section 3 notes) proposing the chosen approach before touching the
-  parser/compiler/VM.
-- Once a design is chosen: update GRAMMAR.bnf, ISA.bnf, compiler.zig,
-  vm.zig, and add both unit and integration tests covering at least one
-  case per existing `RuntimeError` variant.
+### 9. Error recovery (try/catch or Result-style handling) — DONE
+`try <block> catch IDENTIFIER <block>` (GRAMMAR.bnf design note 3u) traps a
+runtime error raised anywhere inside its body — at any depth, including
+several call frames deep — and binds a fresh `map` describing it, with four
+always-present keys: `error` (the `RuntimeError` tag name, the stable thing
+to branch on), `message`, `operation`, and `path`. The alternatives weighed
+and rejected, and why, are in `DESIGN-error-recovery.md`, the design spike
+this task asked for.
+
+19 of the 23 `RuntimeError` variants are catchable; `StackOverflow`,
+`StackUnderflow`, `CallStackOverflow` and `HandlerStackOverflow` are not
+(VM-integrity failures — running a handler needs the stack room that just
+ran out), nor is `error.OutOfMemory` (building the error map allocates).
+Two new opcodes, `PUSH_HANDLER`/`POP_HANDLER` (ISA.bnf section 14), over a
+64-entry handler table beside the call frames; `RET` drops the departing
+frame's handlers, which covers every way out of a frame by construction.
+Covered by lexer/parser/compiler/VM unit tests, the `try_catch` integration
+case (15 variants caught and identified by tag, running against a real
+scratch filesystem via the harness's new `expectCaseOutputWithFs`), and
+`examples/error_handling.butter`.
+
+Landing this also fixed nine latent refcount leaks in the VM: an
+instruction that popped a value and then failed used to strand the
+reference, which was harmless while every error killed the process and is a
+live leak once a handler resumes. The invariant is documented on `Vm.pop`.
 
 ---
 

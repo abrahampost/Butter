@@ -1,0 +1,154 @@
+# try/catch (GRAMMAR.bnf design note 3u, ISA.bnf section 14) — one case
+# per catchable RuntimeError variant a Butter program can actually raise.
+#
+# Four catchable variants are deliberately absent, because no program text
+# can provoke them: FilesUnavailable needs an embedder that supplied no
+# filesystem, StreamWriteFailed needs an output stream that fails mid-write
+# (both covered by unit tests in src/compiler.zig), and StreamReadFailed and
+# FileCloseFailed need a genuine OS-level I/O failure — src/vm.zig's
+# catchability-table test is the only per-variant coverage those two can
+# get. The four NON-catchable variants have their own escape tests in
+# src/vm.zig; by construction none of them can appear here, since a program
+# that raises one never reaches its next line.
+
+# Prints the variant name if it's the one that was expected, and something
+# unmissable otherwise — so the .expected file is just the list of names,
+# and any drift reads as an error rather than as a reordering.
+func show(string want, map e) -> int {
+    if e["error"] == want {
+        print want
+    } else {
+        print "MISMATCH: wanted " + want + ", got " + e["error"]
+    }
+    return 0
+}
+
+# A map element is dynamically typed, so reading one is the only shape the
+# static type checker (design note 3t) leaves for the runtime to reject.
+map dyn := {"flag": true}
+
+# --- Arithmetic and indexing -----------------------------------------
+
+try {
+    print dyn["flag"] + 1
+} catch e {
+    show("TypeMismatch", e)
+}
+
+try {
+    print 1 / 0
+} catch e {
+    show("DivisionByZero", e)
+}
+
+try {
+    int big := 9223372036854775807
+    print big + 1
+} catch e {
+    show("Overflow", e)
+}
+
+try {
+    list xs := [1, 2]
+    print xs[9]
+} catch e {
+    show("IndexOutOfBounds", e)
+}
+
+try {
+    int[1] bad
+    bad[0] := 300
+    print write(stdout, bad, 1)
+} catch e {
+    show("ByteOutOfRange", e)
+}
+
+# --- Maps, JSON, and parsing -----------------------------------------
+
+try {
+    print dyn["missing"]
+} catch e {
+    show("KeyNotFound", e)
+}
+
+try {
+    int[1] partial
+    partial[0] := 123
+    print json(partial, 1)
+} catch e {
+    show("JsonParseFailed", e)
+}
+
+try {
+    print int("not a number")
+} catch e {
+    show("NumberParseFailed", e)
+}
+
+try {
+    exit 999
+} catch e {
+    show("InvalidExitCode", e)
+}
+
+# --- Files and streams -----------------------------------------------
+
+try {
+    int missing := open("no_such_file.txt", read)
+} catch e {
+    show("FileOpenFailed", e)
+    # The only two variants that carry a Diagnostic all the way through:
+    # every other error above leaves both of these empty.
+    print "  " + e["operation"] + " " + e["path"]
+}
+
+int seed := open("data.txt", write)
+write(seed, "hello")
+close seed
+
+try {
+    int w := open("out.txt", write)
+    int[4] rb
+    print read(w, rb)
+} catch e {
+    show("StreamNotReadable", e)
+}
+
+try {
+    int r := open("data.txt", read)
+    print write(r, "x")
+} catch e {
+    show("StreamNotWritable", e)
+}
+
+try {
+    int c := open("data.txt", read)
+    close c
+    int[4] cb
+    print read(c, cb)
+} catch e {
+    show("StreamClosed", e)
+}
+
+# `close stdout` is rejected by the compiler outright; routing it through a
+# local is what reaches the runtime check instead.
+try {
+    int s := stdout
+    close s
+} catch e {
+    show("CannotCloseStandardStream", e)
+}
+
+# Last, because the handles it leaks stay open for the rest of the run —
+# there is no way to close a stream whose handle was never kept.
+try {
+    for i in 0..99 {
+        int f := open("data.txt", read)
+    }
+} catch e {
+    show("TooManyOpenFiles", e)
+}
+
+# The program survived all fifteen: without try/catch, any one of them
+# would have killed it on the spot.
+print "all handled"

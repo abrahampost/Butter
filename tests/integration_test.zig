@@ -72,6 +72,51 @@ fn expectCaseOutputWithArgs(comptime name: []const u8, args: []const []const u8)
     try std.testing.expectEqualStrings(expected, actual);
 }
 
+/// Runs tests/cases/<name>.butter with a real filesystem available to it,
+/// rooted at a scratch directory of its own that is deleted afterward.
+///
+/// The other case runners deliberately supply no `Host.fs`, so `open` in
+/// them is `RuntimeError.FilesUnavailable` — fine for cases that never
+/// touch a file, but the file and stream errors can't be reached that way
+/// at all. The scratch directory lives under `.zig-cache` (already
+/// gitignored, already this build's own scratch space), and is named after
+/// the case so two of them could never collide.
+fn expectCaseOutputWithFs(comptime name: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("cases/" ++ name ++ ".butter");
+    const expected = @embedFile("cases/" ++ name ++ ".expected");
+
+    const io = std.testing.io;
+    const scratch_path = ".zig-cache/butter-test-" ++ name;
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, scratch_path) catch {}; // left over from an interrupted run
+    var scratch = try cwd.createDirPathOpen(io, scratch_path, .{});
+    defer {
+        scratch.close(io);
+        cwd.deleteTree(io, scratch_path) catch {};
+    }
+
+    var loader = butter.module.Loader.init(allocator, io, cwd);
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(source, "<test>", ".");
+    const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry);
+
+    var compiler = butter.compiler.Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(modules.entry_index, modules.units);
+    defer compiled.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    var vm = butter.vm.Vm.init(allocator);
+    try vm.run(&compiled, .{ .out = &out.writer, .fs = .{ .io = io, .dir = scratch } });
+
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
 /// Runs `source` with `args` and returns both everything it printed and
 /// the process exit code it requested via `exit` (ISA.bnf's EXIT) — `null`
 /// for a program that falls off the end (an ordinary HALT) without ever
@@ -151,6 +196,10 @@ test "parse_numbers: int(...)/float(...) parse strings into numbers" {
 
 test "escapes: \\n/\\t/\\\\/\\\" decode inside string literals" {
     try expectCaseOutput("escapes");
+}
+
+test "try_catch: one caught case per catchable RuntimeError a program can raise" {
+    try expectCaseOutputWithFs("try_catch");
 }
 
 test "args: the bare 'args' keyword sees the host's argv, in order" {

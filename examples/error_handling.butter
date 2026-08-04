@@ -1,0 +1,70 @@
+# Error handling: the shape a real CLI tool wants — attempt something
+# fallible, and on failure report WHY on stderr and exit non-zero, instead
+# of dying with a VM error message the user can't act on. GRAMMAR.bnf
+# design note 3u; ISA.bnf section 14.
+#
+#   zig build run -- examples/error_handling.butter -- examples/data.json
+#   zig build run -- examples/error_handling.butter -- no_such_file.json
+#   zig build run -- examples/error_handling.butter
+#
+# Every failure below — a missing argument aside — was fatal before
+# try/catch existed: `open` on a missing file, `json` on malformed bytes,
+# and a bracket-read of an absent key each terminated the whole program.
+
+list argv := args
+
+if len(argv) == 0 {
+    write(stderr, "usage: error_handling.butter <file.json>\n")
+    exit 2
+}
+
+string path := argv[0]
+
+# `open` and `read` are guarded together, since either can fail and the
+# report reads the same either way. `buf` and `n` are declared OUTSIDE the
+# try block: a local declared inside it wouldn't be in scope afterward, and
+# more to the point might never have been initialized.
+int[512] buf
+int n := 0
+
+try {
+    int f := open(path, read)
+    n := read(f, buf)
+    close f
+} catch e {
+    # "operation" and "path" are what make a file error actionable — they
+    # name what was being attempted and to what. Both are always present
+    # (empty for an error that carries no such detail), so neither needs a
+    # has() guard first.
+    write(stderr, "cannot read " + e["path"] + ": " + e["message"] + "\n")
+    exit 1
+}
+
+# A separate handler, because "the file isn't there" and "the file isn't
+# JSON" deserve different wording — the whole point of scoping a handler to
+# a block rather than to the program.
+map doc := {}
+
+try {
+    doc := json(buf, n)
+} catch e {
+    write(stderr, path + " is not valid JSON (" + e["error"] + ")\n")
+    exit 1
+}
+
+# Branching on "error" rather than on "message": the tag name is the stable
+# thing to compare against, while the message's exact wording isn't a
+# compatibility promise.
+try {
+    print "name:   " + doc["name"]
+    print "absent: " + doc["nope"]
+} catch e {
+    if e["error"] == "KeyNotFound" {
+        print "(that key is missing, which this tool treats as fine)"
+    } else {
+        write(stderr, "unexpected: " + e["message"] + "\n")
+        exit 1
+    }
+}
+
+print "done"

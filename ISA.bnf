@@ -202,6 +202,26 @@
                                                (section 4). TypeMismatch if
                                                the peeked value isn't BOOL.
 
+   PUSH_HANDLER #target                       pushes a handler onto the
+                                               handler stack (section 14),
+                                               recording the current chunk,
+                                               `target` (the catch block's
+                                               entry offset in it), sp, bp,
+                                               frame count and return width —
+                                               everything needed to resume
+                                               there later. No effect on the
+                                               value stack.
+                                               HandlerStackOverflow past 64
+                                               live handlers, which is itself
+                                               NOT catchable.
+   POP_HANDLER                                discards the innermost handler.
+                                               Emitted where a try body falls
+                                               off its end normally; a RET
+                                               out of the frame drops the
+                                               frame's handlers on its own
+                                               (section 14), so no other exit
+                                               needs one.
+
    CALL         #func_index  ( arg1 ... argN -- result )
                                                the N arguments (N = the
                                                callee's arity) are already on
@@ -223,6 +243,11 @@
                                                the caller's stack. Every
                                                function chunk is guaranteed by
                                                the compiler to end in a RET.
+                                               Also drops every handler
+                                               belonging to the departing
+                                               frame (section 14) — a
+                                               `return` out of a try block is
+                                               what makes this necessary.
 
    PRINT                  ( v -- )            pops v, decrefs it, writes it
                                                followed by a newline, always
@@ -443,6 +468,30 @@
        JUMP  loop_start
      exit_target:
        POP
+
+   try-stmt (body, error binding, handler — section 14):
+
+       PUSH_HANDLER  catch_target
+       <try body>                   (* its own scope; locals POPped at end *)
+       POP_HANDLER
+       JUMP  end_target
+     catch_target:
+       <catch body>                 (* the error map is ALREADY on the stack,
+                                       pushed by the VM while unwinding, and
+                                       IS the binding's local slot *)
+       POP                          (* discard the binding, via the normal
+                                       end-of-scope pop *)
+     end_target:
+
+   The binding needs no STORE_LOCAL and no opcode of its own. At the `try`
+   statement the compiler's next free slot is some N; the try body's own
+   locals occupy N upward and are popped at its end, so the catch block is
+   compiled with the next free slot back at N and declares the binding
+   there. At run time a statement boundary always has sp == bp + N (locals
+   below, no live temporaries), so the sp PUSH_HANDLER recorded is exactly
+   the binding's address — unwinding restores that sp and then pushes the
+   error map, landing it precisely in slot N. The end-of-scope POP then
+   discards it with no special case.
 
    'and' (short-circuits a false left operand without evaluating right):
 
@@ -981,4 +1030,92 @@
    design note 3r). Neither opcode touches the heap or any refcount beyond
    decreffing its own popped string operand (`Vm.pop`'s usual convention) —
    the pushed result is a plain scalar INT/FLOAT either way.
+
+
+(* --------------------------------------------------------------------------
+   14. ERROR HANDLING (PUSH_HANDLER, POP_HANDLER — section 3; one new runtime
+       table, no new value kind)
+   -------------------------------------------------------------------------- *)
+
+   What `try <block> catch IDENTIFIER <block>` (GRAMMAR.bnf design note 3u)
+   lowers to. The codegen pattern is in section 4; this section is the
+   runtime half.
+
+   THE HANDLER STACK is a fixed array of 64 entries beside the call frames
+   (vm.zig's `Exec`), sized like the open-file table (section 10) and for
+   the same reason: the VM has no allocator at run time. Each entry records
+   the chunk, the catch block's entry offset in it, sp, bp, frame count, and
+   return width. Exceeding 64 live handlers is `HandlerStackOverflow`.
+
+   The limit has to be a RUNTIME one rather than a compile-time one: lexical
+   `try` nesting within a chunk is bounded and countable, but recursion
+   through a function that itself contains a `try` is not.
+
+   UNWINDING. When the dispatch loop sees a CATCHABLE error (below) and the
+   handler stack is non-empty, it takes the innermost handler H and:
+
+     1. pops H;
+     2. decrefs stack[H.sp .. sp] and sets sp = H.sp — the same loop that
+        already runs over the whole stack at HALT/EXIT, just bounded below;
+        correct across frames for the same reason it is there, since the
+        physical stack is one flat array;
+     3. restores chunk, bp, frame count and return width from H, and sets
+        ip = H.ip;
+     4. clears `Vm.diagnostic`, so a later detail-free uncaught error can't
+        report stale detail from an earlier caught one;
+     5. builds the error map and pushes it — landing it at exactly the slot
+        the compiler allocated for the binding (section 4);
+     6. continues the loop.
+
+   Note what is NOT restored: the open-file table. A stream can legitimately
+   outlive the block that opened it, and the VM cannot tell that case apart
+   from one that can't (GRAMMAR.bnf design note 3u). Every still-open file is
+   flushed and closed at HALT/EXIT as always.
+
+   THE ERROR MAP is an ordinary heap map (section 11) with four string-keyed
+   entries, always all present: "error" (the RuntimeError tag name, via
+   `@errorName`), "message" (rendered exactly the way the CLI renders an
+   uncaught error, so a caught-and-reported one reads identically), and
+   "operation"/"path" from `Vm.diagnostic`, `""` when there is none. No new
+   value kind is involved — it is the same map a `{...}` literal builds.
+
+   CATCHABLE vs NOT. Nineteen RuntimeError variants are catchable:
+   TypeMismatch, DivisionByZero, Overflow, IndexOutOfBounds, ByteOutOfRange,
+   StreamReadFailed, StreamWriteFailed, FileOpenFailed, TooManyOpenFiles,
+   FileCloseFailed, StreamNotReadable, StreamNotWritable, StreamClosed,
+   CannotCloseStandardStream, FilesUnavailable, KeyNotFound, JsonParseFailed,
+   NumberParseFailed, InvalidExitCode.
+
+   Four are not: StackOverflow, StackUnderflow, CallStackOverflow, and
+   HandlerStackOverflow. These are VM-integrity failures rather than program
+   conditions, and running a catch block requires the very stack room that
+   has just been exhausted. Neither is `error.OutOfMemory` — it is not a
+   RuntimeError at all (it comes from the Zig allocator), and building the
+   error map itself allocates, so a handler for it could not run. The
+   catchable set is enumerated explicitly in vm.zig rather than tested by
+   exclusion, so adding a RuntimeError forces a decision about it.
+
+   EXIT is not in either list: it is not an error. It returns from `Vm.run`
+   normally (section 3's EXIT entry), which bypasses the handler stack with
+   no special case — `exit` inside a try block still halts the program.
+
+   RET DROPS STALE HANDLERS. A `return` from inside a try block would
+   otherwise leave that frame's handler installed with an ip into a chunk
+   that is no longer running. RET therefore pops every handler whose
+   recorded frame count exceeds the post-return frame count. Doing this at
+   run time rather than making the compiler emit a POP_HANDLER before each
+   in-try `return` keeps it correct for every path out of a frame by
+   construction. Butter has no `break` or `continue`, so `return`, `exit`,
+   and falling off the end are the only ways to leave a try block other than
+   the error path itself, and the latter two need nothing.
+
+   A stale or spent handler is worth testing for deliberately, because it is
+   NOT observable through the reported error alone: a failure that lands in a
+   dead catch block usually re-raises or re-reaches the same condition and
+   reports the identical error. Detecting it takes a side effect inside the
+   handler that should never run.
+
+   COST WHEN UNUSED is one comparison per RET and nothing else — a program
+   containing no `try` is emitted byte-for-byte as it was before this
+   feature existed, and the benchmarks are unchanged.
    ========================================================================== *)

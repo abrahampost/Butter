@@ -1,0 +1,17 @@
+TypeMismatch
+DivisionByZero
+Overflow
+IndexOutOfBounds
+ByteOutOfRange
+KeyNotFound
+JsonParseFailed
+NumberParseFailed
+InvalidExitCode
+FileOpenFailed
+  open no_such_file.txt
+StreamNotReadable
+StreamNotWritable
+StreamClosed
+CannotCloseStandardStream
+TooManyOpenFiles
+all handled

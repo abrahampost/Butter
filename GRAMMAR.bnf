@@ -40,6 +40,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'stdin' | 'stdout' | 'stderr' | 'append'
                | 'map' | 'list' | 'push' | 'keys' | 'has' | 'delete'
                | 'json' | 'stringify' | 'null' | 'args' | 'exit'
+               | 'try' | 'catch'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -75,6 +76,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <if-stmt>
                       | <while-stmt>
                       | <for-stmt>
+                      | <try-stmt>
                       | <statement>
 
 (* A parameter's or the return type's array suffix is '[' INT ']' (fixed
@@ -107,6 +109,11 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    once at loop entry. IDENTIFIER introduces a fresh loop-scoped int. *)
 <for-stmt>          ::= 'for' IDENTIFIER 'in' <expression> '..' <expression>
                         <declaration>
+
+(* Both halves take a mandatory <block>, not the bare <declaration> that
+   if/while/for accept — see design note 3u. The IDENTIFIER binding is
+   mandatory too; a handler that doesn't want it writes `catch _ { ... }`. *)
+<try-stmt>          ::= 'try' <block> { NEWLINE } 'catch' IDENTIFIER <block>
 
 <statement>         ::= <print-stmt>
                       | <close-stmt>
@@ -530,4 +537,64 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      unchecked here, and the existing runtime `RuntimeError.TypeMismatch`
      checks remain the only guard for those, exactly as before this feature
      existed. *)
+
+(* --- Error recovery: try/catch (design note 3u) ---
+   - `try <block> catch IDENTIFIER <block>` runs its first block; if a
+     CATCHABLE runtime error is raised while it does — at any depth,
+     including inside a function it calls, and inside a function that one
+     calls — execution abandons the rest of that block and continues at the
+     first statement of the catch block, with IDENTIFIER bound to a fresh
+     `map` describing the failure. A try block that completes without error
+     skips the catch block entirely. This is the only way a Butter program
+     can observe a `RuntimeError` at all; before it, every one of them
+     killed the process.
+   - BOTH HALVES TAKE MANDATORY BRACES, unlike `if`/`while`/`for`, which
+     accept a bare <declaration>: both are load-bearing scopes (the catch
+     block's is what the binding lives in), and a braceless try body reads
+     ambiguously next to the `catch` that has to follow it. The binding is
+     likewise mandatory — `catch _ { ... }` for a handler that ignores it —
+     rather than adding a second production and a second codegen path to
+     save one identifier.
+   - THE TWO BLOCKS ARE SEPARATE SCOPES. A local declared in the try block
+     is not visible in the catch block: it may never have been initialized,
+     which is precisely the case the catch block exists to handle. The
+     binding is an ordinary local of the catch block's own scope, discarded
+     at its end like any other, and shadows an outer local of the same name
+     for exactly that extent. Its static type is `map` (design note 3t), so
+     reading a key out of it (`e["message"]`) is an ordinary — and, like any
+     map element, dynamically typed — bracket read.
+   - THE ERROR MAP HAS FOUR KEYS, ALWAYS ALL PRESENT, so a handler can read
+     any of them without a `has()` guard first: `"error"` (the RuntimeError
+     tag name, e.g. `"KeyNotFound"`), `"message"` (the same human-readable
+     text the CLI prints for an uncaught one), `"operation"` (e.g. `"open"`),
+     and `"path"` (the file involved). The last two are `""` for an error
+     that carries no diagnostic detail — most of them. `"error"` is the
+     stable one to branch on (`if e["error"] == "KeyNotFound"`);
+     `"message"`'s exact wording is not a compatibility promise.
+   - NOT EVERY ERROR IS CATCHABLE. The 19 that are, are the ones a program
+     could plausibly do something about — `TypeMismatch`, `DivisionByZero`,
+     `Overflow`, `IndexOutOfBounds`, `ByteOutOfRange`, `KeyNotFound`,
+     `JsonParseFailed`, `NumberParseFailed`, `InvalidExitCode`, and the ten
+     stream/file ones. `StackOverflow`, `StackUnderflow`, `CallStackOverflow`
+     and `HandlerStackOverflow` are NOT: they are VM-integrity failures, not
+     program conditions, and running a handler needs the very stack room
+     that has just run out. Neither is an out-of-memory failure, since
+     building the error map itself allocates. Those four still terminate the
+     program exactly as every error did before this feature existed.
+   - try/catch NESTS, and the innermost enclosing `try` wins. An error
+     raised INSIDE a catch block is not caught by its own `try` — that
+     handler is already spent by the time the catch block runs — so it
+     propagates to the next enclosing `try`, or terminates the program.
+   - `return` inside a try block returns from the enclosing function
+     normally, abandoning the handler. `exit` inside a try block still halts
+     the whole program immediately (design note 3q): it is not an error, so
+     there is nothing for a handler to intercept.
+   - A FILE OPENED INSIDE A TRY BLOCK STAYS OPEN if the block is abandoned
+     mid-way. The open-file table is not rewound, for the same reason the
+     value stack isn't restored past the handler's own mark: a stream can
+     legitimately outlive the block that opened it (a local declared outside
+     the `try` and assigned inside it), and there is no way to tell that
+     apart from one that can't. Every still-open file is flushed and closed
+     when the program halts, as always; a handler that wants a deterministic
+     close does it itself. *)
    ========================================================================== *)

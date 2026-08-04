@@ -4147,3 +4147,83 @@ test "a non-int exit code is released, not leaked, when exit rejects it" {
 
     try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
 }
+
+test "every RuntimeError variant has the catchability ISA.bnf section 14 documents" {
+    // The whole enum, listed by hand rather than reflected over, so that
+    // adding a variant fails this test until someone decides which half it
+    // belongs in — the same reason `catchable` itself enumerates rather
+    // than testing by exclusion. This is also the only per-variant coverage
+    // `StreamReadFailed` and `FileCloseFailed` can get: both need a genuine
+    // OS-level I/O failure to raise, which no test program can provoke.
+    const catchable_variants = [_]RuntimeError{
+        RuntimeError.TypeMismatch,
+        RuntimeError.DivisionByZero,
+        RuntimeError.Overflow,
+        RuntimeError.IndexOutOfBounds,
+        RuntimeError.ByteOutOfRange,
+        RuntimeError.StreamReadFailed,
+        RuntimeError.StreamWriteFailed,
+        RuntimeError.FileOpenFailed,
+        RuntimeError.TooManyOpenFiles,
+        RuntimeError.FileCloseFailed,
+        RuntimeError.StreamNotReadable,
+        RuntimeError.StreamNotWritable,
+        RuntimeError.StreamClosed,
+        RuntimeError.CannotCloseStandardStream,
+        RuntimeError.FilesUnavailable,
+        RuntimeError.KeyNotFound,
+        RuntimeError.JsonParseFailed,
+        RuntimeError.NumberParseFailed,
+        RuntimeError.InvalidExitCode,
+    };
+    const uncatchable_variants = [_]RuntimeError{
+        RuntimeError.StackOverflow,
+        RuntimeError.StackUnderflow,
+        RuntimeError.CallStackOverflow,
+        RuntimeError.HandlerStackOverflow,
+    };
+    // Every variant appears in exactly one of the two lists above.
+    try std.testing.expectEqual(
+        @typeInfo(RuntimeError).error_set.?.len,
+        catchable_variants.len + uncatchable_variants.len,
+    );
+
+    for (catchable_variants) |err| try std.testing.expect(Vm.catchable(err));
+    for (uncatchable_variants) |err| try std.testing.expect(!Vm.catchable(err));
+
+    // Not a RuntimeError at all: building the error map allocates, so a
+    // handler for this could not run (ISA.bnf section 14).
+    try std.testing.expect(!Vm.catchable(error.OutOfMemory));
+}
+
+test "a value-stack overflow escapes even with a handler installed" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const push = try openGuard(&chunk, allocator);
+    const one = try chunk.addConstant(allocator, .{ .int = 1 });
+    var i: usize = 0;
+    while (i <= stack_max) : (i += 1) _ = try chunk.emitWithOperand(allocator, .push_const, one);
+    const jump = try closeGuard(&chunk, allocator, push);
+    _ = try chunk.emit(allocator, .print); // catch block, must not run
+    chunk.patchOperand(jump, @intCast(chunk.code.items.len));
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.StackOverflow);
+}
+
+test "a value-stack underflow escapes even with a handler installed" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const push = try openGuard(&chunk, allocator);
+    _ = try chunk.emit(allocator, .pop); // nothing on the stack to pop
+    const jump = try closeGuard(&chunk, allocator, push);
+    _ = try chunk.emit(allocator, .print); // catch block, must not run
+    chunk.patchOperand(jump, @intCast(chunk.code.items.len));
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.StackUnderflow);
+}

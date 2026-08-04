@@ -291,14 +291,80 @@ Suggested landing order, each step green before the next:
    `SemanticError.UnsupportedStatement` ("try/catch is not implemented
    yet") so a `try` program is a clean compile error rather than an
    `unreachable` between this step and the next; step 5 deletes both.
-5. compiler.zig codegen, scope and slot handling, `map` typing for the
-   binding.
-6. Docs: GRAMMAR.bnf KEYWORD list + `<try-stmt>` + design note 3u; ISA.bnf
-   section 3 entries, the section 4 pattern above, and new section 14.
-7. `tests/cases/try_catch.butter` covering **all 22 `RuntimeError`
+5. ~~compiler.zig codegen, scope and slot handling, `map` typing for the
+   binding.~~ **DONE.** `compileTry` emits exactly the section 6 pattern;
+   the handler's scope is opened by hand rather than through `compileBlock`
+   so the binding can be declared inside it (slot `next_slot`, typed `map`,
+   `collection = .map`) before its statements compile, and closed by the
+   ordinary `popLocalsAbove`. The `sp == bp + next_slot` assumption held
+   without adjustment — it is simply what a statement boundary looks like.
+   `SemanticError.UnsupportedStatement` and its temporary arm are gone.
+   Twenty compiler tests, run end to end through the VM. Five mutations,
+   all caught: dropping POP_HANDLER, dropping the JUMP over the handler,
+   not reserving the binding's slot, typing the binding `int`, and leaving
+   the handler's scope unclosed. Perf is untouched by construction — a
+   program with no `try` gets no new instructions — and the benchmarks
+   match step 1's baselines.
+
+   Two things worth carrying forward:
+   - **The error map's `path` is empty in the compiler's own unit tests.**
+     `runProgram` supplies no `Host.fs`, so `open` raises the (catchable)
+     `FilesUnavailable` gate rather than `FileOpenFailed`, and the only
+     diagnostic-carrying errors reachable there are
+     `JsonParseFailed`/`NumberParseFailed`, which name an operation but no
+     file. Both keys together need a real filesystem — step 7's integration
+     case is where that gets covered.
+   - **A spent handler is not observable through the reported error**, the
+     same way a stale one wasn't in step 3: without POP_HANDLER, a later
+     error resumes in the already-run catch block and reports whatever that
+     block does. The test needs a marker print, not just an expected error.
+6. ~~Docs: GRAMMAR.bnf KEYWORD list + `<try-stmt>` + design note 3u; ISA.bnf
+   section 3 entries, the section 4 pattern above, and new section 14.~~
+   **DONE.** All of it, plus a note on RET's own entry about dropping the
+   departing frame's handlers.
+7. ~~`tests/cases/try_catch.butter` covering **all 22 `RuntimeError`
    variants** — 19 caught and inspected, 3 asserted to still escape — plus an
    `examples/` program showing the CLI-tool shape (open, parse, report,
-   `exit 1`).
+   `exit 1`).~~ **DONE**, though not in that shape — it is 23 variants now
+   (step 3 added `HandlerStackOverflow`), and they are not all reachable
+   from one program. The split:
+
+   - **15 in `tests/cases/try_catch.butter`**, caught and identified by
+     tag: `TypeMismatch`, `DivisionByZero`, `Overflow`,
+     `IndexOutOfBounds`, `ByteOutOfRange`, `KeyNotFound`,
+     `JsonParseFailed`, `NumberParseFailed`, `InvalidExitCode`,
+     `FileOpenFailed` (whose `operation`/`path` are checked too),
+     `StreamNotReadable`, `StreamNotWritable`, `StreamClosed`,
+     `CannotCloseStandardStream`, `TooManyOpenFiles` — and `FilesUnavailable`
+     is the one it can't reach, since the case now runs WITH a filesystem.
+     That needed a new `expectCaseOutputWithFs` in the integration harness:
+     every other case runner supplies no `Host.fs`, so `open` in them is
+     `FilesUnavailable`. It roots the program at a scratch directory under
+     `.zig-cache` and deletes it afterward, so the case can create and
+     reopen real files without touching the repo.
+   - **2 as compiler unit tests**, because both depend on how the embedder
+     wired up the host rather than on program text: `FilesUnavailable` (no
+     `Host.fs`) and `StreamWriteFailed` (an undersized output writer).
+   - **2 by classification only** — `StreamReadFailed` and
+     `FileCloseFailed` need a genuine OS-level I/O failure, which no test
+     program can provoke. vm.zig's new catchability-table test enumerates
+     the entire enum by hand and asserts each variant's side, with a length
+     check so adding a variant fails until someone classifies it.
+   - **4 non-catchable**, each with its own escape test in vm.zig:
+     `CallStackOverflow` and `HandlerStackOverflow` from step 3,
+     `StackOverflow` and `StackUnderflow` new here.
+
+   `examples/error_handling.butter` is the CLI shape: usage → `exit 2`,
+   unreadable file → `exit 1` naming the path and cause, malformed JSON →
+   `exit 1`, and a `KeyNotFound` branched on by tag and treated as benign.
+   All four paths verified by hand.
+
+   One inconsistency found and NOT fixed, since it predates this work: the
+   PRINT opcode propagates the raw `std.Io.Writer.Error` straight out,
+   while WRITE maps the same failure to `RuntimeError.StreamWriteFailed`.
+   So a failing `write(stdout, x)` is catchable and a failing `print x` is
+   not. Nothing observable changed for either before try/catch existed —
+   both simply killed the program — which is why it went unnoticed.
 
 ## 8. Alternatives considered
 

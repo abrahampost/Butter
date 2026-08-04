@@ -52,10 +52,6 @@ pub const SemanticError = error{
     /// is left to the existing runtime `RuntimeError.TypeMismatch` checks,
     /// same as before this feature existed.
     TypeMismatch,
-    /// A statement the parser accepts but this compiler doesn't lower yet.
-    /// Temporary: `try`/`catch` is the only one, and step 5 of
-    /// DESIGN-error-recovery.md's plan removes both it and this variant.
-    UnsupportedStatement,
 };
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
@@ -691,12 +687,7 @@ pub const Compiler = struct {
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .exit);
             },
-            // Parsed (ast.Stmt.Try) but not yet compiled — step 5 of
-            // DESIGN-error-recovery.md's plan replaces this arm with the
-            // PUSH_HANDLER/POP_HANDLER codegen the VM already implements,
-            // and deletes `UnsupportedStatement` with it. Until then a
-            // `try` is a clean compile error rather than an `unreachable`.
-            .try_stmt => return self.fail(SemanticError.UnsupportedStatement, "try", "try/catch is not implemented yet"),
+            .try_stmt => |t| try self.compileTry(t),
         }
     }
 
@@ -820,6 +811,66 @@ pub const Compiler = struct {
 
         if (i.else_branch) |eb| try self.compileStmt(eb);
         self.chunk.patchOperand(else_jump, @intCast(self.chunk.code.items.len));
+    }
+
+    /// `try <body> catch <name> <handler>` (design note 3u), on the same
+    /// backpatched-jump skeleton as `compileIf`:
+    ///
+    /// ```
+    ///        PUSH_HANDLER  catch_target
+    ///        <body>                  (* its own scope; locals POPped at its end *)
+    ///        POP_HANDLER
+    ///        JUMP  end_target
+    ///      catch_target:
+    ///        <handler>               (* the error map is ALREADY on the stack *)
+    ///        POP                     (* the binding, via popLocalsAbove *)
+    ///      end_target:
+    /// ```
+    ///
+    /// The binding needs neither a STORE_LOCAL nor an opcode of its own.
+    /// At the `try` statement `next_slot` is some N; the body's own locals
+    /// occupy N upward and `compileBlock` pops them at its end, so the
+    /// handler is compiled with `next_slot` back at N and declares the
+    /// binding as an ordinary local at slot N. At run time, a statement
+    /// boundary always has `sp == bp + next_slot` (locals below, no live
+    /// temporaries), so the `sp` PUSH_HANDLER recorded is exactly `bp + N` —
+    /// and unwinding restores that `sp` and then pushes the error map,
+    /// landing it precisely in slot N. `popLocalsAbove` then discards it at
+    /// the end of the handler's scope with no special case.
+    ///
+    /// Nothing here emits a POP_HANDLER before a `return` inside the body:
+    /// RET drops the departing frame's handlers itself (ISA.bnf section 14),
+    /// which covers every way out of a frame by construction. Butter has no
+    /// `break`/`continue`, so `return`, `exit`, and falling off the end are
+    /// the only other exits, and the latter two need nothing.
+    fn compileTry(self: *Compiler, t: ast.StmtKind.Try) CompileError!void {
+        const catch_jump = try self.chunk.emitWithOperand(self.allocator, .push_handler, 0);
+
+        try self.compileBlock(t.body);
+
+        _ = try self.chunk.emit(self.allocator, .pop_handler);
+        const end_jump = try self.chunk.emit(self.allocator, .jump);
+        self.chunk.patchOperand(catch_jump, @intCast(self.chunk.code.items.len));
+
+        // The handler's scope, opened by hand rather than via `compileBlock`
+        // so the binding can be declared inside it before its statements
+        // are compiled. Typed `map` (design note 3t), so reading a key out
+        // of it is an ordinary — and, like any map element, dynamically
+        // typed — bracket read.
+        self.scope_depth += 1;
+        try self.locals.append(self.allocator, .{
+            .name = t.error_var,
+            .depth = self.scope_depth,
+            .slot = self.next_slot,
+            .collection = .map,
+            .value_type = .map,
+        });
+        self.next_slot += 1;
+        for (t.handler) |*s| try self.compileStmt(s);
+        self.scope_depth -= 1;
+        try self.popLocalsAbove(self.scope_depth);
+
+        self.chunk.patchOperand(end_jump, @intCast(self.chunk.code.items.len));
     }
 
     fn compileWhile(self: *Compiler, w: ast.StmtKind.While) CompileError!void {
@@ -3373,4 +3424,422 @@ test "open()'s stream result satisfies an int-declared local (the existing file-
     defer compiler.deinit();
     var compiled = try compiler.compileProgram(program);
     defer compiled.deinit(allocator);
+}
+
+// ---- try/catch (design note 3u, ISA.bnf section 14) ------------------
+
+test "a runtime error in a try block continues in the catch block" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\print "before"
+        \\try {
+        \\    print 1 / 0
+        \\    print "skipped"
+        \\} catch e {
+        \\    print "caught"
+        \\}
+        \\print "after"
+    , &buf);
+    try std.testing.expectEqualStrings("before\ncaught\nafter\n", output);
+}
+
+test "a try block that completes normally skips the catch block entirely" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\try {
+        \\    print "ok"
+        \\} catch e {
+        \\    print "never"
+        \\}
+        \\print "after"
+    , &buf);
+    try std.testing.expectEqualStrings("ok\nafter\n", output);
+}
+
+test "a try block that completes normally leaves no armed handler behind" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\try {
+        \\    print "ok"
+        \\} catch e {
+        \\    print "spent"
+        \\}
+        \\print 1 / 0
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    // Without the POP_HANDLER after the body, the division would resume in
+    // the already-spent catch block instead of killing the program — and
+    // the error alone can't tell the difference, so "spent" is the marker
+    // that detects it.
+    try std.testing.expectError(vm_mod.RuntimeError.DivisionByZero, vm.run(&compiled, .{ .out = &writer }));
+    try std.testing.expectEqualStrings("ok\n", writer.buffered());
+}
+
+test "the caught error binds a map with all four keys always present" {
+    const allocator = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\map m := {"a": 1}
+        \\try {
+        \\    print m["nope"]
+        \\} catch e {
+        \\    print e["error"]
+        \\    print e["message"]
+        \\    print "[" + e["operation"] + "]"
+        \\    print "[" + e["path"] + "]"
+        \\}
+    , &buf);
+    // KeyNotFound carries no Diagnostic, so the last two are empty — but
+    // still present, so reading them needs no `has()` guard.
+    try std.testing.expectEqualStrings("KeyNotFound\nKeyNotFound\n[]\n[]\n", output);
+}
+
+test "a diagnostic-carrying error fills in operation" {
+    const allocator = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\try {
+        \\    print int("not a number")
+        \\} catch e {
+        \\    print e["error"]
+        \\    print e["message"]
+        \\    print e["operation"]
+        \\}
+    , &buf);
+    // `path` stays empty here — PARSE_INT's Diagnostic names the operation
+    // but has no file to name. The file errors that fill BOTH in need a
+    // real `Host.fs`, which the `files` integration case covers end to end.
+    try std.testing.expectEqualStrings("NumberParseFailed\nint: malformed integer literal\nint\n", output);
+}
+
+test "a failing write is catchable" {
+    const allocator = std.testing.allocator;
+    // A fixed writer far too small for what's written to it. Note this
+    // uses `write(stdout, ...)`, not `print`: WRITE maps a writer failure
+    // to StreamWriteFailed (vm.zig's `writeValue`), whereas PRINT lets the
+    // raw `std.Io.Writer.Error` escape, which no handler sees.
+    //
+    // This and `FilesUnavailable` above are the two catchable variants
+    // that depend on how the EMBEDDER wired up the host, so neither is
+    // reachable from the integration case (`try_catch`), which always gets
+    // a real filesystem and an unbounded output buffer.
+    var lex = lexer_mod.Lexer.init(
+        \\try {
+        \\    print write(stdout, "far longer than the output buffer holds")
+        \\} catch e {
+        \\    exit 3
+        \\}
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var buf: [8]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    // The write fails partway, so what landed in `buf` is not worth
+    // asserting on — that the handler ran at all is the point, and the
+    // exit code is how it says so.
+    try vm.run(&compiled, .{ .out = &writer });
+    try std.testing.expectEqual(@as(?u8, 3), vm.exit_code);
+}
+
+test "the sandbox gate (no Host.fs) is itself catchable" {
+    const allocator = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    // `runProgram` supplies no `Host.fs`, so `open` is refused outright —
+    // an embedder that hasn't opted into file access can now be handled by
+    // the program rather than killing it.
+    const output = try runProgram(allocator,
+        \\try {
+        \\    int f := open("anything.txt", read)
+        \\    print "opened"
+        \\} catch e {
+        \\    print e["error"]
+        \\}
+    , &buf);
+    try std.testing.expectEqualStrings("FilesUnavailable\n", output);
+}
+
+test "an error raised several call frames deep unwinds to the handler" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func deep(int n) -> int {
+        \\    if n == 0 {
+        \\        return 1 / 0
+        \\    }
+        \\    return deep(n - 1)
+        \\}
+        \\try {
+        \\    print deep(5)
+        \\} catch e {
+        \\    print e["error"]
+        \\}
+        \\print "after"
+    , &buf);
+    try std.testing.expectEqualStrings("DivisionByZero\nafter\n", output);
+}
+
+test "try/catch inside a function: return works from either half" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func safeDiv(int a, int b) -> int {
+        \\    try {
+        \\        return a / b
+        \\    } catch _ {
+        \\        return -1
+        \\    }
+        \\}
+        \\print safeDiv(10, 2)
+        \\print safeDiv(10, 0)
+    , &buf);
+    try std.testing.expectEqualStrings("5\n-1\n", output);
+}
+
+test "returning out of a try block does not strand its handler" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    // `guarded` returns normally, leaving its handler behind unless RET
+    // drops it. If one were stranded, the later division would resume in
+    // `guarded`'s dead catch block and print "stranded" — so the marker,
+    // not the error text, is what detects it (see DESIGN-error-recovery.md
+    // step 3's first finding).
+    const output = try runProgram(allocator,
+        \\func guarded() -> int {
+        \\    try {
+        \\        return 1
+        \\    } catch e {
+        \\        print "stranded"
+        \\        return 0
+        \\    }
+        \\}
+        \\print guarded()
+        \\try {
+        \\    print 1 / 0
+        \\} catch e {
+        \\    print e["error"]
+        \\}
+    , &buf);
+    try std.testing.expectEqualStrings("1\nDivisionByZero\n", output);
+}
+
+test "try/catch nests, and the innermost enclosing try wins" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\try {
+        \\    try {
+        \\        print [1, 2][9]
+        \\    } catch inner {
+        \\        print "inner " + inner["error"]
+        \\    }
+        \\    print "resumed"
+        \\} catch outer {
+        \\    print "never"
+        \\}
+    , &buf);
+    try std.testing.expectEqualStrings("inner IndexOutOfBounds\nresumed\n", output);
+}
+
+test "an error inside a catch block escapes to the enclosing try, not its own" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\try {
+        \\    try {
+        \\        print [1, 2][9]
+        \\    } catch inner {
+        \\        print {"z": 1}["q"]
+        \\    }
+        \\} catch outer {
+        \\    print "outer " + outer["error"]
+        \\}
+    , &buf);
+    try std.testing.expectEqualStrings("outer KeyNotFound\n", output);
+}
+
+test "exit inside a try block is not catchable" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\try {
+        \\    exit 7
+        \\} catch e {
+        \\    print "never"
+        \\}
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try vm.run(&compiled, .{ .out = &writer });
+
+    try std.testing.expectEqualStrings("", writer.buffered());
+    try std.testing.expectEqual(@as(?u8, 7), vm.exit_code);
+}
+
+test "a non-catchable error still escapes a try block" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\func recurse(int n) -> int {
+        \\    return recurse(n + 1)
+        \\}
+        \\try {
+        \\    print recurse(0)
+        \\} catch e {
+        \\    print "never"
+        \\}
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    // CallStackOverflow is a VM-integrity failure, not a program condition
+    // (DESIGN-error-recovery.md section 3) — no handler sees it.
+    try std.testing.expectError(vm_mod.RuntimeError.CallStackOverflow, vm.run(&compiled, .{ .out = &writer }));
+}
+
+test "a local declared in the try block is not in scope in the catch block" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\try {
+        \\    int x := 1
+        \\} catch e {
+        \\    print x
+        \\}
+    , SemanticError.UndefinedVariable);
+}
+
+test "the error binding is not in scope after the catch block" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\try {
+        \\    print 1
+        \\} catch e {
+        \\    print e["error"]
+        \\}
+        \\print e["error"]
+    , SemanticError.UndefinedVariable);
+}
+
+test "the error binding is statically typed map" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\try {
+        \\    print 1 / 0
+        \\} catch e {
+        \\    int n := e
+        \\}
+    , SemanticError.TypeMismatch);
+}
+
+test "the error binding may be used as a map anywhere one is accepted" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\try {
+        \\    print 1 / 0
+        \\} catch e {
+        \\    print has(e, "error")
+        \\    print len(keys(e))
+        \\}
+    , &buf);
+    try std.testing.expectEqualStrings("true\n4\n", output);
+}
+
+test "the error binding shadows an outer local of the same name, which survives intact" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\string e := "outer"
+        \\try {
+        \\    print 1 / 0
+        \\} catch e {
+        \\    print e["error"]
+        \\}
+        \\print e
+    , &buf);
+    try std.testing.expectEqualStrings("DivisionByZero\nouter\n", output);
+}
+
+test "repeatedly abandoning a try block neither drifts the stack nor leaks its locals" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    // Each iteration strands a heap string and a map in the abandoned
+    // scope, above the handler's recorded `sp`. Under
+    // `std.testing.allocator` a missed decref fails the test; a botched
+    // `sp` restore would overflow the value stack long before 2000.
+    const output = try runProgram(allocator,
+        \\int n := 0
+        \\for i in 0..2000 {
+        \\    try {
+        \\        string s := "a string that is heap allocated"
+        \\        map m := {"k": s}
+        \\        print m["missing"]
+        \\    } catch e {
+        \\        n := n + 1
+        \\    }
+        \\}
+        \\print n
+    , &buf);
+    try std.testing.expectEqualStrings("2000\n", output);
+}
+
+test "a try block's locals do not permanently consume slots" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    // The catch binding lands in the slot the try block's first local
+    // used, and both are reclaimed afterward — so `after` reads back
+    // correctly rather than aliasing either.
+    const output = try runProgram(allocator,
+        \\try {
+        \\    int a := 1
+        \\    int b := 2
+        \\    print a + b
+        \\} catch e {
+        \\    print "never"
+        \\}
+        \\int after := 99
+        \\print after
+    , &buf);
+    try std.testing.expectEqualStrings("3\n99\n", output);
 }
