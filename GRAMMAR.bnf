@@ -44,22 +44,25 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'exists' | 'listDir' | 'remove' | 'rename'
                | 'exec'
                | 'now' | 'random'
+               | 'struct' | 'enum'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
                | '!' | '!=' | '==' | '<' | '<=' | '>' | '>=' | ':' | ':='
-               | '->' | ',' | '..'
+               | '->' | ',' | '.' | '..'
 
 (* Whitespace (space, tab, '\r') is discarded; '\n' is significant (NEWLINE).
    '#' starts a comment through (not including) the next '\n' or EOF; the
    terminating '\n' is still scanned as its own NEWLINE. Comments don't nest
-   and aren't recognized inside a STRING. A lone '=' or '.' is a lexer
-   error — '=' must be followed by '=', and '.' only ever appears as part
-   of '..'. ':' can stand alone (a map literal's key/value separator); ':='
-   is its own two-character token. STRING supports exactly four escape
-   sequences — `\n`, `\t`, `\\`, `\"` (design note 3s) — decoded when the
-   token's contents are read; any other character following a `\` is a
-   lexer error, and `\"` does not end the string early. *)
+   and aren't recognized inside a STRING. A lone '=' is a lexer error — '='
+   must be followed by '=' (did you mean '=='?). '.' stands alone (field
+   access / enum variant reference, design notes 3z/3aa) exactly like ':'
+   already does; '..' is still its own two-character token, checked first,
+   so a single '.' never gets confused with it. ':=' is its own two-
+   character token. STRING supports exactly four escape sequences — `\n`,
+   `\t`, `\\`, `\"` (design note 3s) — decoded when the token's contents are
+   read; any other character following a `\` is a lexer error, and `\"`
+   does not end the string early. *)
 
 
 (* --------------------------------------------------------------------------
@@ -68,10 +71,13 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 <program>          ::= { NEWLINE } { <top-level-decl> { NEWLINE } }
 
-(* Functions and imports are top-level only — never reachable from inside a
-   block/if/while/function body. *)
+(* Functions, imports, and struct/enum declarations are top-level only —
+   never reachable from inside a block/if/while/function body (design notes
+   3z, 3aa). *)
 <top-level-decl>    ::= <import-decl>
                       | [ 'export' ] <function-decl>
+                      | [ 'export' ] <struct-decl>
+                      | [ 'export' ] <enum-decl>
                       | <declaration>
 
 <declaration>       ::= <var-declaration>
@@ -95,12 +101,29 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 (* `path` resolves relative to the IMPORTING file's own directory. *)
 <import-decl>       ::= 'import' STRING <end>
 
-(* The array suffix's INT is always a literal (never `map`/`list`, which are
-   always exactly one value, never a run of raw slots). *)
+(* struct/enum fields never take an array suffix, for the same reason
+   `map`/`list` params/vars never do — always exactly one `Value`, never a
+   run of raw slots (design notes 3z, 3aa). A field-list/variant-list's
+   items may be separated by ',', NEWLINE, or both, with an optional
+   trailing ','. *)
+<struct-decl>       ::= 'struct' IDENTIFIER '{' { NEWLINE } [ <field-list> ] '}'
+<field-list>        ::= <field> { ( ',' | NEWLINE ) <field> } [ ',' ]
+<field>             ::= <type> IDENTIFIER
+
+<enum-decl>         ::= 'enum' IDENTIFIER '{' { NEWLINE } [ <variant-list> ] '}'
+<variant-list>      ::= IDENTIFIER { ( ',' | NEWLINE ) IDENTIFIER } [ ',' ]
+
+(* The array suffix's INT is always a literal (never `map`/`list`/a named
+   struct-or-enum type, all of which are always exactly one value, never a
+   run of raw slots). *)
 <var-declaration>   ::= <type> [ '[' INT ']' ] IDENTIFIER
                          [ ':=' <expression> ] <end>
 
+(* A bare IDENTIFIER names a user-declared struct or enum type (design
+   notes 3z, 3aa) — resolved by the compiler, never validated by this
+   grammar or the parser. *)
 <type>              ::= 'int' | 'float' | 'bool' | 'string' | 'map' | 'list'
+                      | IDENTIFIER
 
 <block>             ::= '{' { NEWLINE } { <declaration> { NEWLINE } } '}'
 
@@ -146,10 +169,12 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 (* Recognized after the fact: the parser parses a general <expression>
    first, then reinterprets it as an assignment target if ':=' follows and
-   it has the right shape (a bare identifier, or a <primary> ending in a
-   '[' <expression> ']' suffix). *)
+   it has the right shape (a bare identifier, a <primary> ending in a
+   '[' <expression> ']' suffix, or a <primary> ending in a '.' IDENTIFIER
+   suffix — design note 3z). *)
 <assignment>        ::= IDENTIFIER ':=' <assignment>
                       | <primary> '[' <expression> ']' ':=' <assignment>
+                      | <primary> '.' IDENTIFIER ':=' <assignment>
                       | <logic-or>
 
 <logic-or>          ::= <logic-and> { 'or' <logic-and> }
@@ -169,8 +194,14 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    below) — `s[a..b]`, end exclusive, same convention as the for-loop's own
    range. A slice is never itself an assignment target: <assignment> below
    only ever recognizes the single-index shape, so `s[a..b] := v` is a
-   parse-time "invalid assignment target" like any other non-lvalue. *)
-<primary>           ::= <atom> { '[' <expression> [ '..' <expression> ] ']' }
+   parse-time "invalid assignment target" like any other non-lvalue.
+   '.' IDENTIFIER chains the exact same way (design notes 3z, 3aa) — a
+   struct field read or an enum variant reference; which one is decided by
+   the compiler, never here (a shape that's neither, e.g. `5.x`, is
+   likewise left to the compiler to reject). *)
+<primary>           ::= <atom> { <postfix> }
+<postfix>           ::= '[' <expression> [ '..' <expression> ] ']'
+                      | '.' IDENTIFIER
 
 <atom>              ::= INT
                       | FLOAT
@@ -203,12 +234,26 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <exec-expr>
                       | <now-expr>
                       | <random-expr>
+                      | <struct-literal>
                       | 'stdin' | 'stdout' | 'stderr'
                       | 'args'
                       | IDENTIFIER
 
 <call-expr>         ::= IDENTIFIER '(' [ <arg-list> ] ')'
 <arg-list>          ::= <expression> { ',' <expression> }
+
+(* IDENTIFIER '{' ... is only ever a struct literal when what's immediately
+   inside the '{' (past any leading NEWLINEs) is IDENTIFIER ':' — the shape
+   every field-init starts with, and one no Butter STATEMENT can ever start
+   with (design note 3z). This is what keeps `if flag { ... }` /
+   `for i in 0..n { ... }` unambiguous: `flag`/`n` there are bare
+   identifiers immediately followed by the surrounding construct's OWN body
+   block, not a struct literal for a type named `flag`/`n`. A struct with no
+   declared fields therefore has no literal spelling — `Type{}` is never
+   recognized as one, precisely to keep this rule this simple. *)
+<struct-literal>    ::= IDENTIFIER '{' { NEWLINE } <field-init-list> '}'
+<field-init-list>   ::= <field-init> { ( ',' | NEWLINE ) <field-init> } [ ',' ]
+<field-init>        ::= IDENTIFIER ':' <expression>
 
 (* A fixed-array initializer wherever one's expected; otherwise builds a
    `list`. *)
@@ -672,6 +717,93 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      instead assert PLAUSIBILITY (a real clock, checked against a wide
      sane range) rather than an exact value. *)
 
+(* --- Records / structs (design note 3z) ---
+   - `struct Name { <type> field, ... }` declares a new, program-wide named
+     type — top-level only (like a function), and, like a function, may be
+     prefixed `export` to be nameable from a file that imports this one
+     (visibility is direct-import-only, not transitive, exactly mirroring
+     `functionVisible`/the import/export design note above). Struct AND enum
+     names share one namespace, unique across the whole compiled program —
+     a struct and an enum can never share a name, any more than two
+     functions can.
+   - A field's `<type>` may be any of `int`/`float`/`bool`/`string`/`map`/
+     `list`, or another struct/enum type (nesting is free, including mutual
+     references between two structs — see below) — but never a fixed/
+     generic array: a field is always exactly one `Value`, the same
+     restriction a `map`/`list` param already has (never a run of raw
+     slots). Struct/enum names are registered before any field is resolved,
+     so a struct's own field types may reference another struct/enum
+     declared LATER in the same file, or in a different module entirely,
+     with no forward-declaration needed — the same freedom functions
+     already have calling each other regardless of declaration order.
+   - A struct value is a REFERENCE, heap-allocated and refcounted exactly
+     like a `map`/`list` (`b := a` aliases, mutation through one is visible
+     through the other) — but with a compile-time-FIXED, ORDERED set of
+     named fields rather than a runtime string-keyed hash lookup: reading or
+     writing `p.field` resolves to a plain compile-time index into the
+     struct's own field array, never a runtime name lookup. This is the
+     central tradeoff versus a plain `map`: a struct's field names are
+     checked ONCE, here, not on every access, and a typo'd field name
+     (`p.raidus`) is `SemanticError.UnknownField` — a compile error — never
+     a `RuntimeError.KeyNotFound` the way a bad map key would be.
+   - `TypeName{field1: expr1, field2: expr2, ...}` constructs an instance —
+     every declared field is required, keyed by name (not position), in any
+     order; a missing field is `SemanticError.MissingField`, an unknown one
+     is `SemanticError.UnknownField`, and repeating the same field twice is
+     `SemanticError.DuplicateFieldInLiteral`. There is no partial/default-
+     filled literal — the recursive zero-value a struct-typed local gets
+     with no initializer (every field defaulted, recursively for a nested
+     struct field) is the only other way to get a "default" instance.
+   - `p.field` (read) and `p.field := v` (write) are the only two
+     operations — see the Fields/Enums shared design note below for how a
+     `.` is disambiguated from an enum variant reference. Both are fully
+     resolved at compile time (the field's index AND its declared type are
+     both known before any code is emitted for them) — unlike bracket-
+     indexing a map/list, NO runtime error is possible from a field
+     read/write once it compiles at all.
+   - `==`/`!=` between two struct values compare by POINTER IDENTITY only
+     (never deep), the exact same rule `map`/`list` already follow — no
+     special case for structs. *)
+
+(* --- Enums (design note 3aa) ---
+   - `enum Name { Variant, ... }` declares a new, program-wide named type —
+     same top-level-only, optionally-`export`ed, shared-namespace-with-
+     structs treatment `struct` gets, above. A variant carries no payload —
+     this is a plain named tag (like a C enum), not a data-carrying union;
+     variant names must be unique within their own enum
+     (`SemanticError.DuplicateVariant`).
+   - `EnumName.Variant` (e.g. `Color.Red`) is a compile-time CONSTANT of a
+     genuinely distinct runtime type from `int` — this is the entire point
+     of this design over a plain "named int constants" scheme: assigning,
+     passing, or returning a bare `int` where a declared enum type is
+     expected is `SemanticError.TypeMismatch`, caught here, at compile time,
+     the same way passing a `string` where a `bool` is expected already is.
+     An enum value is never heap-allocated (no refcounting) — it's a plain
+     scalar, exactly as cheap to copy as an `int`/`bool`.
+   - `EnumName.Variant` uses the exact same `.` syntax a struct field read
+     does (`ast.Expr.field_access`) — whether a `<base>.name` expression is
+     a struct field read or an enum variant reference is decided by the
+     COMPILER, never the parser: if `<base>` is a bare identifier that names
+     no local variable currently in scope, but DOES name a declared enum
+     type, it's a variant reference; a local variable always wins if one by
+     that name exists (so a local named the same as some enum type shadows
+     it, the same way a local can already shadow a `keys`/`map` builtin
+     name's confusability is avoided by context). Anything else must be a
+     struct field read (`SemanticError.NotAStruct` if it statically isn't).
+   - `print`s and otherwise renders as its bare variant name (`Red`, not
+     `0` or `"Red"`) — an enum value is self-describing, carrying its own
+     type/variant name, not requiring any lookup table to display. It has
+     no JSON representation (`stringify` reports `error.Unstringifiable`,
+     the same bucket a stream or array reference falls into) and no
+     `int(...)`-style ordinal cast is provided in this pass.
+   - `==`/`!=` between two enum values are TRUE only for the same declared
+     enum type AND the same variant — comparing across two different enum
+     types (or against a bare `int`) is simply `false`, never a compile or
+     runtime error, consistent with design note 3t's blanket "`==`/`!=` are
+     never type-checked" rule: enums get no special carve-out from it, even
+     though every OTHER checked position (assignment, a parameter, a return)
+     does enforce the exact type match. *)
+
 (* --- Process exit code ---
    - `exit <expression>` halts the entire program immediately, from
      anywhere — the top level, mid-loop, mid-expression-statement, or
@@ -694,16 +826,20 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      same while-loop pattern every other loop compiles to. *)
 
 (* --- import/export ---
-   - Only function declarations may be exported/imported — a top-level
-     var-declaration can't be, sidestepping any notion of module
-     initialization order. An imported file may only contain more imports
-     and function declarations at its top level.
+   - Function AND struct/enum declarations may be exported/imported (design
+     notes 3z, 3aa extend this to type declarations) — a top-level
+     var-declaration still can't be, sidestepping any notion of module
+     initialization order. An imported file may only contain more imports,
+     function declarations, and struct/enum declarations at its top level.
    - Visibility is direct-import-only, not transitive: importing B doesn't
-     expose what B itself imports.
+     expose what B itself imports — true of a struct/enum type exactly as
+     it is of a function.
    - A path resolves relative to the file containing the `import`, not the
      entry program. Function names are unique across the whole compiled
-     program, not just within one file. A dependency shared by more than
-     one importer is compiled exactly once. *)
+     program, not just within one file — struct/enum names too, and in the
+     SAME shared namespace as each other (though still a separate namespace
+     from function names). A dependency shared by more than one importer is
+     compiled exactly once. *)
 
 (* --- Static type checking (design note 3t) ---
    - Every `<type>`-checkable position in the language now has its
@@ -711,11 +847,14 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      compile time against what's expected there, `SemanticError.TypeMismatch`
      otherwise: a var-declaration's initializer (and, for a fixed-size
      array declaration, each array-literal element, or an initializing
-     call's returned array's element type); an assignment's value; a call
+     call's returned array's element type); an assignment's value (including
+     a struct field assignment, `p.field := v`, design note 3z); a call
      argument against its parameter; a `return` against the function's
-     declared return type; an `if`/`while` condition (must be `bool`); a
-     for-loop's `start`/`end` (must be `int`); an `exit` code (must be
-     `int`); and every binary/unary/logical operator's operand(s), mirroring
+     declared return type; a struct literal's field values against each
+     field's own declared type (design note 3z); an `if`/`while` condition
+     (must be `bool`); a for-loop's `start`/`end` (must be `int`); an `exit`
+     code (must be `int`); and every binary/unary/logical operator's
+     operand(s), mirroring
      the VM's own runtime rules for that operator (`+` and the four
      ordering comparisons accept two numbers OR two strings; every other
      arithmetic operator and the two ordering-adjacent unary/logical forms
@@ -730,9 +869,11 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      conversion — `float x := 5` still stores a raw INT value in `x`'s slot,
      exactly as it always has. `float` never narrows to `int` implicitly;
      that still requires the explicit `int(x)` truncating cast (design note
-     3r). Every other pairing (`bool`, `string`, `map`, `list` against
-     anything but their own exact type) is rejected outright — no
-     coercions among those.
+     3r). Every other pairing (`bool`, `string`, `map`, `list`, a struct, or
+     an enum against anything but their own exact type — for a struct/enum,
+     "exact type" meaning the SAME declared type, not merely another
+     struct/enum of the same shape) is rejected outright — no coercions
+     among those.
    - A stream (`stdin`/`stdout`/`stderr`, or an `open(...)` result) has no
      `<type>` keyword of its own — there's no syntax to declare a
      stream-typed local — so, to avoid breaking the established convention

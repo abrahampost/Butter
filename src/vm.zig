@@ -502,6 +502,16 @@ pub const Vm = struct {
                 const i: usize = @intCast(index.int);
                 return Value.newString(allocator, bytes[i .. i + 1]);
             },
+            // A struct field is never reached through bracket-indexing from
+            // compiled Butter source: a bare struct-typed local is already
+            // rejected at compile time (`compileIndex`'s `NotIndexable`
+            // check, same as any other non-collection/non-string local),
+            // and the only way this arm is reachable at all is a non-
+            // identifier base whose value TURNS OUT to be a struct at
+            // runtime (e.g. indexing a function call's result directly) —
+            // same "checked, not trusted" treatment any other container-
+            // kind mismatch already gets here.
+            .record => return RuntimeError.TypeMismatch,
         }
     }
 
@@ -542,6 +552,8 @@ pub const Vm = struct {
                 try container.object.mapSet(allocator, key, value);
             },
             .string => return RuntimeError.TypeMismatch,
+            // See `indexGet`'s `.record` arm — same reasoning.
+            .record => return RuntimeError.TypeMismatch,
         }
     }
 
@@ -1498,6 +1510,54 @@ pub const Vm = struct {
                 try self.push(.{ .object = obj });
             },
 
+            // ---- Records (ISA.bnf section 19) ----
+
+            .make_struct => {
+                const st = ex.program.struct_types[instr.operand];
+                const n = st.field_names.len;
+                const fields = try self.allocator.alloc(Value, n);
+                errdefer self.allocator.free(fields);
+                // A pure move: the n values already on the stack become
+                // this record's own fields, so neither an incref (moving
+                // in) nor a decref (the old stack slots, about to be
+                // discarded via sp -= n) is needed for them — exactly like
+                // MAKE_LIST, above.
+                @memcpy(fields, self.stack[self.sp - n .. self.sp]);
+                self.sp -= n;
+                const obj = try Object.create(self.allocator, .{ .record = .{
+                    .type_name = st.type_name,
+                    .field_names = st.field_names,
+                    .fields = fields,
+                } });
+                try self.push(.{ .object = obj });
+            },
+            .field_get => {
+                const container = try self.pop();
+                defer container.decref(self.allocator);
+                // Compiler-verified: `container` is always a `.record` with
+                // at least `instr.operand + 1` fields — a wrong field name
+                // or a non-struct base is always a compile error
+                // (`SemanticError.UnknownField`/`NotAStruct`), never reaches
+                // here (ISA.bnf section 19) — unlike INDEX_GET's map-key
+                // lookup, there is no `RuntimeError` this instruction can
+                // raise.
+                const v = container.object.payload.record.fields[instr.operand];
+                v.incref();
+                try self.push(v);
+            },
+            .field_set => {
+                const v = try self.pop();
+                errdefer v.decref(self.allocator); // undo the stack's own claim if we never restore it below
+                v.incref();
+                errdefer v.decref(self.allocator); // undo the copy we're about to store, if push fails
+                const container = try self.pop();
+                defer container.decref(self.allocator);
+                const fields = container.object.payload.record.fields;
+                fields[instr.operand].decref(self.allocator);
+                fields[instr.operand] = v;
+                try self.push(v);
+            },
+
             .index_get => {
                 const index_val = try self.pop();
                 defer index_val.decref(self.allocator);
@@ -1583,6 +1643,12 @@ pub const Vm = struct {
                     .list => |list| list.items.len,
                     .map => |map| map.count(),
                     .string => |s| s.len,
+                    // `len(...)` isn't a defined operation on a struct
+                    // instance (GRAMMAR.bnf design note 3z has no "record
+                    // length" concept — its field count is always known at
+                    // compile time from the struct's own declaration, not
+                    // something a program need ask for at runtime).
+                    .record => return RuntimeError.TypeMismatch,
                 };
                 try self.push(.{ .int = @intCast(len) });
             },

@@ -162,6 +162,20 @@ pub const OpCode = enum(u8) {
     // compile-time constant.
     exit,
 
+    // Records (ISA.bnf section 19, GRAMMAR.bnf design note 3z). MAKE_STRUCT's
+    // operand is an index into `Program.struct_types` — the field COUNT
+    // isn't a separate operand since it's already
+    // `struct_types[idx].field_names.len` (mirrors CALL's single
+    // func-index operand, which likewise doesn't separately encode arity).
+    // FIELD_GET/FIELD_SET's operand is a field's compile-time-resolved
+    // ordinal within whatever struct type the popped value turns out to
+    // be — the compiler has already verified that field exists there, so
+    // unlike INDEX_GET/INDEX_SET there is no runtime name lookup and no way
+    // for either to fail.
+    make_struct,
+    field_get,
+    field_set,
+
     halt,
 };
 
@@ -245,7 +259,7 @@ pub const Chunk = struct {
                     try writer.print(" slot={d} len={d}\n", .{ idx.slot, idx.length });
                 },
                 .jump, .jump_if_false, .push_handler => try writer.print(" -> {d}\n", .{instr.operand}),
-                .call, .make_list, .make_map => try writer.print(" #{d}\n", .{instr.operand}),
+                .call, .make_list, .make_map, .make_struct, .field_get, .field_set => try writer.print(" #{d}\n", .{instr.operand}),
                 .open => {
                     const mode: value_mod.OpenMode = @enumFromInt(instr.operand);
                     try writer.print(" {s}\n", .{mode.name()});
@@ -277,17 +291,35 @@ pub const Function = struct {
     }
 };
 
+/// One declared struct type's shape (ISA.bnf section 19) — `type_name`/
+/// `field_names` are what every `.record` instance of this type shares (see
+/// `value.Object.Payload.record`'s doc comment); `field_names.len` is also
+/// MAKE_STRUCT's implicit field count for this type, the same way a
+/// `Function`'s own `arity` is never re-encoded in CALL's operand.
+pub const StructType = struct {
+    type_name: []const u8,
+    field_names: []const []const u8,
+};
+
 /// A fully compiled program: the top-level "main" chunk (executed as an
-/// implicit frame 0) plus every function declared in it, indexed by the
-/// operand CALL instructions use to name their target.
+/// implicit frame 0), every function declared in it (indexed by the operand
+/// CALL instructions use to name their target), and every struct type
+/// declared in it (indexed by the operand MAKE_STRUCT instructions use).
 pub const Program = struct {
     main: Chunk = .{},
     functions: []Function = &.{},
+    struct_types: []const StructType = &.{},
 
     pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
         self.main.deinit(allocator);
         for (self.functions) |*f| f.deinit(allocator);
         allocator.free(self.functions);
+        // `type_name`/each entry of `field_names` are borrowed straight from
+        // source text (ast.zig's usual convention), never owned here — only
+        // the `field_names` slice itself (this table's own allocation) and
+        // the `struct_types` slice are freed.
+        for (self.struct_types) |st| allocator.free(st.field_names);
+        allocator.free(self.struct_types);
     }
 
     /// Disassembles the main chunk followed by every function's chunk,
@@ -471,6 +503,40 @@ test "disassemble renders make_list and make_map with their element/pair count" 
         "0000 make_list #3\n0001 make_map #2\n",
         writer.buffered(),
     );
+}
+
+test "disassemble renders make_struct, field_get, and field_set with their operand" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emitWithOperand(allocator, .make_struct, 0);
+    _ = try chunk.emitWithOperand(allocator, .field_get, 1);
+    _ = try chunk.emitWithOperand(allocator, .field_set, 1);
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings(
+        "0000 make_struct #0\n0001 field_get #1\n0002 field_set #1\n",
+        writer.buffered(),
+    );
+}
+
+test "Program.deinit frees the struct_types table (field_names slice and the table itself)" {
+    const allocator = std.testing.allocator;
+    var program: Program = .{};
+    _ = try program.main.emit(allocator, .halt);
+
+    var struct_types: std.ArrayList(StructType) = .empty;
+    const field_names = try allocator.alloc([]const u8, 2);
+    field_names[0] = "x";
+    field_names[1] = "y";
+    try struct_types.append(allocator, .{ .type_name = "Point", .field_names = field_names });
+    program.struct_types = try struct_types.toOwnedSlice(allocator);
+
+    program.deinit(allocator); // must not leak (checked by std.testing.allocator)
 }
 
 test "disassemble renders the operand-less map/list/json instructions" {

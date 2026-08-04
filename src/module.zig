@@ -153,11 +153,18 @@ pub const Loader = struct {
         if (!allow_top_level_code) {
             for (program) |*stmt| {
                 switch (stmt.kind) {
-                    .function_decl, .import_stmt => {},
+                    // Struct/enum declarations are permitted here too
+                    // (GRAMMAR.bnf design notes 3z/3aa) — like a function
+                    // declaration, a type declaration compiles to no
+                    // executable code by itself (compiler.zig's
+                    // `compileModules` never calls `compileStmt` on either),
+                    // so it can't introduce the module-initialization-order
+                    // problem this check exists to sidestep.
+                    .function_decl, .import_stmt, .struct_decl, .enum_decl => {},
                     else => return self.fail(
                         LoadError.ImportedFileHasTopLevelCode,
                         key,
-                        "an imported file may only contain 'import' statements and function declarations",
+                        "an imported file may only contain 'import' statements, function declarations, and struct/enum declarations",
                     ),
                 }
             }

@@ -1,0 +1,10 @@
+enum Color { Red, Green }
+struct Point { int x, int y }
+struct Vec2 { int x, int y }
+
+Color c := Color.Red
+Point p := Point{x: 1, y: 2}
+Vec2 v := Vec2{x: 1, y: 2}
+
+print c == 0
+print (p == p)

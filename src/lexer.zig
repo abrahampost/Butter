@@ -59,6 +59,8 @@ pub const TokenType = enum {
     kw_exec,
     kw_now,
     kw_random,
+    kw_struct,
+    kw_enum,
 
     // Operators and punctuation
     plus,
@@ -84,6 +86,7 @@ pub const TokenType = enum {
     colon_equal,
     arrow,
     comma,
+    dot,
     dot_dot,
 
     newline,
@@ -140,6 +143,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "exec", .kw_exec },
     .{ "now", .kw_now },
     .{ "random", .kw_random },
+    .{ "struct", .kw_struct },
+    .{ "enum", .kw_enum },
 });
 
 pub const Token = struct {
@@ -331,7 +336,7 @@ pub const Lexer = struct {
             '[' => self.makeToken(.lbracket),
             ']' => self.makeToken(.rbracket),
             ',' => self.makeToken(.comma),
-            '.' => if (self.match('.')) self.makeToken(.dot_dot) else self.fail(Error.UnexpectedCharacter, "unexpected character"),
+            '.' => self.makeToken(if (self.match('.')) .dot_dot else .dot),
             '!' => self.makeToken(if (self.match('=')) .bang_equal else .bang),
             '<' => self.makeToken(if (self.match('=')) .less_equal else .less),
             '>' => self.makeToken(if (self.match('=')) .greater_equal else .greater),
@@ -403,7 +408,13 @@ test "a dot not followed by a digit does not start a float" {
     try std.testing.expectEqual(TokenType.int, a.type);
     try std.testing.expectEqualStrings("5", a.lexeme);
 
-    try std.testing.expectError(Error.UnexpectedCharacter, lexer.next());
+    // No longer a lexer error (design note 3z, field access): an INT
+    // immediately followed by '.' with no digit after it is now `.int`
+    // then `.dot` — same shape a struct-field access on an int expression
+    // would lex as. Whether that's meaningful is left entirely to the
+    // parser/compiler (it isn't: `NotAStruct` rejects it later).
+    const b = try lexer.next();
+    try std.testing.expectEqual(TokenType.dot, b.type);
 }
 
 test "lexes string literals" {
@@ -493,9 +504,8 @@ test "lexes '..' as a single range token" {
     try expectTokenTypes("0..10", &.{ .int, .dot_dot, .int, .eof });
 }
 
-test "a lone '.' is a lexer error" {
-    var lexer = Lexer.init(".");
-    try std.testing.expectError(Error.UnexpectedCharacter, lexer.next());
+test "lexes a lone '.' as a dot token (field access, design note 3z)" {
+    try expectTokenTypes(".", &.{ .dot, .eof });
 }
 
 test "'for' and 'in' are recognized as keywords" {
@@ -644,4 +654,20 @@ test "map/list and their builtins are recognized as keywords" {
     try expectTokenTypes("map list push keys has delete json stringify null mapx", &.{
         .kw_map, .kw_list, .kw_push, .kw_keys, .kw_has, .kw_delete, .kw_json, .kw_stringify, .kw_null, .identifier, .eof,
     });
+}
+
+test "'struct' and 'enum' are recognized as keywords" {
+    try expectTokenTypes("struct enum structx enumx", &.{
+        .kw_struct, .kw_enum, .identifier, .identifier, .eof,
+    });
+}
+
+test "lexes '.' as a distinct dot token, chainable like field access" {
+    try expectTokenTypes("a.b.c", &.{
+        .identifier, .dot, .identifier, .dot, .identifier, .eof,
+    });
+}
+
+test "'.' and '..' are distinct tokens" {
+    try expectTokenTypes(". .. .", &.{ .dot, .dot_dot, .dot, .eof });
 }

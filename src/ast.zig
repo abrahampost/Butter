@@ -37,6 +37,20 @@ pub const ValueType = enum {
     /// A refcounted heap list (GRAMMAR.bnf design note 3m) — same story as
     /// `map`, but ordered/indexed by INT instead of by STRING key.
     list,
+    /// A user-declared `struct` or `enum` type (GRAMMAR.bnf design notes 3z
+    /// and 3aa) — the actual name is never carried here, but in a sibling
+    /// `named_type: ?[]const u8` field alongside whichever `ValueType` this
+    /// is (`Param.named_type`, `Stmt.VarDecl.named_type`,
+    /// `Stmt.FunctionDecl.return_named_type`, `Stmt.FieldDecl.named_type`).
+    /// Keeping `ValueType` itself a plain, payload-less enum — rather than
+    /// turning it into a `union(enum)` — means every existing
+    /// `== .int`/`== .map`-style comparison across parser.zig/compiler.zig
+    /// keeps working unchanged; only call sites that actually need the name
+    /// (compiler.zig's type resolution, this file's debug printer) look at
+    /// the sibling field. The parser never resolves this name against
+    /// anything — that happens once, in compiler.zig, against the set of
+    /// struct/enum types registered across the whole compiled program.
+    named,
 };
 
 pub const UnaryOp = enum {
@@ -88,9 +102,24 @@ pub const ArraySpec = union(enum) {
 
 pub const Param = struct {
     type: ValueType,
+    /// Set only when `type == .named` — see `ValueType.named`'s doc comment.
+    named_type: ?[]const u8 = null,
     name: []const u8,
     /// null for a plain scalar parameter; see `ArraySpec` otherwise.
     array_size: ?ArraySpec = null,
+};
+
+/// One `<type> IDENTIFIER` field of a `struct` declaration (GRAMMAR.bnf
+/// design note 3z) — deliberately shaped like `Param` (same grammar, same
+/// `<type> IDENTIFIER` order) but without an `array_size`: a field is always
+/// exactly one `Value` slot in the record's `fields` array, the same
+/// restriction `map`/`list` params already have, extended to every field
+/// type (never a run of raw slots to lay out).
+pub const FieldDecl = struct {
+    type: ValueType,
+    /// Set only when `type == .named` — see `ValueType.named`'s doc comment.
+    named_type: ?[]const u8 = null,
+    name: []const u8,
 };
 
 pub const Expr = union(enum) {
@@ -104,6 +133,37 @@ pub const Expr = union(enum) {
     array_literal: []*Expr,
     index: Index,
     index_assign: IndexAssign,
+    /// `TypeName{field1: expr1, field2: expr2, ...}` (GRAMMAR.bnf design
+    /// note 3z) — constructs a heap record of the declared struct
+    /// `type_name`. Every field is required, keyed by name, any order in
+    /// source; `type_name`/each field's name are unresolved here (bare
+    /// source text) — compiler.zig resolves `type_name` against the
+    /// program's registered struct types, validates the field set exactly,
+    /// and reorders the field expressions into the struct's *declared*
+    /// order before emitting `MAKE_STRUCT` (ISA.bnf section 19), so bytecode
+    /// field order never depends on the order a literal happened to list
+    /// them in.
+    struct_literal: StructLiteral,
+    /// `<base>.IDENTIFIER` (GRAMMAR.bnf design notes 3z/3aa) — a struct
+    /// field read OR an enum variant reference (`Color.Red`); which one is
+    /// never decided here. The parser only ever produces this one shape for
+    /// every `.`-postfix, exactly the way `Index` doesn't care whether its
+    /// `base` is a list or a map — compiler.zig disambiguates by resolving
+    /// `base`: if it's a bare `.variable` that names no local in scope but
+    /// does name a declared enum type, this is an enum-variant reference
+    /// (compiles to a `PUSH_CONST` of a `Value.enum_value`); otherwise
+    /// `base`'s static type must be a struct, and `field` must be one of
+    /// its declared fields (`FIELD_GET`, ISA.bnf section 19) —
+    /// `SemanticError.NotAStruct`/`UnknownField`/`UnknownEnumVariant`
+    /// otherwise. Chains the same way `Index` does (`p.a.b`, `xs[0].x`) for
+    /// free, since both live in the same postfix loop (parser.zig's
+    /// `primary`).
+    field_access: FieldAccess,
+    /// `<base>.IDENTIFIER := <expression>` — the `.field_access`
+    /// counterpart to `.index_assign`; only ever a struct field write
+    /// (`assignment()` never turns an enum-variant reference into an
+    /// lvalue, the same way it never does for any other non-lvalue shape).
+    field_assign: FieldAssign,
     /// `<base>[start..end]` (GRAMMAR.bnf's Strings design notes) — a
     /// read-only substring, end exclusive, same convention as the
     /// for-loop's own range. Never produced as an assignment target: unlike
@@ -279,6 +339,27 @@ pub const Expr = union(enum) {
         value: *Expr,
     };
 
+    pub const FieldInit = struct {
+        name: []const u8,
+        value: *Expr,
+    };
+
+    pub const StructLiteral = struct {
+        type_name: []const u8,
+        fields: []FieldInit,
+    };
+
+    pub const FieldAccess = struct {
+        base: *Expr,
+        field: []const u8,
+    };
+
+    pub const FieldAssign = struct {
+        base: *Expr,
+        field: []const u8,
+        value: *Expr,
+    };
+
     pub const Slice = struct {
         base: *Expr,
         start: *Expr,
@@ -391,6 +472,20 @@ pub const StmtKind = union(enum) {
     return_stmt: *Expr,
     for_stmt: For,
     import_stmt: Import,
+    /// `[export] struct IDENTIFIER '{' <field-list> '}'` (GRAMMAR.bnf design
+    /// note 3z) — only ever produced at the top level (see parser.zig's
+    /// `topLevelDeclaration`), matching `function_decl`/`import_stmt`.
+    /// Compiles to nothing by itself (no codegen — purely a registration in
+    /// compiler.zig, the same way `import_stmt` is); a struct name is
+    /// resolved wherever `<type>` names it (`ValueType.named`) and a
+    /// literal constructs it (`Expr.struct_literal`).
+    struct_decl: StructDecl,
+    /// `[export] enum IDENTIFIER '{' <variant-list> '}'` (GRAMMAR.bnf design
+    /// note 3aa) — same top-level-only, registration-only shape as
+    /// `struct_decl`. A variant's runtime value is a compile-time constant
+    /// (`Value.enum_value`), never something this statement itself emits
+    /// any code for.
+    enum_decl: EnumDecl,
     /// `close <expression>` — a statement rather than an expression because,
     /// unlike `open`/`read`/`write`, it produces no value; `print` is the
     /// same shape for the same reason (design note 3l).
@@ -411,6 +506,8 @@ pub const StmtKind = union(enum) {
 
     pub const VarDecl = struct {
         type: ValueType,
+        /// Set only when `type == .named` — see `ValueType.named`'s doc comment.
+        named_type: ?[]const u8 = null,
         name: []const u8,
         /// null for a plain scalar declaration; `Some(n)` means this
         /// declares a fixed-size array of `n` elements of `type` instead
@@ -438,6 +535,9 @@ pub const StmtKind = union(enum) {
         name: []const u8,
         params: []Param,
         return_type: ValueType,
+        /// Set only when `return_type == .named` — see
+        /// `ValueType.named`'s doc comment.
+        return_named_type: ?[]const u8 = null,
         /// null for a plain scalar return type; see `ArraySpec` otherwise.
         return_array_size: ?ArraySpec = null,
         body: []Stmt,
@@ -480,6 +580,27 @@ pub const StmtKind = union(enum) {
     /// read, relative to the importing file's own directory.
     pub const Import = struct {
         path: []const u8,
+    };
+
+    /// Only ever produced at the top level (see parser.zig's
+    /// `topLevelDeclaration`) — same restriction `FunctionDecl` has, for the
+    /// same reason (GRAMMAR.bnf design note 3z).
+    pub const StructDecl = struct {
+        name: []const u8,
+        fields: []FieldDecl,
+        /// Whether this struct is nameable from a file that imports this
+        /// one (GRAMMAR.bnf design note h, extended to type declarations by
+        /// design note 3z). Irrelevant for uses from within the same file.
+        exported: bool = false,
+    };
+
+    /// Only ever produced at the top level, same as `StructDecl`
+    /// (GRAMMAR.bnf design note 3aa).
+    pub const EnumDecl = struct {
+        name: []const u8,
+        variants: [][]const u8,
+        /// See `StructDecl.exported`.
+        exported: bool = false,
     };
 };
 
@@ -553,6 +674,27 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try printExpr(writer, ia.index);
             try writer.writeAll(") ");
             try printExpr(writer, ia.value);
+            try writer.writeAll(")");
+        },
+        .struct_literal => |sl| {
+            try writer.print("(struct {s}", .{sl.type_name});
+            for (sl.fields) |f| {
+                try writer.print(" ({s} ", .{f.name});
+                try printExpr(writer, f.value);
+                try writer.writeAll(")");
+            }
+            try writer.writeAll(")");
+        },
+        .field_access => |fa| {
+            try writer.writeAll("(. ");
+            try printExpr(writer, fa.base);
+            try writer.print(" {s})", .{fa.field});
+        },
+        .field_assign => |fa| {
+            try writer.writeAll("(:= (. ");
+            try printExpr(writer, fa.base);
+            try writer.print(" {s}) ", .{fa.field});
+            try printExpr(writer, fa.value);
             try writer.writeAll(")");
         },
         .slice => |s| {
@@ -729,7 +871,9 @@ fn printArraySpecSuffix(writer: *std.Io.Writer, spec: ArraySpec) std.Io.Writer.E
     }
 }
 
-fn valueTypeName(t: ValueType) []const u8 {
+/// `named_type` is only consulted when `t == .named` (see
+/// `ValueType.named`'s doc comment); every other case ignores it.
+fn valueTypeName(t: ValueType, named_type: ?[]const u8) []const u8 {
     return switch (t) {
         .int => "int",
         .float => "float",
@@ -737,6 +881,7 @@ fn valueTypeName(t: ValueType) []const u8 {
         .string => "string",
         .map => "map",
         .list => "list",
+        .named => named_type.?,
     };
 }
 
@@ -746,9 +891,9 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
     switch (stmt.kind) {
         .var_decl => |d| {
             if (d.array_len) |n| {
-                try writer.print("({s}[{d}] {s}", .{ valueTypeName(d.type), n, d.name });
+                try writer.print("({s}[{d}] {s}", .{ valueTypeName(d.type, d.named_type), n, d.name });
             } else {
-                try writer.print("({s} {s}", .{ valueTypeName(d.type), d.name });
+                try writer.print("({s} {s}", .{ valueTypeName(d.type, d.named_type), d.name });
             }
             if (d.initializer) |init_expr| {
                 try writer.writeAll(" ");
@@ -794,10 +939,10 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
             try writer.print("({s}func {s} (", .{ prefix, f.name });
             for (f.params, 0..) |p, i| {
                 if (i > 0) try writer.writeAll(" ");
-                try writer.writeAll(valueTypeName(p.type));
+                try writer.writeAll(valueTypeName(p.type, p.named_type));
                 if (p.array_size) |spec| try printArraySpecSuffix(writer, spec);
             }
-            try writer.print(") {s}", .{valueTypeName(f.return_type)});
+            try writer.print(") {s}", .{valueTypeName(f.return_type, f.return_named_type)});
             if (f.return_array_size) |spec| try printArraySpecSuffix(writer, spec);
             try writer.writeAll(")\n");
             for (f.body) |*s| {
@@ -822,6 +967,20 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
             try writer.writeAll(")");
         },
         .import_stmt => |i| try writer.print("(import \"{s}\")", .{i.path}),
+        .struct_decl => |s| {
+            const prefix = if (s.exported) "export " else "";
+            try writer.print("({s}struct {s}", .{ prefix, s.name });
+            for (s.fields) |f| {
+                try writer.print(" ({s} {s})", .{ valueTypeName(f.type, f.named_type), f.name });
+            }
+            try writer.writeAll(")");
+        },
+        .enum_decl => |e| {
+            const prefix = if (e.exported) "export " else "";
+            try writer.print("({s}enum {s}", .{ prefix, e.name });
+            for (e.variants) |v| try writer.print(" {s}", .{v});
+            try writer.writeAll(")");
+        },
         .close_stmt => |e| {
             try writer.writeAll("(close ");
             try printExpr(writer, e);

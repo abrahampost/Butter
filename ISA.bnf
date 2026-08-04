@@ -42,7 +42,7 @@
    2. VALUE REPRESENTATION
    -------------------------------------------------------------------------- *)
 
-<value>    ::= INT | FLOAT | BOOL | ARRAY_REF | STREAM | NULL | OBJECT
+<value>    ::= INT | FLOAT | BOOL | ARRAY_REF | STREAM | NULL | ENUM_TAG | OBJECT
 
 (* INT and FLOAT are i64/f64.
 
@@ -69,14 +69,25 @@
    payload; there is exactly one null value.
 
    OBJECT is `*value.Object`, a refcounted heap allocation — the VM's only
-   heap-managed value kind. It holds a STRING, a list, or a map (section 11).
-   Every string value is one of these: a compile-time literal, a map-literal
-   key, a `MAP_KEYS` result, and a JSON-parsed string are all built the same
-   way, via `Value.newString(allocator, bytes)` — there is no separate
+   heap-managed value kind. It holds a STRING, a list, a map, or a RECORD
+   (section 11 for the first three, section 19 for RECORD). Every string
+   value is one of these: a compile-time literal, a map-literal key, a
+   `MAP_KEYS` result, and a JSON-parsed string are all built the same way,
+   via `Value.newString(allocator, bytes)` — there is no separate
    borrowed/unowned string representation. A Chunk's constant pool
    (`Chunk.constants`) holds one permanent owning reference to each
    OBJECT-backed constant, released on `Chunk.deinit`; PUSH_CONST increfs
    before pushing a copy onto the stack (section 11).
+
+   ENUM_TAG (section 20) is `value.EnumTag`: `{ type_index: u32, variant:
+   u32, type_name: []const u8, variant_name: []const u8 }` — a plain scalar,
+   NOT an OBJECT (no heap allocation, no refcount; as cheap to copy as an
+   INT). `type_index`/`variant` are what equality actually compares;
+   `type_name`/`variant_name` are carried alongside purely so this value can
+   describe itself when printed, with no side table to consult. Only ever
+   produced by PUSH_CONST — an enum variant reference (`EnumName.Variant`)
+   is a compile-time constant exactly like an INT or STRING literal, so
+   there is no dedicated opcode for constructing one.
 
    A compiled program is one main Chunk (top-level code, run as an implicit
    frame 0 — section 6) plus one Chunk per declared function, each with its
@@ -455,6 +466,50 @@
                                                leaves `Vm.exit_code` null)
                                                purely by checking that field.
 
+   MAKE_STRUCT  #type_index  ( f1..fn -- struct )
+                                               n = struct_types[type_index]
+                                               .field_names.len (never a
+                                               separate operand — mirrors
+                                               CALL not separately encoding
+                                               arity); pops the n values
+                                               already on the stack (a pure
+                                               MOVE — no incref/decref, same
+                                               as MAKE_LIST) and builds a
+                                               fresh RECORD object from them,
+                                               in order, sharing
+                                               struct_types[type_index]'s own
+                                               type_name/field_names slices;
+                                               pushes it. Full detail in
+                                               section 19. What a struct
+                                               literal (`TypeName{...}`,
+                                               GRAMMAR.bnf design note 3z)
+                                               compiles to.
+   FIELD_GET    #field_index  ( struct -- v )  pops struct (always a RECORD
+                                               object — compiler-verified,
+                                               never anything else reaches
+                                               here from compiled source);
+                                               pushes fields[field_index],
+                                               increffed. Unlike INDEX_GET,
+                                               this can raise no
+                                               RuntimeError at all — the
+                                               field's existence and index
+                                               are both resolved at compile
+                                               time (`SemanticError
+                                               .UnknownField` otherwise).
+                                               What `p.field` (a struct
+                                               field read) compiles to.
+   FIELD_SET    #field_index  ( struct v -- v )
+                                               increfs v, decrefs the old
+                                               fields[field_index], stores v
+                                               there, decrefs struct (this
+                                               instruction's own reference to
+                                               it — the record itself lives
+                                               on independent of this),
+                                               pushes v back. Same "no
+                                               RuntimeError possible" story
+                                               as FIELD_GET. What `p.field :=
+                                               v` compiles to.
+
    HALT                                       stop execution (only ever
                                                appears in the main chunk, at
                                                the very end); `Vm.exit_code`
@@ -561,6 +616,20 @@
    field (null / `.map` / `.list`, checked before `Local.array`) for a
    map/list local, which is always exactly one heap-reference slot,
    addressed via INDEX_GET/INDEX_SET rather than any array opcode.
+
+   `Local.named_ref` (section 19/20) is a third, independent optional axis
+   (set only when `Local.value_type == .named` — a struct- or enum-typed
+   local/parameter) recording which registered type this is and whether
+   it's a struct or an enum — never combined with `.array` (a struct/enum
+   local is always exactly one slot, same as a map/list), stored separately
+   from `Local.value_type` itself rather than turning it into a payload-
+   carrying union, for the same reason `Local.collection`/`Local.is_string`
+   are their own fields rather than folded into `Local.array`: it keeps
+   every existing `Local.value_type == .int`-style comparison working
+   unchanged. A struct-typed local's field reads/writes go through
+   FIELD_GET/FIELD_SET (section 19), never LOAD_INDEX/INDEX_GET; an
+   enum-typed local is an ordinary LOAD_LOCAL/STORE_LOCAL scalar, exactly
+   like an INT or BOOL local, just carrying an ENUM_TAG value instead.
 
    A function's parameters are its first locals, occupying slots
    0..arity-1: a scalar parameter costs one slot, a `.fixed(n)` array
@@ -1582,4 +1651,158 @@
    on the TypeMismatch path (`Vm.pop`'s usual convention, section 14's
    addendum) — the one place in this section refcounting is actually live,
    since a non-INT `start`/`end` could be a STRING.
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   19. RECORDS (MAKE_STRUCT, FIELD_GET, FIELD_SET — three new opcodes,
+       section 3; one new OBJECT payload, RECORD; one new `Program`-level
+       table, struct_types; GRAMMAR.bnf design note 3z)
+   -------------------------------------------------------------------------- *)
+
+   RECORD (a fourth `value.Object.Payload` variant, alongside STRING/list/
+   map) is `{ type_name: []const u8, field_names: []const []const u8,
+   fields: []Value }`. `type_name`/`field_names` are shared, PROGRAM-owned
+   slices — every instance of the same struct type points at the exact same
+   two slices (borrowed from that type's own `chunk_mod.StructType` entry,
+   below), never duplicated per instance; only `fields` (this instance's own
+   values) is unique and owned by this object. A struct value is a genuine
+   heap OBJECT, refcounted exactly like a list/map — `b := a` where `a` is
+   struct-typed aliases the same object, mutation through one is visible
+   through the other — but unlike a map, field access never hashes a
+   string: `fields[i]` is always the value of the i-th field IN DECLARATION
+   ORDER, an index resolved once, at compile time, from the field's name.
+
+   `chunk_mod.Program.struct_types: []const StructType` — a sibling table to
+   `Program.functions`, `StructType = { type_name, field_names }` — one
+   entry per struct OR enum type registered across the whole compiled
+   program (compiler.zig's `Compiler.types`), indexed identically: an
+   enum's own entry exists (`field_names = &.{}`) but is never actually
+   read, since MAKE_STRUCT's operand, by construction, only ever names a
+   struct's own type_index — this keeps a type_index resolved anywhere in
+   the compiler valid here unchanged, with no separate struct-only
+   renumbering pass needed.
+
+   MAKE_STRUCT/FIELD_GET/FIELD_SET are documented in full in section 3,
+   above. The key structural fact those three entries lean on: NEITHER
+   FIELD_GET NOR FIELD_SET CAN RAISE A RUNTIME ERROR. This is the entire
+   payoff of a struct being a NEW, compile-time-resolved value kind rather
+   than sugar over `map`: every field name is checked exactly once, at
+   compile time (`SemanticError.UnknownField`/`NotAStruct`), so by the time
+   either opcode runs, the field is known to exist at that exact index —
+   there is no `RuntimeError.KeyNotFound` counterpart the way a bad map key
+   read has.
+
+   `Local.named_ref`/`FunctionInfo.return_named_ref`/`param_named_refs`
+   (section 5) are how the compiler tracks "this local/parameter/return is
+   struct-typed, and which struct" without ever changing `Local.value_type`/
+   `ast.ValueType` from a plain closed enum into a payload-carrying union —
+   `ast.ValueType.named` is the one new tag; the actual registered-type
+   index (and whether it's a struct or an enum) always travels in a sibling
+   `?NamedTypeRef{ index, is_enum }` field instead. `compiler.zig`'s
+   `Compiler.types: []TypeDecl` is the single source of truth this all
+   resolves against, built by a two-stage pre-pass in `compileModules`
+   BEFORE functions are even registered (a param/return type may itself
+   name a struct/enum) — stage one collects every struct/enum NAME across
+   every module (so a struct's own fields can forward/mutually reference
+   another type regardless of declaration order, the same freedom functions
+   already have calling each other), stage two resolves each struct's field
+   types now that every name is known.
+
+   BOTH A STRUCT LITERAL (`TypeName{field: expr, ...}`) AND A FIELD
+   READ/WRITE (`p.field`, `p.field := v`) ARE FULLY STATIC. A struct literal
+   requires EXACTLY the declared field set — no fewer (`MissingField`), no
+   more (`UnknownField`), no duplicates (`DuplicateFieldInLiteral`) — and
+   compiles each field's value in the struct's OWN declared order regardless
+   of the order the literal listed them in, so MAKE_STRUCT's popped values
+   always land in the same order `struct_types[type_index].field_names`
+   records. A field read/write's base expression must have a STATICALLY
+   determinable struct type (`compiler.zig`'s `resolveStructBase`, via the
+   same `inferType` the rest of the static type checker, section 5's
+   addendum/GRAMMAR.bnf design note 3t, already uses) — `NotAStruct`
+   otherwise, even where the base's ACTUAL runtime type might have worked
+   out fine (e.g. a map/list element holding a struct) — this is a
+   deliberate, permanent restriction, not a "not yet implemented": there is
+   no slot to resolve FIELD_GET/FIELD_SET's operand against without a known
+   struct type at compile time.
+
+   A struct-typed local/field's DEFAULT value (no initializer; a function
+   falling off its end with a struct return type) is never a compile-time
+   constant — like an empty map/list, it is a genuine heap allocation, built
+   by `compiler.zig`'s `compileStructDefault` emitting each field's own
+   default (recursively — a struct field that is itself another struct
+   gets its own fresh MAKE_STRUCT) followed by MAKE_STRUCT.
+
+   `==`/`!=` between two struct values are POINTER IDENTITY ONLY, never
+   deep — the exact same rule list/map already follow (section 11); no
+   special case is added for structs.
+
+
+(* --------------------------------------------------------------------------
+   20. ENUMS (no new opcode — an enum variant reference is a PUSH_CONST of
+       an ENUM_TAG constant, section 2; GRAMMAR.bnf design note 3aa)
+   -------------------------------------------------------------------------- *)
+
+   `EnumName.Variant` (e.g. `Color.Red`) compiles to an ordinary PUSH_CONST
+   referencing a fresh ENUM_TAG constant added to the CURRENT CHUNK's own
+   constant pool — exactly like an INT or STRING literal, and for the same
+   reason: it's a value fully known at compile time, so there's nothing for
+   a dedicated opcode to compute at run time. `type_name`/`variant_name`
+   inside that constant simply borrow the declaration's own source text
+   (every other AST-borrowed string in this codebase already assumes the
+   source buffer outlives the `Vm.run` call, per ast.zig's file-level doc
+   comment — an ENUM_TAG constant needs nothing extra here).
+
+   DISAMBIGUATING A FIELD READ FROM A VARIANT REFERENCE IS THE COMPILER'S
+   JOB, NOT THE PARSER'S. The parser produces exactly one node shape,
+   `ast.Expr.field_access { base, field }`, for every `<expr> '.' IDENTIFIER`
+   — the same way `ast.Expr.Index` doesn't care whether its base is a list
+   or a map. `compiler.zig`'s `compileFieldAccess` resolves it: if `base` is
+   a bare `.variable` that names NO local currently in scope, but DOES name
+   a declared enum type (`Compiler.findTypeIndex`), it's a variant reference
+   (`compileEnumVariant`) — a local always wins over a same-named enum type
+   if one is in scope. Any other shape must resolve to a struct field read
+   (section 19); `SemanticError.NotAStruct`/`UnknownEnumVariant` cover the
+   ways either path can fail, both at compile time only.
+
+   AN ENUM-TYPED LOCAL/PARAMETER/RETURN IS TRACKED EXACTLY LIKE A
+   STRUCT-TYPED ONE (section 19's `Local.named_ref`/`NamedTypeRef` addendum
+   to section 5) — the only difference is `NamedTypeRef.is_enum`, which
+   `compiler.zig`'s `StaticType`/`DeclaredType` machinery checks wherever it
+   already checks `is_enum` for a struct: `typeCompatible` requires the
+   SAME declared enum type, no coercion, not even to/from a plain `int` —
+   this is the entire reason enum alternative B (a real distinct value kind)
+   was chosen over a bare "named int constants" scheme: `SemanticError.
+   TypeMismatch` catches a raw `int` passed where an enum is expected, at
+   compile time, the same way a `string` passed where a `bool` is expected
+   already is.
+
+   AN ENUM-TYPED LOCAL'S DEFAULT VALUE (no initializer, or falling off a
+   function's end) is its FIRST-DECLARED variant (index 0) — an ordinary
+   PUSH_CONST, exactly like any other scalar's default, since (unlike a
+   struct) an enum value is never a heap allocation.
+
+   `==`/`!=` BETWEEN TWO ENUM_TAG VALUES compare `type_index` AND `variant`
+   only (`Value.eql`'s `.enum_value` arm) — true only for the exact same
+   declared enum type and the exact same variant; comparing across two
+   different enum types, or against a bare INT, is simply `false`, never a
+   `RuntimeError` or a `SemanticError` — consistent with GRAMMAR.bnf design
+   note 3t's blanket "`==`/`!=` are never statically checked" rule. This is
+   a deliberate asymmetry: EVERY OTHER checked position (a var-decl
+   initializer, an assignment, a parameter, a return) enforces the exact
+   enum-type match at compile time, but `==`/`!=` themselves get no special
+   carve-out from the rule every other type pair already follows.
+
+   PRINT rendering (`Value.printAt`'s `.enum_value` arm) is the bare
+   `variant_name` (`Red`), unquoted — an ENUM_TAG is self-describing, unlike
+   every other case in `printAt` needing either a fixed per-kind string or a
+   lookup into the value it's rendering. `json.zig`'s `stringify` reports
+   `error.Unstringifiable` for an ENUM_TAG (`write`'s `.enum_value` arm) —
+   the same bucket a STREAM or ARRAY_REF falls into (section 12): JSON has
+   no native shape for an enum variant, and unlike a struct/map/list there
+   is no reasonable one-way rendering either (a bare string would silently
+   collide with an ordinary string value). `json_parse`/`convert` needs no
+   change in either direction — nothing on the JSON side can produce a
+   RECORD or an ENUM_TAG, so `json(...)` can never hand either kind back to
+   a program.
    ========================================================================== *)

@@ -109,6 +109,26 @@ pub const Object = struct {
         /// a re-serialized JSON document all see deterministic,
         /// insertion-order output rather than hash-bucket order.
         map: std.StringArrayHashMapUnmanaged(Value),
+        /// A struct instance (GRAMMAR.bnf design note 3z, ISA.bnf section
+        /// 19) — an ORDERED, compile-time-fixed set of fields, unlike
+        /// `map`'s runtime string-keyed hash lookup: `fields[i]` is always
+        /// the value of the struct type's i-th declared field, an index the
+        /// compiler resolves once from the field's NAME and bakes directly
+        /// into `FIELD_GET`/`FIELD_SET`'s operand — no runtime name lookup,
+        /// no `RuntimeError.KeyNotFound` (a wrong field name is a compile
+        /// error, `SemanticError.UnknownField`). `type_name` and
+        /// `field_names` are shared, program-owned slices (borrowed from
+        /// the compiler's registered struct-type table, `chunk.Program
+        /// .struct_types` — same lifetime as `Function.name`), so every
+        /// instance of the same struct type points at the same two slices;
+        /// only `fields` itself is unique per instance.
+        record: Record,
+    };
+
+    pub const Record = struct {
+        type_name: []const u8,
+        field_names: []const []const u8,
+        fields: []Value,
     };
 
     pub fn create(allocator: std.mem.Allocator, payload: Payload) !*Object {
@@ -134,6 +154,15 @@ pub const Object = struct {
                     entry.value_ptr.decref(allocator);
                 }
                 map.deinit(allocator);
+            },
+            .record => |*record| {
+                // type_name/field_names are borrowed from the program's own
+                // struct-type table (chunk.Program.struct_types) — never
+                // owned by any one instance, so never freed here; only
+                // `fields` (this instance's own values and their backing
+                // slice) belongs to this object.
+                for (record.fields) |v| v.decref(allocator);
+                allocator.free(record.fields);
             },
         }
         allocator.destroy(self);
@@ -174,6 +203,23 @@ pub const Object = struct {
     }
 };
 
+/// A single enum variant reference (GRAMMAR.bnf design note 3aa, ISA.bnf
+/// section 20) — a plain scalar `Value`, NOT heap/refcounted: copying it is
+/// as free as copying an `int`. `type_index`/`variant` are what `eql`
+/// actually compares (a small integer pair, one per declared enum type/
+/// variant, assigned by the compiler in declaration order); `type_name`/
+/// `variant_name` are carried alongside purely so `typeName`/`printAt` can
+/// render this value on their own, with no table to consult — every
+/// occurrence of this same variant in a compiled program is a value-equal
+/// (not just index-equal) `EnumTag`, so there is nothing to deduplicate or
+/// own here, unlike `Object`.
+pub const EnumTag = struct {
+    type_index: u32,
+    variant: u32,
+    type_name: []const u8,
+    variant_name: []const u8,
+};
+
 pub const Value = union(enum) {
     int: i64,
     float: f64,
@@ -184,6 +230,8 @@ pub const Value = union(enum) {
     /// exactly one null value, and copying/discarding it is as free as any
     /// other scalar.
     null_value,
+    /// A named enum variant (GRAMMAR.bnf design note 3aa) — see `EnumTag`.
+    enum_value: EnumTag,
     object: *Object,
 
     /// Allocates a new heap string value: dupes `bytes` into an
@@ -205,10 +253,16 @@ pub const Value = union(enum) {
             .array_ref => "array",
             .stream => "stream",
             .null_value => "null",
+            // Unlike every other case here, this isn't a fixed string — it's
+            // the declared name of whichever enum type this value actually
+            // is (e.g. "Color"), carried directly in the tag (see
+            // `EnumTag`'s doc comment) rather than looked up anywhere.
+            .enum_value => |e| e.type_name,
             .object => |o| switch (o.payload) {
                 .string => "string",
                 .list => "list",
                 .map => "map",
+                .record => |r| r.type_name,
             },
         };
     }
@@ -292,9 +346,15 @@ pub const Value = union(enum) {
             // equal stream value naming an entirely different file.
             .stream => |av| b == .stream and std.meta.eql(av, b.stream),
             .null_value => b == .null_value,
+            // Same type-and-variant only — comparing against a mismatched
+            // enum type, or against any non-enum value, is simply `false`,
+            // never a type error (GRAMMAR.bnf design note 3t: `==`/`!=` are
+            // deliberately never type-checked, and enums get no special
+            // carve-out from that rule).
+            .enum_value => |ae| b == .enum_value and ae.type_index == b.enum_value.type_index and ae.variant == b.enum_value.variant,
             .object => |ao| switch (ao.payload) {
                 .string => unreachable, // asStringBytes above already handled this
-                .list, .map => b == .object and ao == b.object,
+                .list, .map, .record => b == .object and ao == b.object,
             },
         };
     }
@@ -328,6 +388,11 @@ pub const Value = union(enum) {
                 .file => |slot| try writer.print("<file {d}>", .{slot}),
             },
             .null_value => try writer.writeAll("null"),
+            // Bare, unquoted variant name (like `boolean` prints `true`, not
+            // `"true"`) — regardless of `quoted`, since an enum value has no
+            // separate "as a list/map element" rendering to distinguish
+            // (GRAMMAR.bnf design note 3aa).
+            .enum_value => |e| try writer.writeAll(e.variant_name),
             .object => |o| switch (o.payload) {
                 .string => |v| if (quoted) try writer.print("\"{s}\"", .{v}) else try writer.writeAll(v),
                 .list => |list| {
@@ -348,6 +413,20 @@ pub const Value = union(enum) {
                         if (i > 0) try writer.writeAll(", ");
                         try writer.print("\"{s}\": ", .{entry.key_ptr.*});
                         try entry.value_ptr.printAt(writer, depth + 1, true);
+                    }
+                    try writer.writeAll("}");
+                },
+                // Renders like `map` — a JSON-object shape keyed by each
+                // field's declared name, in declared order (GRAMMAR.bnf
+                // design note 3z) — but the keys come from the struct
+                // type's own `field_names`, not per-instance storage.
+                .record => |r| {
+                    if (depth >= max_print_depth) return writer.writeAll("...");
+                    try writer.writeAll("{");
+                    for (r.field_names, r.fields, 0..) |name, v, i| {
+                        if (i > 0) try writer.writeAll(", ");
+                        try writer.print("\"{s}\": ", .{name});
+                        try v.printAt(writer, depth + 1, true);
                     }
                     try writer.writeAll("}");
                 },
@@ -524,4 +603,76 @@ test "print caps recursion depth on a self-referential list" {
     var writer = std.Io.Writer.fixed(&buf);
     try (Value{ .object = obj }).print(&writer);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "...") != null);
+}
+
+test "destroying a record recursively decrefs its fields and frees the fields slice" {
+    const allocator = std.testing.allocator;
+    const inner = try Object.create(allocator, .{ .list = .empty });
+
+    const field_names = [_][]const u8{ "x", "y" };
+    const fields = try allocator.alloc(Value, 2);
+    fields[0] = .{ .int = 1 };
+    fields[1] = .{ .object = inner }; // adopts inner's +1
+
+    const record_obj = try Object.create(allocator, .{ .record = .{
+        .type_name = "Point",
+        .field_names = &field_names,
+        .fields = fields,
+    } });
+    (Value{ .object = record_obj }).decref(allocator); // frees record_obj, decrefs inner to 0, frees inner
+}
+
+test "print renders a record like a map, keyed by its declared field names" {
+    const allocator = std.testing.allocator;
+    const field_names = [_][]const u8{ "x", "y" };
+    const fields = try allocator.alloc(Value, 2);
+    fields[0] = .{ .int = 1 };
+    fields[1] = try Value.newString(allocator, "a");
+
+    const record_obj = try Object.create(allocator, .{ .record = .{
+        .type_name = "Point",
+        .field_names = &field_names,
+        .fields = fields,
+    } });
+    defer (Value{ .object = record_obj }).decref(allocator);
+
+    try expectPrint(.{ .object = record_obj }, "{\"x\": 1, \"y\": \"a\"}");
+    try std.testing.expectEqualStrings("Point", (Value{ .object = record_obj }).typeName());
+}
+
+test "eql compares records by pointer identity, never deep" {
+    const allocator = std.testing.allocator;
+    const field_names = [_][]const u8{"x"};
+    const fields_a = try allocator.alloc(Value, 1);
+    fields_a[0] = .{ .int = 1 };
+    const fields_b = try allocator.alloc(Value, 1);
+    fields_b[0] = .{ .int = 1 };
+
+    const a = try Object.create(allocator, .{ .record = .{ .type_name = "Point", .field_names = &field_names, .fields = fields_a } });
+    defer (Value{ .object = a }).decref(allocator);
+    const b = try Object.create(allocator, .{ .record = .{ .type_name = "Point", .field_names = &field_names, .fields = fields_b } });
+    defer (Value{ .object = b }).decref(allocator);
+
+    try std.testing.expect(Value.eql(.{ .object = a }, .{ .object = a }));
+    try std.testing.expect(!Value.eql(.{ .object = a }, .{ .object = b }));
+}
+
+test "enum_value eql compares by type_index+variant; typeName/print use the carried names" {
+    const red: Value = .{ .enum_value = .{ .type_index = 0, .variant = 0, .type_name = "Color", .variant_name = "Red" } };
+    const red_again: Value = .{ .enum_value = .{ .type_index = 0, .variant = 0, .type_name = "Color", .variant_name = "Red" } };
+    const green: Value = .{ .enum_value = .{ .type_index = 0, .variant = 1, .type_name = "Color", .variant_name = "Green" } };
+    const other_type_zero: Value = .{ .enum_value = .{ .type_index = 1, .variant = 0, .type_name = "Size", .variant_name = "Small" } };
+
+    try std.testing.expect(Value.eql(red, red_again));
+    try std.testing.expect(!Value.eql(red, green));
+    // Different enum TYPE, same numeric variant tag — still not equal, and
+    // not a compile-time-relevant distinction here since eql never errors
+    // across types (GRAMMAR.bnf design note 3t).
+    try std.testing.expect(!Value.eql(red, other_type_zero));
+    // Never equal to a bare int either, even one matching its own variant
+    // tag — this is exactly the type-safety alternative B was chosen for.
+    try std.testing.expect(!Value.eql(red, .{ .int = 0 }));
+
+    try std.testing.expectEqualStrings("Color", red.typeName());
+    try expectPrint(red, "Red");
 }

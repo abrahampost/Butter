@@ -52,6 +52,42 @@ pub const SemanticError = error{
     /// is left to the existing runtime `RuntimeError.TypeMismatch` checks,
     /// same as before this feature existed.
     TypeMismatch,
+    /// A `<type>` position (var-decl, param, return type, struct field)
+    /// names an IDENTIFIER that isn't any declared struct/enum type
+    /// (GRAMMAR.bnf design notes 3z/3aa) — the struct/enum counterpart to
+    /// `UndefinedFunction`.
+    UndefinedType,
+    /// A struct or enum is declared with a name another struct or enum
+    /// already has, anywhere in the compiled program (they share one
+    /// namespace) — the struct/enum counterpart to `DuplicateFunction`.
+    DuplicateTypeName,
+    /// A struct declaration repeats the same field name twice.
+    DuplicateField,
+    /// An enum declaration repeats the same variant name twice.
+    DuplicateVariant,
+    /// A `.field` read/write, or a struct literal's key, names a field the
+    /// struct doesn't have. Never a `RuntimeError` — this is the entire
+    /// point of alternative C's compile-time-resolved field access (design
+    /// note 3z): a wrong field name is always caught here, never surfaces
+    /// as a runtime `KeyNotFound`-style failure the way a bad map key would.
+    UnknownField,
+    /// A struct literal doesn't supply a value for one of its declared
+    /// fields — every field is required (design note 3z).
+    MissingField,
+    /// A struct literal gives the same field a value more than once.
+    DuplicateFieldInLiteral,
+    /// A `.field` access's base is statically known to be something other
+    /// than a struct (or its type can't be pinned down at compile time at
+    /// all) — field access, unlike bracket-indexing, is never left to a
+    /// runtime check: the field's slot has to be known here (design note
+    /// 3z), so there is nothing for the VM to check instead.
+    NotAStruct,
+    /// `EnumType.name` where `name` isn't one of that enum's declared
+    /// variants.
+    UnknownEnumVariant,
+    /// A struct/enum type exists but isn't exported by a module this file
+    /// imports — the struct/enum counterpart to `FunctionNotVisible`.
+    TypeNotVisible,
 };
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
@@ -107,6 +143,75 @@ const Local = struct {
     /// a bare-array-name index, the element type `compileIndex`'s
     /// LOAD_INDEX/LOAD_INDEX_REF path produces.
     value_type: ast.ValueType,
+    /// Set only when `value_type == .named` (a struct/enum-typed local or
+    /// parameter — always exactly one heap-reference or scalar slot, same
+    /// as `collection`/`is_string`, so never combined with `array`) — which
+    /// registered type this is and whether it's a struct or an enum. See
+    /// `ast.ValueType.named`'s doc comment for why this travels as a
+    /// sibling field rather than being folded into `value_type` itself.
+    named_ref: ?NamedTypeRef = null,
+};
+
+/// Which registered type (in `Compiler.types`) a `.named` `ast.ValueType`
+/// resolves to, and whether it's a struct or an enum (GRAMMAR.bnf design
+/// notes 3z/3aa) — see `ast.ValueType.named`'s doc comment for why this
+/// travels as a sibling value rather than being folded into `ast.ValueType`
+/// itself.
+const NamedTypeRef = struct {
+    index: u32,
+    is_enum: bool,
+};
+
+/// The compiler's own working currency wherever `ast.ValueType` alone
+/// denoted a fully-resolved DECLARED type before struct/enum existed (a
+/// local's/parameter's/field's own type, a function's return type):
+/// `named_ref` is set (and `type == .named`) for a struct/enum-typed
+/// position, resolved once (`resolveDeclaredType`) rather than re-resolved
+/// by name on every use.
+const DeclaredType = struct {
+    type: ast.ValueType,
+    named_ref: ?NamedTypeRef = null,
+
+    fn builtin(t: ast.ValueType) DeclaredType {
+        std.debug.assert(t != .named);
+        return .{ .type = t };
+    }
+};
+
+/// One field of a registered struct type — `type` is already fully
+/// resolved (never a bare unresolved name), unlike `ast.FieldDecl`.
+const FieldInfo = struct {
+    name: []const u8,
+    type: DeclaredType,
+};
+
+const TypeKind = union(enum) {
+    struct_decl: struct {
+        /// Allocator-owned (`Compiler.allocator`) — freed by `Compiler.deinit`.
+        /// Empty until stage 2 of `compileModules`'s type pre-pass resolves
+        /// it (stage 1 only registers the NAME, so mutually/forward-
+        /// referencing struct fields can resolve regardless of declaration
+        /// order — same reasoning `FunctionInfo`'s own up-front registration
+        /// pass already relies on).
+        fields: []const FieldInfo,
+    },
+    /// Borrowed directly from the declaring `ast.Stmt.EnumDecl` — never
+    /// needs resolution the way a struct's fields do (a variant is just a
+    /// name, not itself a `<type>`), so nothing to freshly allocate here.
+    enum_decl: struct {
+        variants: []const []const u8,
+    },
+};
+
+/// A registered struct or enum type (GRAMMAR.bnf design notes 3z/3aa) —
+/// struct and enum names share one namespace, program-wide, exactly
+/// mirroring how function names are unique across the whole compiled
+/// program regardless of which module declares them.
+const TypeDecl = struct {
+    name: []const u8,
+    module: usize,
+    exported: bool,
+    kind: TypeKind,
 };
 
 const CollectionKind = enum { map, list };
@@ -127,7 +232,7 @@ fn collectionKind(value_type: ast.ValueType) ?CollectionKind {
     return switch (value_type) {
         .map => .map,
         .list => .list,
-        .int, .float, .bool, .string => null,
+        .int, .float, .bool, .string, .named => null,
     };
 }
 
@@ -156,6 +261,11 @@ fn collectionKind(value_type: ast.ValueType) ?CollectionKind {
 const FunctionInfo = struct {
     name: []const u8,
     params: []const ast.Param,
+    /// Parallel to `params` (same length, same index correspondence) —
+    /// `params[i].named_type` resolved once at registration time, rather
+    /// than by name on every call site. Allocator-owned; freed by
+    /// `Compiler.deinit`.
+    param_named_refs: []const ?NamedTypeRef,
     return_array_size: ?ast.ArraySpec,
     /// The declared return type — for an array-returning function, its
     /// scalar ELEMENT type (same convention as `Local.value_type`). Used by
@@ -163,6 +273,9 @@ const FunctionInfo = struct {
     /// and to check an array-returning call's element type against a
     /// declared array local's.
     return_type: ast.ValueType,
+    /// Set only when `return_type == .named` — see `Local.named_ref`'s doc
+    /// comment for why this travels as a sibling field.
+    return_named_ref: ?NamedTypeRef,
     arity: u32,
     index: u32,
     module: usize,
@@ -212,6 +325,12 @@ pub const Compiler = struct {
     /// rather than growing the frame unboundedly.
     next_slot: u32 = 0,
     functions: std.ArrayList(FunctionInfo) = .empty,
+    /// Every struct/enum type registered across all modules (GRAMMAR.bnf
+    /// design notes 3z/3aa), built by a two-stage pre-pass in
+    /// `compileModules` before functions are even registered (a param/
+    /// return type may itself be a struct/enum, so type names must already
+    /// be known by the time functions are registered).
+    types: std.ArrayList(TypeDecl) = .empty,
     /// True while compiling a function body — the only context in which
     /// `return` is legal (see `SemanticError.ReturnOutsideFunction`).
     in_function: bool = false,
@@ -239,6 +358,10 @@ pub const Compiler = struct {
     /// type when `current_return_array_size` isn't null) — a scalar
     /// `return`'s static type check (design note 3t) is against this.
     current_return_type: ast.ValueType = .int,
+    /// Set alongside `current_return_type` for the duration of
+    /// `compileFunctionBody` — see `Local.named_ref`'s doc comment for why
+    /// this travels as a sibling field.
+    current_return_named_ref: ?NamedTypeRef = null,
     /// The line number of the statement currently being compiled, used by
     /// `fail()` to stamp error diagnostics with accurate source locations.
     current_line: usize = 0,
@@ -254,7 +377,13 @@ pub const Compiler = struct {
     /// `program.deinit` themselves.
     pub fn deinit(self: *Compiler) void {
         self.locals.deinit(self.allocator);
+        for (self.functions.items) |f| self.allocator.free(f.param_named_refs);
         self.functions.deinit(self.allocator);
+        for (self.types.items) |t| switch (t.kind) {
+            .struct_decl => |sd| self.allocator.free(sd.fields),
+            .enum_decl => {},
+        };
+        self.types.deinit(self.allocator);
     }
 
     /// Compiles a single, self-contained `ast.Program` with no imports —
@@ -288,7 +417,68 @@ pub const Compiler = struct {
     /// dependency's functions get compiled exactly once here rather than
     /// once per importer.
     pub fn compileModules(self: *Compiler, entry: usize, modules: []const ModuleUnit) CompileError!chunk_mod.Program {
+        // Pass 0a: collect every struct/enum type's NAME across all modules
+        // (GRAMMAR.bnf design notes 3z/3aa) before resolving any of them —
+        // this is what lets a struct's field (stage 0b, below), or a
+        // function's param/return type (pass 1), reference a struct/enum
+        // declared later in the same file or in another module entirely,
+        // exactly the way functions can already call each other regardless
+        // of declaration order.
         for (modules, 0..) |m, mi| {
+            for (m.program) |*stmt| {
+                const name, const exported = switch (stmt.kind) {
+                    .struct_decl => |s| .{ s.name, s.exported },
+                    .enum_decl => |e| .{ e.name, e.exported },
+                    else => continue,
+                };
+                self.current_line = stmt.line;
+                if (self.findTypeIndex(name) != null) {
+                    return self.fail(SemanticError.DuplicateTypeName, name, "a struct or enum with this name already exists");
+                }
+                const kind: TypeKind = switch (stmt.kind) {
+                    .struct_decl => .{ .struct_decl = .{ .fields = &.{} } }, // resolved in stage 0b, below
+                    .enum_decl => |e| blk: {
+                        for (e.variants, 0..) |v, i| {
+                            for (e.variants[0..i]) |prev| {
+                                if (std.mem.eql(u8, prev, v)) return self.fail(SemanticError.DuplicateVariant, v, "a variant with this name is already declared in this enum");
+                            }
+                        }
+                        break :blk .{ .enum_decl = .{ .variants = e.variants } };
+                    },
+                    else => unreachable,
+                };
+                try self.types.append(self.allocator, .{ .name = name, .module = mi, .exported = exported, .kind = kind });
+            }
+        }
+
+        // Pass 0b: resolve every struct's field types now that every type's
+        // NAME (from every module) is registered. Each struct is resolved
+        // from its own declaring module's visibility perspective
+        // (`resolveDeclaredType`/`typeVisible`, mirroring `functionVisible`).
+        for (modules, 0..) |m, mi| {
+            self.current_module = mi;
+            self.visible_imports = m.imports;
+            for (m.program) |*stmt| {
+                if (stmt.kind != .struct_decl) continue;
+                const s = stmt.kind.struct_decl;
+                self.current_line = stmt.line;
+                const type_index = self.findTypeIndex(s.name).?; // registered in stage 0a, above
+
+                const fields = try self.allocator.alloc(FieldInfo, s.fields.len);
+                errdefer self.allocator.free(fields);
+                for (s.fields, 0..) |fd, i| {
+                    for (s.fields[0..i]) |prev| {
+                        if (std.mem.eql(u8, prev.name, fd.name)) return self.fail(SemanticError.DuplicateField, fd.name, "a field with this name is already declared in this struct");
+                    }
+                    fields[i] = .{ .name = fd.name, .type = try self.resolveDeclaredType(fd.type, fd.named_type) };
+                }
+                self.types.items[type_index].kind.struct_decl.fields = fields;
+            }
+        }
+
+        for (modules, 0..) |m, mi| {
+            self.current_module = mi;
+            self.visible_imports = m.imports;
             for (m.program) |*stmt| {
                 if (stmt.kind != .function_decl) continue;
                 const f = stmt.kind.function_decl;
@@ -296,11 +486,19 @@ pub const Compiler = struct {
                     self.current_line = stmt.line;
                     return self.fail(SemanticError.DuplicateFunction, f.name, "function already declared");
                 }
+                self.current_line = stmt.line;
+                const param_named_refs = try self.allocator.alloc(?NamedTypeRef, f.params.len);
+                for (f.params, 0..) |p, i| {
+                    param_named_refs[i] = if (p.type == .named) (try self.resolveDeclaredType(p.type, p.named_type)).named_ref else null;
+                }
+                const return_named_ref: ?NamedTypeRef = if (f.return_type == .named) (try self.resolveDeclaredType(f.return_type, f.return_named_type)).named_ref else null;
                 try self.functions.append(self.allocator, .{
                     .name = f.name,
                     .params = f.params,
+                    .param_named_refs = param_named_refs,
                     .return_array_size = f.return_array_size,
                     .return_type = f.return_type,
+                    .return_named_ref = return_named_ref,
                     .arity = totalParamWidth(f.params),
                     .index = @intCast(self.functions.items.len),
                     .module = mi,
@@ -321,7 +519,7 @@ pub const Compiler = struct {
         var main_chunk: Chunk = blk: {
             errdefer self.chunk.deinit(self.allocator);
             for (modules[entry].program) |*stmt| {
-                if (stmt.kind == .function_decl or stmt.kind == .import_stmt) continue;
+                if (stmt.kind == .function_decl or stmt.kind == .import_stmt or stmt.kind == .struct_decl or stmt.kind == .enum_decl) continue;
                 try self.compileStmt(stmt);
             }
             _ = try self.chunk.emit(self.allocator, .halt);
@@ -355,7 +553,36 @@ pub const Compiler = struct {
             }
         }
 
-        return .{ .main = main_chunk, .functions = try compiled.toOwnedSlice(self.allocator) };
+        // Builds the runtime-facing struct-type table MAKE_STRUCT's operand
+        // indexes into (ISA.bnf section 19) — indexed identically to
+        // `self.types` itself (one entry per registered type, struct OR
+        // enum) so a type_index resolved anywhere in this compiler is
+        // always valid here unchanged; an enum's own entry is never
+        // actually read (MAKE_STRUCT's operand, by construction, only ever
+        // names a struct's own type_index) but is filled in anyway rather
+        // than left a gap, so this table's shape needs no separate
+        // struct-only renumbering pass.
+        var struct_types_list: std.ArrayList(chunk_mod.StructType) = .empty;
+        errdefer {
+            for (struct_types_list.items) |st| self.allocator.free(st.field_names);
+            struct_types_list.deinit(self.allocator);
+        }
+        for (self.types.items) |t| {
+            switch (t.kind) {
+                .struct_decl => |sd| {
+                    const field_names = try self.allocator.alloc([]const u8, sd.fields.len);
+                    for (sd.fields, 0..) |f, j| field_names[j] = f.name;
+                    try struct_types_list.append(self.allocator, .{ .type_name = t.name, .field_names = field_names });
+                },
+                .enum_decl => try struct_types_list.append(self.allocator, .{ .type_name = t.name, .field_names = &.{} }),
+            }
+        }
+
+        return .{
+            .main = main_chunk,
+            .functions = try compiled.toOwnedSlice(self.allocator),
+            .struct_types = try struct_types_list.toOwnedSlice(self.allocator),
+        };
     }
 
     /// Compiles one function's body into a fresh, self-contained chunk:
@@ -374,10 +601,12 @@ pub const Compiler = struct {
         self.in_function = true;
         self.current_return_array_size = f.return_array_size;
         self.current_return_type = f.return_type;
+        self.current_return_named_ref = self.findFunction(f.name).?.return_named_ref;
         defer self.in_function = false;
         defer self.current_return_array_size = null;
 
-        for (f.params) |p| {
+        const info = self.findFunction(f.name).?;
+        for (f.params, 0..) |p, i| {
             try self.locals.append(self.allocator, .{
                 .name = p.name,
                 .depth = 0,
@@ -386,6 +615,7 @@ pub const Compiler = struct {
                 .collection = collectionKind(p.type),
                 .is_string = p.type == .string,
                 .value_type = p.type,
+                .named_ref = info.param_named_refs[i],
             });
             self.next_slot += arraySpecWidth(p.array_size);
         }
@@ -399,7 +629,10 @@ pub const Compiler = struct {
         // since any index into it immediately bounds-checks out.
         if (self.current_return_array_size) |spec| switch (spec) {
             .fixed => |n| {
-                const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, f.return_type));
+                // Array element types are always plain scalars (design note
+                // 3e — a named struct/enum type never takes the array
+                // suffix), so `f.return_type` is never `.named` here.
+                const idx = try self.chunk.addConstant(self.allocator, try self.defaultValue(DeclaredType.builtin(f.return_type)));
                 var i: u32 = 0;
                 while (i < n) : (i += 1) _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             },
@@ -407,16 +640,14 @@ pub const Compiler = struct {
                 const idx = try self.chunk.addConstant(self.allocator, .{ .array_ref = .{ .base = 0, .len = 0 } });
                 _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             },
-        } else switch (f.return_type) {
-            // An empty map/list isn't a compile-time constant (it's a
-            // genuine heap allocation), so it can't route through
-            // `defaultValue`+PUSH_CONST the way every scalar zero value can.
-            .map => _ = try self.chunk.emitWithOperand(self.allocator, .make_map, 0),
-            .list => _ = try self.chunk.emitWithOperand(self.allocator, .make_list, 0),
-            else => {
-                const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, f.return_type));
-                _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
-            },
+        } else {
+            // An empty map/list, or a struct instance, isn't a compile-time
+            // constant (each is a genuine heap allocation), so this can't
+            // route through `defaultValue`+PUSH_CONST the way every scalar
+            // (including an enum's own zero value) can —
+            // `compileDefaultValue` is what tells these apart.
+            const dt: DeclaredType = if (f.return_type == .named) .{ .type = .named, .named_ref = self.current_return_named_ref } else DeclaredType.builtin(f.return_type);
+            try self.compileDefaultValue(dt);
         }
         _ = try self.chunk.emit(self.allocator, .ret);
 
@@ -428,6 +659,47 @@ pub const Compiler = struct {
             if (std.mem.eql(u8, f.name, name)) return f;
         }
         return null;
+    }
+
+    fn findTypeIndex(self: *const Compiler, name: []const u8) ?usize {
+        for (self.types.items, 0..) |t, i| {
+            if (std.mem.eql(u8, t.name, name)) return i;
+        }
+        return null;
+    }
+
+    fn findType(self: *const Compiler, name: []const u8) ?TypeDecl {
+        const i = self.findTypeIndex(name) orelse return null;
+        return self.types.items[i];
+    }
+
+    /// Mirrors `functionVisible` exactly (GRAMMAR.bnf design note h,
+    /// extended to type declarations by design notes 3z/3aa): a struct/enum
+    /// is nameable from wherever `self.current_module` is right now if it
+    /// belongs to that same module (regardless of `exported`), or if it's
+    /// `exported` by one of that module's *direct* imports.
+    fn typeVisible(self: *const Compiler, decl: TypeDecl) bool {
+        if (decl.module == self.current_module) return true;
+        if (!decl.exported) return false;
+        for (self.visible_imports) |m| {
+            if (m == decl.module) return true;
+        }
+        return false;
+    }
+
+    /// Resolves a parsed `<type>` (an `ast.ValueType` plus its sibling
+    /// `named_type` string — see `ast.ValueType.named`'s doc comment) into
+    /// this compiler's own `DeclaredType`. Every non-`.named` type passes
+    /// through unchanged; a `.named` one is looked up by name against
+    /// `self.types` (registered by `compileModules`'s pre-pass) and its
+    /// visibility checked the same way a called function's is.
+    fn resolveDeclaredType(self: *Compiler, t: ast.ValueType, named_type: ?[]const u8) CompileError!DeclaredType {
+        if (t != .named) return DeclaredType.builtin(t);
+        const name = named_type.?;
+        const index = self.findTypeIndex(name) orelse return self.fail(SemanticError.UndefinedType, name, "no struct or enum with this name is declared");
+        const decl = self.types.items[index];
+        if (!self.typeVisible(decl)) return self.fail(SemanticError.TypeNotVisible, name, "type exists but isn't exported by a module this file imports");
+        return .{ .type = .named, .named_ref = .{ .index = @intCast(index), .is_enum = decl.kind == .enum_decl } };
     }
 
     fn fail(self: *Compiler, comptime err: SemanticError, name: []const u8, message: []const u8) CompileError {
@@ -463,37 +735,66 @@ pub const Compiler = struct {
         scalar: ast.ValueType,
         stream,
         null_type,
+        /// A struct-typed value — index into `Compiler.types` (GRAMMAR.bnf
+        /// design note 3z). Never coerces to/from anything else, including
+        /// a different struct type: `typeCompatible` requires an exact
+        /// index match, the same "own exact type only, no coercions"
+        /// treatment `bool`/`string`/`map`/`list` already get.
+        struct_type: u32,
+        /// An enum-typed value — index into `Compiler.types` (GRAMMAR.bnf
+        /// design note 3aa). Same exact-match-only treatment as
+        /// `struct_type`.
+        enum_type: u32,
     };
 
     fn isNumericType(t: StaticType) bool {
         return switch (t) {
             .scalar => |v| v == .int or v == .float,
-            .stream, .null_type => false,
+            .stream, .null_type, .struct_type, .enum_type => false,
         };
     }
 
     fn isScalarType(t: StaticType, v: ast.ValueType) bool {
         return switch (t) {
             .scalar => |s| s == v,
-            .stream, .null_type => false,
+            .stream, .null_type, .struct_type, .enum_type => false,
         };
+    }
+
+    /// Converts an already-resolved `DeclaredType` (e.g. a struct field's
+    /// own type) into the `StaticType` an inferred expression would carry —
+    /// the two are the same information, just addressed from opposite
+    /// ends (a declared position vs. an expression's inferred type).
+    fn declaredToStatic(dt: DeclaredType) StaticType {
+        if (dt.named_ref) |ref| return if (ref.is_enum) StaticType{ .enum_type = ref.index } else StaticType{ .struct_type = ref.index };
+        return StaticType{ .scalar = dt.type };
     }
 
     /// Whether a value of static type `actual` may be used where `expected`
     /// (a declared `<type>`) is required: an exact scalar match, `int`
     /// widening to `float` (matching the VM's existing runtime int->float
-    /// promotion in add/sub/mul/div/mod/pow — ISA.bnf), or a stream
-    /// satisfying `int` (the codebase's existing convention for holding an
-    /// `open()` result — see `StaticType`). Note that widening is a
-    /// compile-time ACCEPTANCE only, not a runtime conversion: `float x :=
-    /// 5` still stores a raw `Value.int` in `x`'s slot, same as it always
-    /// has — arithmetic already promotes int/float dynamically regardless
-    /// of what a local was declared as, so this changes nothing observable.
-    fn typeCompatible(expected: ast.ValueType, actual: StaticType) bool {
+    /// promotion in add/sub/mul/div/mod/pow — ISA.bnf), a stream satisfying
+    /// `int` (the codebase's existing convention for holding an `open()`
+    /// result — see `StaticType`), or an exact struct/enum type-index match
+    /// (GRAMMAR.bnf design notes 3z/3aa — no coercions between struct/enum
+    /// types, not even between two otherwise-identical-shaped structs).
+    /// Note that widening is a compile-time ACCEPTANCE only, not a runtime
+    /// conversion: `float x := 5` still stores a raw `Value.int` in `x`'s
+    /// slot, same as it always has — arithmetic already promotes int/float
+    /// dynamically regardless of what a local was declared as, so this
+    /// changes nothing observable.
+    fn typeCompatible(expected: DeclaredType, actual: StaticType) bool {
+        if (expected.named_ref) |eref| {
+            return switch (actual) {
+                .struct_type => |i| !eref.is_enum and i == eref.index,
+                .enum_type => |i| eref.is_enum and i == eref.index,
+                .scalar, .stream, .null_type => false,
+            };
+        }
         return switch (actual) {
-            .scalar => |v| v == expected or (expected == .float and v == .int),
-            .stream => expected == .int,
-            .null_type => false,
+            .scalar => |v| v == expected.type or (expected.type == .float and v == .int),
+            .stream => expected.type == .int,
+            .null_type, .struct_type, .enum_type => false,
         };
     }
 
@@ -509,7 +810,7 @@ pub const Compiler = struct {
     /// doesn't track, e.g. a map/list element or `json`'s parsed root — is
     /// silently allowed here; the existing runtime checks remain the only
     /// guard for those, same as before this feature existed.
-    fn checkExpectedType(self: *Compiler, expr: *const ast.Expr, expected: ast.ValueType, name: []const u8, message: []const u8) CompileError!void {
+    fn checkExpectedType(self: *Compiler, expr: *const ast.Expr, expected: DeclaredType, name: []const u8, message: []const u8) CompileError!void {
         if (try self.inferType(expr)) |actual| {
             if (!typeCompatible(expected, actual)) return self.fail(SemanticError.TypeMismatch, name, message);
         }
@@ -538,6 +839,10 @@ pub const Compiler = struct {
             .variable => |name| blk: {
                 const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
                 if (local.array != null) return self.fail(SemanticError.ArrayUsedAsScalar, name, "an array must be indexed, not used as a plain value");
+                if (local.value_type == .named) {
+                    const ref = local.named_ref.?;
+                    break :blk if (ref.is_enum) StaticType{ .enum_type = ref.index } else StaticType{ .struct_type = ref.index };
+                }
                 break :blk StaticType{ .scalar = local.value_type };
             },
             .unary => |u| blk: {
@@ -559,12 +864,22 @@ pub const Compiler = struct {
             .call => |c| blk: {
                 const info = self.findFunction(c.name) orelse break :blk null; // real error raised when this call is actually compiled
                 if (info.return_array_size != null) break :blk null; // likewise ArrayUsedAsScalar, raised there
+                if (info.return_type == .named) {
+                    const ref = info.return_named_ref.?;
+                    break :blk if (ref.is_enum) StaticType{ .enum_type = ref.index } else StaticType{ .struct_type = ref.index };
+                }
                 break :blk StaticType{ .scalar = info.return_type };
             },
             .array_literal => StaticType{ .scalar = .list },
             .map_literal => StaticType{ .scalar = .map },
             .index => |ix| try self.inferIndexType(ix),
             .index_assign => |ia| try self.inferType(ia.value),
+            .struct_literal => |sl| blk: {
+                const idx = self.findTypeIndex(sl.type_name) orelse break :blk null; // real error raised when this is actually compiled
+                break :blk StaticType{ .struct_type = @intCast(idx) };
+            },
+            .field_access => |fa| try self.inferFieldAccessType(fa),
+            .field_assign => |fa| try self.inferType(fa.value),
             .slice => StaticType{ .scalar = .string },
             .len_of => StaticType{ .scalar = .int },
             .stream_literal => StaticType.stream,
@@ -611,6 +926,36 @@ pub const Compiler = struct {
         }
         if (try self.inferType(ix.base)) |bt| {
             if (isScalarType(bt, .string)) return StaticType{ .scalar = .string };
+        }
+        return null;
+    }
+
+    /// `<base>.field`'s static type where determinable: if `field_access`
+    /// resolves to an enum variant reference (`Color.Red`) the WHOLE
+    /// expression's type is that enum; if it resolves to a struct field
+    /// read, the field's own declared type. Never raises here even for a
+    /// shape that will turn out to be invalid — `compileFieldAccess` is the
+    /// authoritative check (`NotAStruct`/`UnknownField`/`UnknownEnumVariant`)
+    /// once the node is actually compiled; this is purely a best-effort hint
+    /// for the SURROUNDING expression's own type check, the same stance
+    /// `inferIndexType` already takes on a genuinely dynamic base.
+    fn inferFieldAccessType(self: *Compiler, fa: ast.Expr.FieldAccess) CompileError!?StaticType {
+        if (fa.base.* == .variable and self.resolveLocal(fa.base.variable) == null) {
+            const decl = self.findType(fa.base.variable) orelse return null; // undefined variable — real error raised when compiled
+            if (decl.kind != .enum_decl) return null;
+            for (decl.kind.enum_decl.variants) |v| {
+                if (std.mem.eql(u8, v, fa.field)) return StaticType{ .enum_type = @intCast(self.findTypeIndex(fa.base.variable).?) };
+            }
+            return null;
+        }
+        const base_type = try self.inferType(fa.base) orelse return null;
+        const type_index = switch (base_type) {
+            .struct_type => |i| i,
+            else => return null,
+        };
+        const fields = self.types.items[type_index].kind.struct_decl.fields;
+        for (fields) |f| {
+            if (std.mem.eql(u8, f.name, fa.field)) return declaredToStatic(f.type);
         }
         return null;
     }
@@ -685,7 +1030,7 @@ pub const Compiler = struct {
                         .generic => try self.compileGenericArrayReturn(e),
                     }
                 } else {
-                    try self.checkExpectedType(e, self.current_return_type, "return", "returned value's type does not match the function's declared return type");
+                    try self.checkExpectedType(e, .{ .type = self.current_return_type, .named_ref = self.current_return_named_ref }, "return", "returned value's type does not match the function's declared return type");
                     try self.compileExpr(e);
                 }
                 _ = try self.chunk.emit(self.allocator, .ret);
@@ -693,9 +1038,11 @@ pub const Compiler = struct {
             .function_decl => unreachable, // top-level only; compileModules never calls compileStmt on this
             .for_stmt => |f| try self.compileFor(f),
             .import_stmt => unreachable, // top-level only; compileModules never calls compileStmt on this
+            .struct_decl => unreachable, // top-level only; compileModules never calls compileStmt on this
+            .enum_decl => unreachable, // top-level only; compileModules never calls compileStmt on this
             .close_stmt => |e| try self.compileCloseStmt(e),
             .exit_stmt => |e| {
-                try self.checkExpectedType(e, .int, "exit", "exit code must be an int");
+                try self.checkExpectedType(e, DeclaredType.builtin(.int), "exit", "exit code must be an int");
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .exit);
             },
@@ -703,17 +1050,68 @@ pub const Compiler = struct {
         }
     }
 
-    /// Never actually called with `.map`/`.list` — every call site checks
-    /// for those first and emits MAKE_MAP/MAKE_LIST instead, since an empty
-    /// map/list isn't a compile-time constant `PUSH_CONST` could hold.
-    fn defaultValue(allocator: std.mem.Allocator, value_type: ast.ValueType) !Value {
-        return switch (value_type) {
+    /// Never actually called with `.map`/`.list`, or a struct-typed
+    /// `DeclaredType` — every call site routes those through
+    /// `compileDefaultValue` instead, since none of the three is a
+    /// compile-time constant `PUSH_CONST` could hold (an empty map/list or
+    /// a struct instance is a genuine heap allocation). An enum-typed
+    /// `DeclaredType` defaults to its first-declared variant (index 0) —
+    /// consistent with "falling off without return yields the declared
+    /// type's zero value" for every other type (GRAMMAR.bnf design note 3aa).
+    fn defaultValue(self: *Compiler, dt: DeclaredType) !Value {
+        if (dt.named_ref) |ref| {
+            std.debug.assert(ref.is_enum);
+            const decl = self.types.items[ref.index];
+            const variant_name = decl.kind.enum_decl.variants[0];
+            return .{ .enum_value = .{ .type_index = ref.index, .variant = 0, .type_name = decl.name, .variant_name = variant_name } };
+        }
+        return switch (dt.type) {
             .int => .{ .int = 0 },
             .float => .{ .float = 0.0 },
             .bool => .{ .boolean = false },
-            .string => try Value.newString(allocator, ""),
-            .map, .list => unreachable,
+            .string => try Value.newString(self.allocator, ""),
+            .map, .list, .named => unreachable,
         };
+    }
+
+    /// Emits the bytecode that leaves `dt`'s zero value on the stack —
+    /// PUSH_CONST for every scalar/enum type (`defaultValue`), MAKE_MAP/
+    /// MAKE_LIST for the two heap collection types, or a recursive
+    /// `compileStructDefault` for a struct type. The single place every
+    /// "no initializer" / "fell off the end of a function" default value
+    /// goes through, regardless of shape (GRAMMAR.bnf design notes 3z/3aa).
+    fn compileDefaultValue(self: *Compiler, dt: DeclaredType) CompileError!void {
+        if (dt.named_ref) |ref| {
+            if (ref.is_enum) {
+                const idx = try self.chunk.addConstant(self.allocator, try self.defaultValue(dt));
+                _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+            } else {
+                try self.compileStructDefault(ref.index);
+            }
+            return;
+        }
+        switch (dt.type) {
+            .map => _ = try self.chunk.emitWithOperand(self.allocator, .make_map, 0),
+            .list => _ = try self.chunk.emitWithOperand(self.allocator, .make_list, 0),
+            else => {
+                const idx = try self.chunk.addConstant(self.allocator, try self.defaultValue(dt));
+                _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+            },
+        }
+    }
+
+    /// A struct-typed default value (no initializer, or falling off a
+    /// function body without an explicit return) is always a fresh
+    /// MAKE_STRUCT, never a compile-time constant — same reason map/list's
+    /// own defaults are special-cased outside `defaultValue` (GRAMMAR.bnf
+    /// design note 3z: a struct instance is a genuine heap allocation).
+    /// Each field's own default is computed recursively — a struct field
+    /// that is itself another struct type gets its own fresh MAKE_STRUCT,
+    /// and so on.
+    fn compileStructDefault(self: *Compiler, type_index: u32) CompileError!void {
+        const fields = self.types.items[type_index].kind.struct_decl.fields;
+        for (fields) |f| try self.compileDefaultValue(f.type);
+        _ = try self.chunk.emitWithOperand(self.allocator, .make_struct, type_index);
     }
 
     /// A declared local's runtime storage IS the value its initializer
@@ -731,7 +1129,7 @@ pub const Compiler = struct {
             // can't route through `defaultValue`+PUSH_CONST since it isn't a
             // compile-time constant.
             if (d.initializer) |init_expr| {
-                try self.checkExpectedType(init_expr, d.type, d.name, "initializer's type does not match the declared type");
+                try self.checkExpectedType(init_expr, DeclaredType.builtin(d.type), d.name, "initializer's type does not match the declared type");
                 try self.compileExpr(init_expr);
             } else switch (kind) {
                 .map => _ = try self.chunk.emitWithOperand(self.allocator, .make_map, 0),
@@ -742,6 +1140,9 @@ pub const Compiler = struct {
             return;
         }
         if (d.array_len) |len| {
+            // Array element types are always plain scalars (design note
+            // 3e — a named struct/enum type never takes the array suffix),
+            // so `d.type` is never `.named` anywhere in this branch.
             if (d.initializer) |init_expr| {
                 switch (init_expr.*) {
                     .array_literal => |elems| {
@@ -749,7 +1150,7 @@ pub const Compiler = struct {
                             return self.fail(SemanticError.ArrayLengthMismatch, d.name, "array literal length does not match the declared size");
                         }
                         for (elems) |elem| {
-                            try self.checkExpectedType(elem, d.type, d.name, "array literal element's type does not match the array's declared element type");
+                            try self.checkExpectedType(elem, DeclaredType.builtin(d.type), d.name, "array literal element's type does not match the array's declared element type");
                             try self.compileExpr(elem);
                         }
                     },
@@ -761,26 +1162,31 @@ pub const Compiler = struct {
                             .generic => return self.fail(SemanticError.InvalidArrayInitializer, d.name, "a local array declaration needs a fixed size, but this function call returns a generic (unsized) array"),
                         };
                         if (ret_len != len) return self.fail(SemanticError.ArrayLengthMismatch, d.name, "the called function's returned array length does not match the declared size");
-                        if (!typeCompatible(d.type, StaticType{ .scalar = info.return_type })) return self.fail(SemanticError.TypeMismatch, d.name, "the called function's returned array's element type does not match the declared element type");
+                        if (!typeCompatible(DeclaredType.builtin(d.type), StaticType{ .scalar = info.return_type })) return self.fail(SemanticError.TypeMismatch, d.name, "the called function's returned array's element type does not match the declared element type");
                     },
                     else => return self.fail(SemanticError.InvalidArrayInitializer, d.name, "an array declaration's initializer must be an array literal or a call to an array-returning function"),
                 }
             } else {
-                const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, d.type));
+                const idx = try self.chunk.addConstant(self.allocator, try self.defaultValue(DeclaredType.builtin(d.type)));
                 var i: u32 = 0;
                 while (i < len) : (i += 1) _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
             }
             try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .array = .{ .fixed = len }, .value_type = d.type });
             self.next_slot += len;
         } else {
+            // The plain-scalar branch — this is also where a struct/enum-
+            // typed local (`d.type == .named`) lands, since neither
+            // `collectionKind` nor `d.array_len` ever apply to one
+            // (GRAMMAR.bnf design notes 3z/3aa).
+            const named_ref: ?NamedTypeRef = if (d.type == .named) (try self.resolveDeclaredType(d.type, d.named_type)).named_ref else null;
+            const dt: DeclaredType = .{ .type = d.type, .named_ref = named_ref };
             if (d.initializer) |init_expr| {
-                try self.checkExpectedType(init_expr, d.type, d.name, "initializer's type does not match the declared type");
+                try self.checkExpectedType(init_expr, dt, d.name, "initializer's type does not match the declared type");
                 try self.compileExpr(init_expr);
             } else {
-                const idx = try self.chunk.addConstant(self.allocator, try defaultValue(self.allocator, d.type));
-                _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+                try self.compileDefaultValue(dt);
             }
-            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .is_string = d.type == .string, .value_type = d.type });
+            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .is_string = d.type == .string, .value_type = d.type, .named_ref = named_ref });
             self.next_slot += 1;
         }
     }
@@ -811,7 +1217,7 @@ pub const Compiler = struct {
     /// with a placeholder target, keep compiling, then patch the target
     /// once it's known.
     fn compileIf(self: *Compiler, i: ast.StmtKind.If) CompileError!void {
-        try self.checkExpectedType(i.condition, .bool, "if", "condition must be a bool");
+        try self.checkExpectedType(i.condition, DeclaredType.builtin(.bool), "if", "condition must be a bool");
         try self.compileExpr(i.condition);
         const then_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false, 0);
         _ = try self.chunk.emit(self.allocator, .pop);
@@ -887,7 +1293,7 @@ pub const Compiler = struct {
 
     fn compileWhile(self: *Compiler, w: ast.StmtKind.While) CompileError!void {
         const loop_start = self.chunk.code.items.len;
-        try self.checkExpectedType(w.condition, .bool, "while", "condition must be a bool");
+        try self.checkExpectedType(w.condition, DeclaredType.builtin(.bool), "while", "condition must be a bool");
         try self.compileExpr(w.condition);
         const exit_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false, 0);
         _ = try self.chunk.emit(self.allocator, .pop);
@@ -910,13 +1316,13 @@ pub const Compiler = struct {
     fn compileFor(self: *Compiler, f: ast.StmtKind.For) CompileError!void {
         self.scope_depth += 1;
 
-        try self.checkExpectedType(f.end, .int, f.var_name, "for-loop end must be an int");
+        try self.checkExpectedType(f.end, DeclaredType.builtin(.int), f.var_name, "for-loop end must be an int");
         try self.compileExpr(f.end);
         const end_slot = self.next_slot;
         try self.locals.append(self.allocator, .{ .name = "", .depth = self.scope_depth, .slot = end_slot, .value_type = .int });
         self.next_slot += 1;
 
-        try self.checkExpectedType(f.start, .int, f.var_name, "for-loop start must be an int");
+        try self.checkExpectedType(f.start, DeclaredType.builtin(.int), f.var_name, "for-loop start must be an int");
         try self.compileExpr(f.start);
         const var_slot = self.next_slot;
         try self.locals.append(self.allocator, .{ .name = f.var_name, .depth = self.scope_depth, .slot = var_slot, .value_type = .int });
@@ -966,7 +1372,7 @@ pub const Compiler = struct {
             .assign => |a| {
                 if (self.resolveLocal(a.name)) |local| {
                     if (local.array == null) {
-                        try self.checkExpectedType(a.value, local.value_type, a.name, "assigned value's type does not match the variable's declared type");
+                        try self.checkExpectedType(a.value, .{ .type = local.value_type, .named_ref = local.named_ref }, a.name, "assigned value's type does not match the variable's declared type");
                     }
                 }
                 try self.compileExpr(a.value);
@@ -995,6 +1401,9 @@ pub const Compiler = struct {
             },
             .index => |ix| try self.compileIndex(ix),
             .index_assign => |ia| try self.compileIndexAssign(ia),
+            .struct_literal => |sl| try self.compileStructLiteral(sl),
+            .field_access => |fa| try self.compileFieldAccess(fa),
+            .field_assign => |fa| try self.compileFieldAssign(fa),
             .slice => |sl| try self.compileSlice(sl),
             .len_of => |e| try self.compileLenOf(e),
             .stream_literal => |s| {
@@ -1075,8 +1484,8 @@ pub const Compiler = struct {
             .time_now => _ = try self.chunk.emit(self.allocator, .now),
             .random_float => _ = try self.chunk.emit(self.allocator, .random_float),
             .random_range => |r| {
-                try self.checkExpectedType(r.start, .int, "random", "random's start must be an int");
-                try self.checkExpectedType(r.end, .int, "random", "random's end must be an int");
+                try self.checkExpectedType(r.start, DeclaredType.builtin(.int), "random", "random's start must be an int");
+                try self.checkExpectedType(r.end, DeclaredType.builtin(.int), "random", "random's end must be an int");
                 try self.compileExpr(r.start);
                 try self.compileExpr(r.end);
                 _ = try self.chunk.emit(self.allocator, .random_range);
@@ -1115,14 +1524,15 @@ pub const Compiler = struct {
         const info = self.findFunction(c.name) orelse return self.fail(SemanticError.UndefinedFunction, c.name, "undefined function");
         if (!self.functionVisible(info)) return self.fail(SemanticError.FunctionNotVisible, c.name, "function exists but isn't exported by a module this file imports");
         if (c.args.len != info.params.len) return self.fail(SemanticError.ArityMismatch, c.name, "wrong number of arguments");
-        for (c.args, info.params) |arg, param| {
+        for (c.args, info.params, 0..) |arg, param, i| {
             if (param.array_size) |spec| {
                 switch (spec) {
                     .fixed => |len| try self.compileArrayArgument(arg, len),
                     .generic => try self.compileGenericArrayArgument(arg),
                 }
             } else {
-                try self.checkExpectedType(arg, param.type, c.name, "argument's type does not match the parameter's declared type");
+                const dt: DeclaredType = .{ .type = param.type, .named_ref = info.param_named_refs[i] };
+                try self.checkExpectedType(arg, dt, c.name, "argument's type does not match the parameter's declared type");
                 try self.compileExpr(arg);
             }
         }
@@ -1380,6 +1790,116 @@ pub const Compiler = struct {
         try self.compileExpr(ia.index);
         try self.compileExpr(ia.value);
         _ = try self.chunk.emit(self.allocator, .index_set);
+    }
+
+    /// `TypeName{field1: expr1, ...}` (GRAMMAR.bnf design note 3z). Resolves
+    /// `type_name` against the program's registered struct types, checks the
+    /// literal supplies EXACTLY the struct's declared fields (no more, no
+    /// fewer, no duplicates), then compiles each field's value in the
+    /// struct's OWN declared order (regardless of what order the literal
+    /// listed them in), so MAKE_STRUCT's popped values always land in the
+    /// order `Program.struct_types` records for this type (ISA.bnf
+    /// section 19).
+    fn compileStructLiteral(self: *Compiler, sl: ast.Expr.StructLiteral) CompileError!void {
+        const type_index = self.findTypeIndex(sl.type_name) orelse return self.fail(SemanticError.UndefinedType, sl.type_name, "no struct with this name is declared");
+        const decl = self.types.items[type_index];
+        if (!self.typeVisible(decl)) return self.fail(SemanticError.TypeNotVisible, sl.type_name, "type exists but isn't exported by a module this file imports");
+        if (decl.kind != .struct_decl) return self.fail(SemanticError.NotAStruct, sl.type_name, "this name is an enum, not a struct — it can't be constructed with '{...}'");
+        const fields = decl.kind.struct_decl.fields;
+
+        for (fields) |f| {
+            var found: ?*ast.Expr = null;
+            for (sl.fields) |init_field| {
+                if (!std.mem.eql(u8, init_field.name, f.name)) continue;
+                if (found != null) return self.fail(SemanticError.DuplicateFieldInLiteral, f.name, "this field is given a value more than once in this struct literal");
+                found = init_field.value;
+            }
+            const value_expr = found orelse return self.fail(SemanticError.MissingField, f.name, "this struct literal is missing a required field");
+            try self.checkExpectedType(value_expr, f.type, f.name, "field value's type does not match the field's declared type");
+            try self.compileExpr(value_expr);
+        }
+        for (sl.fields) |init_field| {
+            var known = false;
+            for (fields) |f| {
+                if (std.mem.eql(u8, f.name, init_field.name)) known = true;
+            }
+            if (!known) return self.fail(SemanticError.UnknownField, init_field.name, "this struct has no field with this name");
+        }
+
+        _ = try self.chunk.emitWithOperand(self.allocator, .make_struct, @intCast(type_index));
+    }
+
+    /// `<base>.field` — either a struct field read or an enum variant
+    /// reference (`Color.Red`); see `ast.Expr.field_access`'s doc comment
+    /// for the disambiguation rule this implements: a bare `.variable` base
+    /// that names no local in scope, but does name a declared enum type, is
+    /// a variant reference; everything else must be a struct field read.
+    fn compileFieldAccess(self: *Compiler, fa: ast.Expr.FieldAccess) CompileError!void {
+        if (fa.base.* == .variable and self.resolveLocal(fa.base.variable) == null) {
+            if (self.findTypeIndex(fa.base.variable)) |type_index| {
+                return self.compileEnumVariant(type_index, fa.base.variable, fa.field);
+            }
+            return self.fail(SemanticError.UndefinedVariable, fa.base.variable, "undefined variable");
+        }
+        const type_index = try self.resolveStructBase(fa.base);
+        const field_index = try self.findFieldIndex(type_index, fa.field);
+        try self.compileExpr(fa.base);
+        _ = try self.chunk.emitWithOperand(self.allocator, .field_get, field_index);
+    }
+
+    /// `<base>.field := value` — the `.field_assign` counterpart to
+    /// `compileFieldAccess`'s struct-field-read path. There is no enum-
+    /// variant assignment: `resolveStructBase` requires a struct-typed
+    /// base, so `Color.Red := x` (base names no local, and isn't a struct)
+    /// fails there, the same as any other invalid field-access base would.
+    fn compileFieldAssign(self: *Compiler, fa: ast.Expr.FieldAssign) CompileError!void {
+        const type_index = try self.resolveStructBase(fa.base);
+        const field_index = try self.findFieldIndex(type_index, fa.field);
+        const field_type = self.types.items[type_index].kind.struct_decl.fields[field_index].type;
+        try self.checkExpectedType(fa.value, field_type, fa.field, "assigned value's type does not match the field's declared type");
+        try self.compileExpr(fa.base);
+        try self.compileExpr(fa.value);
+        _ = try self.chunk.emitWithOperand(self.allocator, .field_set, field_index);
+    }
+
+    /// Resolves `enum_name.variant_name` to a compile-time `Value.enum_value`
+    /// constant, pushed via ordinary PUSH_CONST — an enum value needs no
+    /// dedicated opcode; it's a compile-time constant exactly like an int or
+    /// string literal (ISA.bnf section 20).
+    fn compileEnumVariant(self: *Compiler, type_index: usize, type_name: []const u8, variant_name: []const u8) CompileError!void {
+        const decl = self.types.items[type_index];
+        if (!self.typeVisible(decl)) return self.fail(SemanticError.TypeNotVisible, type_name, "type exists but isn't exported by a module this file imports");
+        if (decl.kind != .enum_decl) return self.fail(SemanticError.NotAStruct, type_name, "this name is a struct, not an enum — it has no variants");
+        for (decl.kind.enum_decl.variants, 0..) |v, i| {
+            if (!std.mem.eql(u8, v, variant_name)) continue;
+            const value = Value{ .enum_value = .{ .type_index = @intCast(type_index), .variant = @intCast(i), .type_name = decl.name, .variant_name = v } };
+            const idx = try self.chunk.addConstant(self.allocator, value);
+            _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+            return;
+        }
+        return self.fail(SemanticError.UnknownEnumVariant, variant_name, "this enum has no variant with this name");
+    }
+
+    /// Resolves a `.field_access`/`.field_assign` base to the struct-type
+    /// index it must be, using the compiler's own static type inference —
+    /// field access, unlike bracket-indexing, is never left to a runtime
+    /// check (`SemanticError.NotAStruct` covers both "knowably not a
+    /// struct" and "not knowable at compile time at all"), since the
+    /// field's slot has to be resolved here (GRAMMAR.bnf design note 3z).
+    fn resolveStructBase(self: *Compiler, base: *const ast.Expr) CompileError!usize {
+        const bt = try self.inferType(base) orelse return self.fail(SemanticError.NotAStruct, "", "not a struct — its type can't be determined at compile time");
+        return switch (bt) {
+            .struct_type => |i| i,
+            else => self.fail(SemanticError.NotAStruct, "", "not a struct — expected a struct value"),
+        };
+    }
+
+    fn findFieldIndex(self: *Compiler, type_index: usize, field: []const u8) CompileError!u32 {
+        const fields = self.types.items[type_index].kind.struct_decl.fields;
+        for (fields, 0..) |f, i| {
+            if (std.mem.eql(u8, f.name, field)) return @intCast(i);
+        }
+        return self.fail(SemanticError.UnknownField, field, "this struct has no field with this name");
     }
 
     /// `<base>[start..end]` (GRAMMAR.bnf's Strings design notes) — always a
@@ -2714,6 +3234,289 @@ test "compileModules: two modules importing the same module both see one compile
     var writer = std.Io.Writer.fixed(&buf);
     try vm.run(&compiled, .{ .out = &writer });
     try std.testing.expectEqualStrings("20\n", writer.buffered());
+}
+
+// ---- Records and enums (GRAMMAR.bnf design notes 3z, 3aa) ---------------
+
+test "struct: declare, construct, and read fields" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point {
+        \\    int x,
+        \\    int y
+        \\}
+        \\Point p := Point{x: 1, y: 2}
+        \\print p.x
+        \\print p.y
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("1\n2\n", output);
+}
+
+test "struct: field write mutates in place" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\Point p := Point{x: 1, y: 2}
+        \\p.x := 99
+        \\print p.x
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("99\n", output);
+}
+
+test "struct: fields may be keyed in any order in a literal" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\Point p := Point{y: 2, x: 1}
+        \\print p.x
+        \\print p.y
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("1\n2\n", output);
+}
+
+test "struct: assignment aliases — mutation through one is visible through the other" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\Point a := Point{x: 1, y: 2}
+        \\Point b := a
+        \\b.x := 99
+        \\print a.x
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("99\n", output);
+}
+
+test "struct: a field may itself be another struct type (nesting)" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\struct Line { Point start, Point end }
+        \\Line l := Line{start: Point{x: 1, y: 2}, end: Point{x: 3, y: 4}}
+        \\print l.start.x
+        \\print l.end.y
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("1\n4\n", output);
+}
+
+test "struct: a field's type may forward-reference a struct declared later in the file" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Line { Point start, Point end }
+        \\struct Point { int x, int y }
+        \\Line l := Line{start: Point{x: 1, y: 2}, end: Point{x: 3, y: 4}}
+        \\print l.start.x
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("1\n", output);
+}
+
+test "struct: print renders it like a JSON object, keyed by declared field names" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\print Point{x: 1, y: 2}
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("{\"x\": 1, \"y\": 2}\n", output);
+}
+
+test "struct: a struct-typed local with no initializer defaults to every field recursively defaulted" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\Point p
+        \\print p.x
+        \\print p.y
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("0\n0\n", output);
+}
+
+test "struct: can be passed to and returned from a function" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\func make(int x, int y) -> Point {
+        \\    return Point{x: x, y: y}
+        \\}
+        \\func sum(Point p) -> int {
+        \\    return p.x + p.y
+        \\}
+        \\print sum(make(3, 4))
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("7\n", output);
+}
+
+test "struct: unknown field on read is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x, int y }\nPoint p := Point{x: 1, y: 2}\nprint p.z\n", SemanticError.UnknownField);
+}
+
+test "struct: unknown field in a literal is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x, int y }\nPoint p := Point{x: 1, y: 2, z: 3}\n", SemanticError.UnknownField);
+}
+
+test "struct: a literal missing a required field is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x, int y }\nPoint p := Point{x: 1}\n", SemanticError.MissingField);
+}
+
+test "struct: a literal repeating the same field is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x, int y }\nPoint p := Point{x: 1, x: 2, y: 3}\n", SemanticError.DuplicateFieldInLiteral);
+}
+
+test "struct: a duplicate field name in the declaration itself is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x, int x }\n", SemanticError.DuplicateField);
+}
+
+test "struct: a field's type not matching the declared type is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x, int y }\nPoint p := Point{x: \"a\", y: 2}\n", SemanticError.TypeMismatch);
+}
+
+test "struct: assigning to a field with the wrong type is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x, int y }\nPoint p := Point{x: 1, y: 2}\np.x := \"a\"\n", SemanticError.TypeMismatch);
+}
+
+test "struct: field access on a statically non-struct value is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int x := 5\nprint x.y\n", SemanticError.NotAStruct);
+}
+
+test "referencing an undeclared type name is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "Foo x := 1\n", SemanticError.UndefinedType);
+}
+
+test "declaring two types (struct or enum) with the same name is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x }\nstruct Point { int y }\n", SemanticError.DuplicateTypeName);
+    try expectCompileError(allocator, "struct Point { int x }\nenum Point { Red }\n", SemanticError.DuplicateTypeName);
+}
+
+test "enum: declare, reference a variant, and print by name" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\enum Color { Red, Green, Blue }
+        \\Color c := Color.Red
+        \\print c
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("Red\n", output);
+}
+
+test "enum: a local with no initializer defaults to the first-declared variant" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\enum Color { Red, Green, Blue }
+        \\Color c
+        \\print c
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("Red\n", output);
+}
+
+test "enum: == is true only for the same type and variant, false (not an error) otherwise" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\enum Color { Red, Green }
+        \\enum Size { Red, Small }
+        \\print Color.Red == Color.Red
+        \\print Color.Red == Color.Green
+        \\print Color.Red == Size.Red
+        \\print Color.Red == 0
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("true\nfalse\nfalse\nfalse\n", output);
+}
+
+test "enum: assigning a bare int where an enum is expected is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "enum Color { Red, Green }\nColor c := 5\n", SemanticError.TypeMismatch);
+}
+
+test "enum: passing an int argument where an enum parameter is expected is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\enum Color { Red, Green }
+        \\func show(Color c) -> int { return 0 }
+        \\show(1)
+        \\
+    , SemanticError.TypeMismatch);
+}
+
+test "enum: referencing an unknown variant is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "enum Color { Red, Green }\nprint Color.Purple\n", SemanticError.UnknownEnumVariant);
+}
+
+test "enum: a duplicate variant name in the declaration is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "enum Color { Red, Red }\n", SemanticError.DuplicateVariant);
+}
+
+test "compileModules: a struct exported by a directly imported module is usable" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+
+    var lib = try parseSource(allocator, "export struct Point { int x, int y }\n");
+    defer lib.parser.deinit();
+    var main = try parseSource(allocator, "Point p := Point{x: 1, y: 2}\nprint p.x\n");
+    defer main.parser.deinit();
+
+    const units = [_]ModuleUnit{
+        .{ .program = main.program, .imports = &.{1} },
+        .{ .program = lib.program },
+    };
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(0, &units);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var writer = std.Io.Writer.fixed(&buf);
+    try vm.run(&compiled, .{ .out = &writer });
+    try std.testing.expectEqualStrings("1\n", writer.buffered());
+}
+
+test "compileModules: a non-exported struct from an imported module is a compile error" {
+    const allocator = std.testing.allocator;
+    var lib = try parseSource(allocator, "struct Point { int x, int y }\n");
+    defer lib.parser.deinit();
+    var main = try parseSource(allocator, "Point p := Point{x: 1, y: 2}\n");
+    defer main.parser.deinit();
+
+    const units = [_]ModuleUnit{
+        .{ .program = main.program, .imports = &.{1} },
+        .{ .program = lib.program },
+    };
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.TypeNotVisible, compiler.compileModules(0, &units));
 }
 
 // ---- Byte-stream I/O (GRAMMAR.bnf design note 3k) -----------------------

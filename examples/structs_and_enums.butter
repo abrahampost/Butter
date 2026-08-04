@@ -1,0 +1,47 @@
+struct Point {
+    int x,
+    int y
+}
+
+struct Circle {
+    Point center,
+    float radius
+}
+
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+func distanceSquared(Point a, Point b) -> int {
+    int dx := a.x - b.x
+    int dy := a.y - b.y
+    return dx * dx + dy * dy
+}
+
+func colorName(Color c) -> string {
+    if c == Color.Red { return "red" }
+    if c == Color.Green { return "green" }
+    return "blue"
+}
+
+Point origin := Point{x: 0, y: 0}
+Point p := Point{x: 3, y: 4}
+print distanceSquared(origin, p)
+
+# Structs are heap references — aliasing one mutates the other.
+Point alias := p
+alias.x := 30
+print p.x
+
+Circle c := Circle{center: Point{x: 1, y: 1}, radius: 2.5}
+print c.center.x
+print c.radius
+print c
+
+Color favorite := Color.Green
+print favorite
+print colorName(favorite)
+print favorite == Color.Green
+print favorite == Color.Red

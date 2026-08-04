@@ -69,6 +69,12 @@ fn write(v: Value, writer: *std.Io.Writer) (std.Io.Writer.Error || error{Unstrin
         // a JSON encoder has no business inventing text that isn't valid
         // JSON, so this is an error instead.
         .stream, .array_ref => return error.Unstringifiable,
+        // Like a stream/array reference, JSON has no native shape for an
+        // enum variant, and unlike a map/list/record there's no reasonable
+        // one-way rendering either (a bare string would silently collide
+        // with an ordinary string value) — same "no representation, don't
+        // invent one" stance (GRAMMAR.bnf design note 3aa).
+        .enum_value => return error.Unstringifiable,
         .object => |o| switch (o.payload) {
             .string => |s| try std.json.Stringify.encodeJsonString(s, .{}, writer),
             .list => |list| {
@@ -88,6 +94,20 @@ fn write(v: Value, writer: *std.Io.Writer) (std.Io.Writer.Error || error{Unstrin
                     try std.json.Stringify.encodeJsonString(entry.key_ptr.*, .{}, writer);
                     try writer.writeByte(':');
                     try write(entry.value_ptr.*, writer);
+                }
+                try writer.writeByte('}');
+            },
+            // Renders like `.map` — a JSON object keyed by each field's
+            // declared name, in declared order (GRAMMAR.bnf design note
+            // 3z) — a one-way rendering only: `json_parse` can never
+            // produce a record back (confirmed in `convert`, below).
+            .record => |r| {
+                try writer.writeByte('{');
+                for (r.field_names, r.fields, 0..) |name, field_v, i| {
+                    if (i > 0) try writer.writeByte(',');
+                    try std.json.Stringify.encodeJsonString(name, .{}, writer);
+                    try writer.writeByte(':');
+                    try write(field_v, writer);
                 }
                 try writer.writeByte('}');
             },
@@ -274,4 +294,21 @@ test "stringify reports a stream or array reference as Unstringifiable" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.Unstringifiable, stringify(allocator, .{ .stream = value_mod.Stream.ofStandard(.stdout) }));
     try std.testing.expectError(error.Unstringifiable, stringify(allocator, .{ .array_ref = .{ .base = 0, .len = 0 } }));
+}
+
+test "stringify renders a record like a map, keyed by its declared field names" {
+    const allocator = std.testing.allocator;
+    const field_names = [_][]const u8{ "x", "y" };
+    const fields = try allocator.alloc(Value, 2);
+    fields[0] = .{ .int = 1 };
+    fields[1] = try Value.newString(allocator, "a");
+    const record_obj = try Object.create(allocator, .{ .record = .{ .type_name = "Point", .field_names = &field_names, .fields = fields } });
+    try expectStringified(.{ .object = record_obj }, "{\"x\":1,\"y\":\"a\"}");
+    (Value{ .object = record_obj }).decref(allocator);
+}
+
+test "stringify reports an enum value as Unstringifiable" {
+    const allocator = std.testing.allocator;
+    const red: Value = .{ .enum_value = .{ .type_index = 0, .variant = 0, .type_name = "Color", .variant_name = "Red" } };
+    try std.testing.expectError(error.Unstringifiable, stringify(allocator, red));
 }

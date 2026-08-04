@@ -51,6 +51,15 @@ pub const Parser = struct {
         return self.tokens[self.pos - 1];
     }
 
+    /// Looks `offset` tokens past the current one without consuming
+    /// anything — clamped to the trailing `.eof` rather than indexing past
+    /// it, the same "eof forever" safety `Lexer.next` already guarantees,
+    /// just for a fixed token slice instead of a live scan.
+    fn peekAt(self: *const Parser, offset: usize) Token {
+        const i = @min(self.pos + offset, self.tokens.len - 1);
+        return self.tokens[i];
+    }
+
     fn isAtEnd(self: *const Parser) bool {
         return self.peek().type == .eof;
     }
@@ -145,20 +154,27 @@ pub const Parser = struct {
         return stmts.toOwnedSlice(self.allocator());
     }
 
-    /// <top-level-decl> ::= <import-decl> | [ 'export' ] <function-decl> | <declaration>
+    /// <top-level-decl> ::= <import-decl> | [ 'export' ] <function-decl>
+    ///                    | [ 'export' ] <struct-decl> | [ 'export' ] <enum-decl>
+    ///                    | <declaration>
     ///
-    /// Function declarations (and now `import`/`export`) are only
+    /// Function/struct/enum declarations (and `import`/`export`) are only
     /// recognized here, never from inside `declaration` — that's what keeps
     /// them out of block/if/while bodies without needing a separate check
-    /// anywhere else (Butter has no nested functions or closures, and no
-    /// mechanism for importing partway through another declaration).
+    /// anywhere else (Butter has no nested functions, closures, or local
+    /// type declarations, and no mechanism for importing partway through
+    /// another declaration).
     fn topLevelDeclaration(self: *Parser) Error!ast.Stmt {
         if (self.check(.kw_import)) return self.importDeclaration();
         if (self.match(.kw_export)) {
-            if (!self.check(.kw_func)) return self.fail("expected 'func' after 'export' — only functions can be exported");
-            return self.functionDeclaration(true);
+            if (self.check(.kw_func)) return self.functionDeclaration(true);
+            if (self.check(.kw_struct)) return self.structDeclaration(true);
+            if (self.check(.kw_enum)) return self.enumDeclaration(true);
+            return self.fail("expected 'func', 'struct', or 'enum' after 'export'");
         }
         if (self.check(.kw_func)) return self.functionDeclaration(false);
+        if (self.check(.kw_struct)) return self.structDeclaration(false);
+        if (self.check(.kw_enum)) return self.enumDeclaration(false);
         return self.declaration();
     }
 
@@ -181,6 +197,19 @@ pub const Parser = struct {
     fn declaration(self: *Parser) Error!ast.Stmt {
         return switch (self.peek().type) {
             .kw_int, .kw_float, .kw_bool, .kw_string, .kw_map, .kw_list => self.varDeclaration(),
+            // A struct/enum-typed var-declaration (GRAMMAR.bnf design notes
+            // 3z/3aa) has no keyword of its own to dispatch on — its
+            // `<type>` is a bare IDENTIFIER (`parseType`'s `.named` case).
+            // Two consecutive IDENTIFIER tokens with nothing between them
+            // (no '(', '{', '.', or operator) can never be anything BUT
+            // `<type> IDENTIFIER`: no expression-statement shape in this
+            // grammar continues one bare identifier with a second one, so
+            // this lookahead is never ambiguous with `<expr-stmt>` — the
+            // same "parser doesn't resolve names" stance `parseType` itself
+            // takes; if `IDENTIFIER` doesn't actually name a declared type,
+            // that's `SemanticError.UndefinedType` in compiler.zig, not a
+            // parse error here.
+            .identifier => if (self.peekAt(1).type == .identifier) self.varDeclaration() else self.statement(),
             .lbrace => self.block(),
             .kw_if => self.ifStatement(),
             .kw_while => self.whileStatement(),
@@ -190,20 +219,35 @@ pub const Parser = struct {
         };
     }
 
-    /// <type> ::= 'int' | 'float' | 'bool' | 'string' | 'map' | 'list'
-    fn parseType(self: *Parser) Error!ast.ValueType {
+    /// Bundles `parseType`'s result: the `ValueType` tag plus, only when
+    /// that tag is `.named`, the bare (unresolved) type name text — see
+    /// `ast.ValueType.named`'s doc comment for why these travel as a pair
+    /// rather than being folded into one union.
+    const ParsedType = struct {
+        type: ast.ValueType,
+        named_type: ?[]const u8 = null,
+    };
+
+    /// <type> ::= 'int' | 'float' | 'bool' | 'string' | 'map' | 'list' | IDENTIFIER
+    ///
+    /// A bare IDENTIFIER (GRAMMAR.bnf design notes 3z/3aa) names a
+    /// user-declared struct/enum type — never validated here (the parser
+    /// resolves no names); compiler.zig rejects an identifier that doesn't
+    /// name any declared struct/enum type (`SemanticError.UndefinedType`).
+    fn parseType(self: *Parser) Error!ParsedType {
         const tok = self.peek();
-        const value_type: ast.ValueType = switch (tok.type) {
-            .kw_int => .int,
-            .kw_float => .float,
-            .kw_bool => .bool,
-            .kw_string => .string,
-            .kw_map => .map,
-            .kw_list => .list,
+        const parsed: ParsedType = switch (tok.type) {
+            .kw_int => .{ .type = .int },
+            .kw_float => .{ .type = .float },
+            .kw_bool => .{ .type = .bool },
+            .kw_string => .{ .type = .string },
+            .kw_map => .{ .type = .map },
+            .kw_list => .{ .type = .list },
+            .identifier => .{ .type = .named, .named_type = tok.lexeme },
             else => return self.fail("expected a type"),
         };
         _ = self.advance();
-        return value_type;
+        return parsed;
     }
 
     /// <function-decl> ::= 'func' IDENTIFIER '(' [ <param-list> ] ')'
@@ -232,27 +276,29 @@ pub const Parser = struct {
         if (!self.check(.rparen)) {
             while (true) {
                 const param_type = try self.parseType();
-                // map/list never take the array suffix — they're always
-                // exactly one value, never a run of raw slots (GRAMMAR.bnf
-                // design note 3m) — so this is simply never attempted for
-                // them, the same way it's never attempted for a param name.
-                const param_array_size = if (param_type == .map or param_type == .list) null else try self.parseArraySpec();
+                // map/list/a named (struct/enum) type never take the array
+                // suffix — they're always exactly one value, never a run of
+                // raw slots (GRAMMAR.bnf design notes 3m, 3z, 3aa) — so this
+                // is simply never attempted for them, the same way it's
+                // never attempted for a param name.
+                const param_array_size = if (param_type.type == .map or param_type.type == .list or param_type.type == .named) null else try self.parseArraySpec();
                 const param_name = try self.expect(.identifier, "expected a parameter name");
-                try params.append(self.allocator(), .{ .type = param_type, .name = param_name.lexeme, .array_size = param_array_size });
+                try params.append(self.allocator(), .{ .type = param_type.type, .named_type = param_type.named_type, .name = param_name.lexeme, .array_size = param_array_size });
                 if (!self.match(.comma)) break;
             }
         }
         _ = try self.expect(.rparen, "expected ')' after parameters");
         _ = try self.expect(.arrow, "expected '->' before return type");
         const return_type = try self.parseType();
-        const return_array_size = if (return_type == .map or return_type == .list) null else try self.parseArraySpec();
+        const return_array_size = if (return_type.type == .map or return_type.type == .list or return_type.type == .named) null else try self.parseArraySpec();
 
         const body_stmt = try self.block();
 
         return ast.Stmt{ .kind = .{ .function_decl = .{
             .name = name_tok.lexeme,
             .params = try params.toOwnedSlice(self.allocator()),
-            .return_type = return_type,
+            .return_type = return_type.type,
+            .return_named_type = return_type.named_type,
             .return_array_size = return_array_size,
             .body = body_stmt.kind.block,
             .exported = exported,
@@ -286,18 +332,91 @@ pub const Parser = struct {
     fn varDeclaration(self: *Parser) Error!ast.Stmt {
         const line = self.peek().line;
         const value_type = try self.parseType();
-        // map/list never take the array-size suffix (GRAMMAR.bnf design
-        // note 3m) — writing `map[3] m` simply never gets this far as an
-        // array declaration; the next token (still `[`) fails the
-        // IDENTIFIER expectation below instead.
-        const array_len = if (value_type == .map or value_type == .list) null else try self.parseOptionalArraySize();
+        // map/list/a named (struct/enum) type never take the array-size
+        // suffix (GRAMMAR.bnf design notes 3m, 3z, 3aa) — writing `map[3] m`
+        // simply never gets this far as an array declaration; the next
+        // token (still `[`) fails the IDENTIFIER expectation below instead.
+        const array_len = if (value_type.type == .map or value_type.type == .list or value_type.type == .named) null else try self.parseOptionalArraySize();
         const name_tok = try self.expect(.identifier, "expected a variable name");
 
         var initializer: ?*ast.Expr = null;
         if (self.match(.colon_equal)) initializer = try self.expression();
 
         try self.consumeEnd();
-        return ast.Stmt{ .kind = .{ .var_decl = .{ .type = value_type, .array_len = array_len, .name = name_tok.lexeme, .initializer = initializer } }, .line = line };
+        return ast.Stmt{ .kind = .{ .var_decl = .{ .type = value_type.type, .named_type = value_type.named_type, .array_len = array_len, .name = name_tok.lexeme, .initializer = initializer } }, .line = line };
+    }
+
+    /// <struct-decl> ::= 'struct' IDENTIFIER '{' { NEWLINE } [ <field-list> ] '}'
+    /// <field-list>  ::= <field> { ( ',' | NEWLINE ) <field> } [ ',' ]
+    /// <field>       ::= <type> IDENTIFIER
+    ///
+    /// Only ever reached from `topLevelDeclaration` (GRAMMAR.bnf design note
+    /// 3z), matching `functionDeclaration`'s own restriction. Fields reuse
+    /// exactly the `<type> IDENTIFIER` shape `<param>` uses — never an
+    /// array suffix (a field is always exactly one `Value` slot, see
+    /// `ast.FieldDecl`'s doc comment) — separated by a comma, a newline, or
+    /// both, with an optional trailing comma before the closing `}`.
+    fn structDeclaration(self: *Parser, exported: bool) Error!ast.Stmt {
+        const line = self.peek().line;
+        _ = self.advance(); // 'struct'
+        const name_tok = try self.expect(.identifier, "expected a struct name");
+        _ = try self.expect(.lbrace, "expected '{' after struct name");
+        self.skipNewlines();
+
+        var fields: std.ArrayList(ast.FieldDecl) = .empty;
+        if (!self.check(.rbrace)) {
+            while (true) {
+                const field_type = try self.parseType();
+                const field_name = try self.expect(.identifier, "expected a field name");
+                try fields.append(self.allocator(), .{ .type = field_type.type, .named_type = field_type.named_type, .name = field_name.lexeme });
+                self.skipNewlines();
+                if (!self.match(.comma)) break;
+                self.skipNewlines();
+                if (self.check(.rbrace)) break; // trailing comma
+            }
+        }
+        self.skipNewlines();
+        _ = try self.expect(.rbrace, "expected '}' to close struct declaration");
+
+        return ast.Stmt{ .kind = .{ .struct_decl = .{
+            .name = name_tok.lexeme,
+            .fields = try fields.toOwnedSlice(self.allocator()),
+            .exported = exported,
+        } }, .line = line };
+    }
+
+    /// <enum-decl>    ::= 'enum' IDENTIFIER '{' { NEWLINE } [ <variant-list> ] '}'
+    /// <variant-list> ::= IDENTIFIER { ( ',' | NEWLINE ) IDENTIFIER } [ ',' ]
+    ///
+    /// Only ever reached from `topLevelDeclaration` (GRAMMAR.bnf design note
+    /// 3aa), matching `structDeclaration`. A variant carries no payload —
+    /// this is a plain named tag, not a data-carrying union.
+    fn enumDeclaration(self: *Parser, exported: bool) Error!ast.Stmt {
+        const line = self.peek().line;
+        _ = self.advance(); // 'enum'
+        const name_tok = try self.expect(.identifier, "expected an enum name");
+        _ = try self.expect(.lbrace, "expected '{' after enum name");
+        self.skipNewlines();
+
+        var variants: std.ArrayList([]const u8) = .empty;
+        if (!self.check(.rbrace)) {
+            while (true) {
+                const variant_tok = try self.expect(.identifier, "expected a variant name");
+                try variants.append(self.allocator(), variant_tok.lexeme);
+                self.skipNewlines();
+                if (!self.match(.comma)) break;
+                self.skipNewlines();
+                if (self.check(.rbrace)) break; // trailing comma
+            }
+        }
+        self.skipNewlines();
+        _ = try self.expect(.rbrace, "expected '}' to close enum declaration");
+
+        return ast.Stmt{ .kind = .{ .enum_decl = .{
+            .name = name_tok.lexeme,
+            .variants = try variants.toOwnedSlice(self.allocator()),
+            .exported = exported,
+        } }, .line = line };
     }
 
     /// <block> ::= '{' { NEWLINE } { <declaration> { NEWLINE } } '}'
@@ -466,6 +585,7 @@ pub const Parser = struct {
 
     /// <assignment> ::= IDENTIFIER ':=' <assignment>
     ///                | IDENTIFIER '[' <expression> ']' ':=' <assignment>
+    ///                | <expression> '.' IDENTIFIER ':=' <assignment>
     ///                | <logic-or>
     fn assignment(self: *Parser) Error!*ast.Expr {
         const expr = try self.logicOr();
@@ -480,8 +600,11 @@ pub const Parser = struct {
             if (expr.* == .index) {
                 return self.createExpr(.{ .index_assign = .{ .base = expr.index.base, .index = expr.index.index, .value = value } });
             }
+            if (expr.* == .field_access) {
+                return self.createExpr(.{ .field_assign = .{ .base = expr.field_access.base, .field = expr.field_access.field, .value = value } });
+            }
 
-            self.diagnostic = .{ .line = equals.line, .column = equals.column, .message = "invalid assignment target: only a bare identifier or an indexed array element may appear left of ':='" };
+            self.diagnostic = .{ .line = equals.line, .column = equals.column, .message = "invalid assignment target: only a bare identifier, an indexed array element, or a struct field may appear left of ':='" };
             return Error.UnexpectedToken;
         }
 
@@ -574,7 +697,7 @@ pub const Parser = struct {
         return self.primary();
     }
 
-    /// <primary> ::= <atom> { '[' <expression> [ '..' <expression> ] ']' }
+    /// <primary> ::= <atom> { '[' <expression> [ '..' <expression> ] ']' | '.' IDENTIFIER }
     ///
     /// The postfix `'[' <expression> ']'` suffix is what lets bracket-
     /// indexing CHAIN (`doc["a"]["b"]`, GRAMMAR.bnf design note 3m) — it's
@@ -586,9 +709,22 @@ pub const Parser = struct {
     /// takes rather than trying to reject it here in the grammar. The `..`
     /// form is a SLICE (GRAMMAR.bnf's Strings design notes) — read-only, so
     /// unlike the single-index form it never becomes an assignment target.
+    /// `'.' IDENTIFIER` (GRAMMAR.bnf design notes 3z/3aa) chains the exact
+    /// same way, for the exact same reason (`p.a.b`, `xs[0].x` both fall out
+    /// for free); a shape that doesn't name a struct/enum is likewise left
+    /// to compiler.zig to reject (`NotAStruct`/`UnknownField`/
+    /// `UnknownEnumVariant`), not this grammar.
     fn primary(self: *Parser) Error!*ast.Expr {
         var expr = try self.atom();
-        while (self.check(.lbracket)) expr = try self.finishIndex(expr);
+        while (true) {
+            if (self.check(.lbracket)) {
+                expr = try self.finishIndex(expr);
+            } else if (self.check(.dot)) {
+                expr = try self.finishField(expr);
+            } else {
+                break;
+            }
+        }
         return expr;
     }
 
@@ -639,6 +775,7 @@ pub const Parser = struct {
             .identifier => {
                 _ = self.advance();
                 if (self.check(.lparen)) return self.finishCall(tok.lexeme);
+                if (self.looksLikeStructLiteral()) return self.finishStructLiteral(tok.lexeme);
                 return self.createExpr(.{ .variable = tok.lexeme });
             },
             .lparen => {
@@ -727,6 +864,78 @@ pub const Parser = struct {
         }
         _ = try self.expect(.rbracket, "expected ']' after array index");
         return self.createExpr(.{ .index = .{ .base = base, .index = start_expr } });
+    }
+
+    /// `'.' IDENTIFIER` postfix suffix (GRAMMAR.bnf design notes 3z/3aa) —
+    /// see `primary`'s doc comment. Called with `base` already parsed and
+    /// '.' as the next token (mirrors `finishIndex`). Always produces a
+    /// `.field_access` node regardless of whether it ends up being read or
+    /// assigned to — `assignment` is what turns a trailing `':=' <expr>`
+    /// into a `.field_assign` instead, exactly mirroring `.index`/
+    /// `.index_assign`. Whether `base.field` actually means a struct field
+    /// or an enum variant reference is never decided here — see
+    /// `ast.Expr.field_access`'s doc comment; the parser treats every
+    /// `.`-postfix identically and leaves disambiguation to compiler.zig.
+    fn finishField(self: *Parser, base: *ast.Expr) Error!*ast.Expr {
+        _ = self.advance(); // '.'
+        const field_tok = try self.expect(.identifier, "expected a field name after '.'");
+        return self.createExpr(.{ .field_access = .{ .base = base, .field = field_tok.lexeme } });
+    }
+
+    /// Whether the `{` right after an just-consumed IDENTIFIER actually
+    /// starts a struct literal (GRAMMAR.bnf design note 3z), rather than
+    /// being a wholly unrelated STATEMENT block that simply happens to
+    /// immediately follow it — the real case this disambiguates is `for i
+    /// in 0..n { ... }` / `if cond { ... }` / `while cond { ... }`, where
+    /// the bound/condition is a bare identifier immediately followed by the
+    /// construct's own braceless-condition body block (none of `if`/
+    /// `while`/`for` require a separator token before their body, so an
+    /// expression ending in a bare identifier is followed directly by `{`
+    /// there too). A struct literal's `{` is always immediately followed
+    /// (past any newlines — a literal may open on its own line) by
+    /// `IDENTIFIER ':'`, its first field — a shape no Butter STATEMENT
+    /// begins with (assignment is `:=`, one token, never a bare `:`), so
+    /// this lookahead never misfires against a real block's first
+    /// statement. A struct with no fields at all can't be constructed via
+    /// `Type{}` as a result — accepting a bare `{}` here would make it
+    /// indistinguishable from `if cond {}`'s empty body, and a zero-field
+    /// struct is not a case worth that ambiguity.
+    fn looksLikeStructLiteral(self: *const Parser) bool {
+        if (!self.check(.lbrace)) return false;
+        var i: usize = 1;
+        while (self.peekAt(i).type == .newline) i += 1;
+        return self.peekAt(i).type == .identifier and self.peekAt(i + 1).type == .colon;
+    }
+
+    /// `TypeName '{' [ <field-init-list> ] '}'` (GRAMMAR.bnf design note 3z)
+    /// — called with the type name already consumed and '{' as the next
+    /// token (mirrors `finishCall`), and only once `looksLikeStructLiteral`
+    /// has already confirmed the shape. `<field-init-list> ::= <field-init>
+    /// { ( ',' | NEWLINE ) <field-init> } [ ',' ]`, `<field-init> ::=
+    /// IDENTIFIER ':' <expression>` — fields are keyed by name, not
+    /// position, and may appear in any order; compiler.zig is what checks
+    /// every declared field is present exactly once and reorders the
+    /// values into the struct's declared order before emitting
+    /// `MAKE_STRUCT` (ISA.bnf section 19).
+    fn finishStructLiteral(self: *Parser, type_name: []const u8) Error!*ast.Expr {
+        _ = self.advance(); // '{'
+        self.skipNewlines();
+        var fields: std.ArrayList(ast.Expr.FieldInit) = .empty;
+        if (!self.check(.rbrace)) {
+            while (true) {
+                const field_tok = try self.expect(.identifier, "expected a field name in struct literal");
+                _ = try self.expect(.colon, "expected ':' after field name");
+                const value = try self.expression();
+                try fields.append(self.allocator(), .{ .name = field_tok.lexeme, .value = value });
+                self.skipNewlines();
+                if (!self.match(.comma)) break;
+                self.skipNewlines();
+                if (self.check(.rbrace)) break; // trailing comma
+            }
+        }
+        self.skipNewlines();
+        _ = try self.expect(.rbrace, "expected '}' after struct literal");
+        return self.createExpr(.{ .struct_literal = .{ .type_name = type_name, .fields = try fields.toOwnedSlice(self.allocator()) } });
     }
 
     /// <len-expr> ::= 'len' '(' <expression> ')'
@@ -2095,4 +2304,149 @@ test "a for loop's range bounds may be arbitrary expressions" {
     const f = result.program[0].kind.for_stmt;
     try std.testing.expectEqualStrings("start", f.start.variable);
     try std.testing.expectEqualStrings("end", f.end.grouping.binary.left.variable);
+}
+
+test "parses a struct declaration with typed fields" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\struct Point {
+        \\    int x,
+        \\    int y
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const s = result.program[0].kind.struct_decl;
+    try std.testing.expectEqualStrings("Point", s.name);
+    try std.testing.expect(!s.exported);
+    try std.testing.expectEqual(@as(usize, 2), s.fields.len);
+    try std.testing.expectEqual(ast.ValueType.int, s.fields[0].type);
+    try std.testing.expectEqualStrings("x", s.fields[0].name);
+    try std.testing.expectEqualStrings("y", s.fields[1].name);
+}
+
+test "a struct field may be another named (struct/enum) type" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\struct Line {
+        \\    Point start,
+        \\    Point end
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const s = result.program[0].kind.struct_decl;
+    try std.testing.expectEqual(ast.ValueType.named, s.fields[0].type);
+    try std.testing.expectEqualStrings("Point", s.fields[0].named_type.?);
+}
+
+test "'export' works on a struct declaration" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "export struct Point { int x, int y }\n");
+    defer result.parser.deinit();
+
+    try std.testing.expect(result.program[0].kind.struct_decl.exported);
+}
+
+test "parses an enum declaration with variants" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\enum Color {
+        \\    Red,
+        \\    Green,
+        \\    Blue
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const e = result.program[0].kind.enum_decl;
+    try std.testing.expectEqualStrings("Color", e.name);
+    try std.testing.expect(!e.exported);
+    try std.testing.expectEqual(@as(usize, 3), e.variants.len);
+    try std.testing.expectEqualStrings("Red", e.variants[0]);
+    try std.testing.expectEqualStrings("Blue", e.variants[2]);
+}
+
+test "'export' works on an enum declaration" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "export enum Color { Red, Green }\n");
+    defer result.parser.deinit();
+
+    try std.testing.expect(result.program[0].kind.enum_decl.exported);
+}
+
+test "a struct/enum declaration allows a trailing comma" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "struct Point { int x, int y, }\nenum Color { Red, Green, }\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.program[0].kind.struct_decl.fields.len);
+    try std.testing.expectEqual(@as(usize, 2), result.program[1].kind.enum_decl.variants.len);
+}
+
+test "'export' requires 'func', 'struct', or 'enum'" {
+    try expectParseError("export int x := 1\n");
+}
+
+test "parses a struct literal keyed by field name, any order" {
+    try expectExprSexpr("Point{y: 2, x: 1}", "(struct Point (y 2) (x 1))");
+}
+
+test "a struct literal may span multiple lines with a trailing comma" {
+    const allocator = std.testing.allocator;
+    var result = try parseExprSource(allocator,
+        \\Point{
+        \\    x: 1,
+        \\    y: 2,
+        \\}
+    );
+    defer result.parser.deinit();
+
+    try std.testing.expectEqualStrings("Point", result.expr.struct_literal.type_name);
+    try std.testing.expectEqual(@as(usize, 2), result.expr.struct_literal.fields.len);
+}
+
+test "parses a field read, chainable like bracket-indexing" {
+    try expectExprSexpr("p.x", "(. p x)");
+    try expectExprSexpr("p.a.b", "(. (. p a) b)");
+    try expectExprSexpr("xs[0].x", "(. (index xs 0) x)");
+}
+
+test "parses an enum variant reference using the same '.' syntax" {
+    try expectExprSexpr("Color.Red", "(. Color Red)");
+}
+
+test "parses a field assignment" {
+    try expectExprSexpr("p.x := 5", "(:= (. p x) 5)");
+}
+
+test "assigning to a non-lvalue field-ish shape still fails (e.g. a slice)" {
+    try expectParseError("s[0..1] := \"x\"\n");
+}
+
+test "'if'/'while'/'for' with a bare-identifier condition/bound followed directly by '{' still parses as condition + block, not a struct literal" {
+    const allocator = std.testing.allocator;
+
+    var if_result = try parseProgramSource(allocator, "if flag {\n  print 1\n}\n");
+    defer if_result.parser.deinit();
+    try std.testing.expectEqualStrings("flag", if_result.program[0].kind.if_stmt.condition.variable);
+    try std.testing.expectEqual(@as(i64, 1), if_result.program[0].kind.if_stmt.then_branch.kind.block[0].kind.print_stmt.literal.int);
+
+    var while_result = try parseProgramSource(allocator, "while flag {\n  print 1\n}\n");
+    defer while_result.parser.deinit();
+    try std.testing.expectEqualStrings("flag", while_result.program[0].kind.while_stmt.condition.variable);
+
+    var for_result = try parseProgramSource(allocator, "for i in 0..n {\n  print i\n}\n");
+    defer for_result.parser.deinit();
+    try std.testing.expectEqualStrings("n", for_result.program[0].kind.for_stmt.end.variable);
+}
+
+test "'if flag {}' (an empty body) is a bare identifier condition plus an empty block, not an empty struct literal" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "if flag {}\n");
+    defer result.parser.deinit();
+
+    const if_stmt = result.program[0].kind.if_stmt;
+    try std.testing.expectEqualStrings("flag", if_stmt.condition.variable);
+    try std.testing.expectEqual(@as(usize, 0), if_stmt.then_branch.kind.block.len);
 }
