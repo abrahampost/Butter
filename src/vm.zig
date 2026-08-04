@@ -81,6 +81,21 @@ pub const RuntimeError = error{
     /// it isn't for `RemoveFailed`.
     RenameFailed,
 
+    // Subprocess execution (ISA.bnf section 17, GRAMMAR.bnf design note
+    // 3x). `Vm.diagnostic` carries which command and why for the latter two
+    // (operation "exec"), the same shape `open`'s file errors have.
+    /// The embedder gave the VM no permission to spawn processes, so `exec`
+    /// cannot work at all (see `Host.process`) — the same capability-gate
+    /// shape `FilesUnavailable` gives `open`.
+    ProcessesUnavailable,
+    /// `exec(command, ...)` couldn't even start `command` — no such
+    /// program, no permission, and so on.
+    ProcessSpawnFailed,
+    /// `exec(...)`'s child process didn't exit normally (killed by a
+    /// signal, stopped, or some other non-`exited` termination) — there is
+    /// no sane `int` in 0..255 to report as `exit_code` in that case.
+    ProcessTerminatedAbnormally,
+
     // Maps, lists, and JSON (ISA.bnf sections 11 and 12).
     /// Reading a map key that isn't present. No diagnostic — the bare tag
     /// says everything there is to say, same as `StreamClosed`.
@@ -166,10 +181,29 @@ pub const Host = struct {
     /// unlike opening a file, reading a variable that isn't there does
     /// nothing observable outside the VM.
     env: []const EnvVar = &.{},
+    /// `exec`'s permission to spawn processes (ISA.bnf section 17,
+    /// GRAMMAR.bnf design note 3x) — gated exactly like `fs`, and for the
+    /// same reason: unlike `env`/`args`, this is the first capability this
+    /// VM has with side effects reaching OUTSIDE its own sandboxed
+    /// `fs`/stream model (a spawned process can do anything the embedding
+    /// process itself could), so it defaults to absent rather than
+    /// something every `Vm` has by default. `null` fails `exec` with
+    /// `RuntimeError.ProcessesUnavailable`.
+    process: ?Process = null,
 
     /// The filesystem as the program sees it: `io` performs the operations,
     /// and `dir` is what a relative path in `open` resolves against.
     pub const Fs = struct {
+        io: std.Io,
+        dir: std.Io.Dir,
+    };
+
+    /// Subprocess-spawning access as the program sees it: `io` performs the
+    /// spawn, and `dir` is the spawned child's own working directory —
+    /// mirroring `Fs`'s own two fields exactly, so a test (or an embedder)
+    /// that wants `exec` to see the same directory `open` does just passes
+    /// the same `dir` to both.
+    pub const Process = struct {
         io: std.Io,
         dir: std.Io.Dir,
     };
@@ -811,6 +845,59 @@ pub const Vm = struct {
         return true;
     }
 
+    /// `exec(command, args)` (ISA.bnf section 17) — spawns `command` with
+    /// `args` (each already checked string-shaped by the EXEC handler below)
+    /// as its own argv[1..], waits for it to exit, and returns a fresh `map`
+    /// with three keys, always all present: "stdout"/"stderr" (its captured
+    /// output, adopted directly rather than copied — see `mapSetOwnedString`)
+    /// and "exit_code" (an `int` in 0..255).
+    ///
+    /// The spawned process's CURRENT DIRECTORY is `process.dir` — mirroring
+    /// `openFile`'s own `fs.dir`, so an embedder (or a test) that wants
+    /// `exec` and `open`/`exists`/... to agree on "here" passes the same
+    /// `dir` to both `Host.fs` and `Host.process`. Its ENVIRONMENT, by
+    /// contrast, is NOT `Host.env` — that only governs what `getenv`/`hasenv`
+    /// see FROM INSIDE this Butter program; the child inherits this actual
+    /// OS process's own real environment (`environ_map = null`), the same
+    /// way any ordinary shelled-out command would. Its standard input is
+    /// always empty (`std.process.run`'s own `.stdin = .ignore`) — there is
+    /// no way, in this pass, to pipe bytes into a spawned child.
+    fn execProcess(self: *Vm, host: Host, command: []const u8, args: []const Value) (RuntimeError || std.mem.Allocator.Error)!Value {
+        const process = host.process orelse return self.failFile(RuntimeError.ProcessesUnavailable, "exec", command, "this program was run without permission to spawn processes");
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(self.allocator);
+        try argv.append(self.allocator, command);
+        for (args) |arg| {
+            const bytes = arg.asStringBytes() orelse return RuntimeError.TypeMismatch;
+            try argv.append(self.allocator, bytes);
+        }
+
+        const result = std.process.run(self.allocator, process.io, .{
+            .argv = argv.items,
+            .cwd = .{ .dir = process.dir },
+        }) catch |err| return self.failFile(RuntimeError.ProcessSpawnFailed, "exec", command, @errorName(err));
+
+        const exit_code: i64 = switch (result.term) {
+            .exited => |code| code,
+            .signal, .stopped, .unknown => {
+                self.allocator.free(result.stdout);
+                self.allocator.free(result.stderr);
+                return self.failFile(RuntimeError.ProcessTerminatedAbnormally, "exec", command, "the process did not exit normally");
+            },
+        };
+
+        const obj = try Object.create(self.allocator, .{ .map = .empty });
+        const value = Value{ .object = obj };
+        errdefer value.decref(self.allocator);
+
+        try self.mapSetOwnedString(obj, "stdout", result.stdout);
+        try self.mapSetOwnedString(obj, "stderr", result.stderr);
+        try obj.mapSet(self.allocator, "exit_code", .{ .int = exit_code });
+
+        return value;
+    }
+
     /// The reader behind a stream, or an error explaining why there isn't
     /// one. `.stdin` with no reader supplied is the one case with neither: a
     /// null result means "already at end of input" (see `Host`), which the
@@ -1035,6 +1122,9 @@ pub const Vm = struct {
             error.ListDirFailed,
             error.RemoveFailed,
             error.RenameFailed,
+            error.ProcessesUnavailable,
+            error.ProcessSpawnFailed,
+            error.ProcessTerminatedAbnormally,
             => true,
 
             // VM-integrity failures. Not a program condition, and running a
@@ -1129,6 +1219,23 @@ pub const Vm = struct {
     /// value on success, so the errdefer only covers it failing first.
     fn mapSetText(self: *Vm, obj: *Object, key: []const u8, text: []const u8) !void {
         const v = try Value.newString(self.allocator, text);
+        errdefer v.decref(self.allocator);
+        try obj.mapSet(self.allocator, key, v);
+    }
+
+    /// Sets `key` to a string OBJECT that ADOPTS `owned` — already an
+    /// `self.allocator`-owned buffer with nothing else referencing it (as
+    /// `std.process.run`'s captured stdout/stderr are, `execProcess`'s only
+    /// caller) — rather than duplicating it the way `mapSetText` does.
+    /// Frees `owned` itself if `Object.create` fails before anything can
+    /// take ownership of it; past that point the usual errdefer-on-`mapSet`
+    /// failure covers it (`Object.destroy` frees a string payload).
+    fn mapSetOwnedString(self: *Vm, obj: *Object, key: []const u8, owned: []const u8) !void {
+        const string_obj = Object.create(self.allocator, .{ .string = owned }) catch |err| {
+            self.allocator.free(owned);
+            return err;
+        };
+        const v = Value{ .object = string_obj };
         errdefer v.decref(self.allocator);
         try obj.mapSet(self.allocator, key, v);
     }
@@ -1519,6 +1626,18 @@ pub const Vm = struct {
                 const to = to_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 const from = from_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 try self.push(.{ .boolean = try self.renamePath(host, from, to) });
+            },
+
+            // ---- Subprocess execution (ISA.bnf section 17) ----
+
+            .exec => {
+                const args_val = try self.pop();
+                defer args_val.decref(self.allocator);
+                const command_val = try self.pop();
+                defer command_val.decref(self.allocator);
+                if (args_val != .object or args_val.object.payload != .list) return RuntimeError.TypeMismatch;
+                const command = command_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                try self.push(try self.execProcess(host, command, args_val.object.payload.list.items));
             },
 
             .add => try self.add(),
@@ -2972,6 +3091,84 @@ test "a file slot beyond the table's size is the same clean error" {
     _ = try chunk.emit(allocator, .halt);
 
     try expectRuntimeError(&chunk, RuntimeError.StreamClosed);
+}
+
+// ---- Subprocess execution (ISA.bnf section 17) ---------------------------
+//
+// Only the capability gate and the non-string/non-list-operand paths are
+// covered here, mirroring the Directory-and-filesystem-metadata section
+// above — a real spawn (success, `ProcessSpawnFailed`) needs an actual
+// process to launch, which src/compiler.zig's `runProgramWithProcess`
+// (granting `Host.process` against a real `std.testing.tmpDir`) provides,
+// and a genuine successful run with real captured output needs a real,
+// host-OS-specific command, which only tests/integration_test.zig picks
+// (see its own comment on why that command can't be spelled out here).
+
+fn emitExecArgs(chunk: *Chunk, allocator: std.mem.Allocator, arg_values: []const Value) !void {
+    for (arg_values) |v| _ = try chunk.emitWithOperand(allocator, .push_const, try chunk.addConstant(allocator, v));
+    _ = try chunk.emitWithOperand(allocator, .make_list, @intCast(arg_values.len));
+}
+
+test "exec without process access is ProcessesUnavailable" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const command = try chunk.addConstant(allocator, try Value.newString(allocator, "anything"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, command);
+    try emitExecArgs(&chunk, allocator, &.{});
+    _ = try chunk.emit(allocator, .exec);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.ProcessesUnavailable);
+}
+
+test "exec with a non-string command is a type mismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const not_a_command = try chunk.addConstant(allocator, .{ .int = 7 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, not_a_command);
+    try emitExecArgs(&chunk, allocator, &.{});
+    _ = try chunk.emit(allocator, .exec);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "exec with a non-list args operand is a type mismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const command = try chunk.addConstant(allocator, try Value.newString(allocator, "anything"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, command);
+    const not_a_list = try chunk.addConstant(allocator, .{ .int = 7 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, not_a_list);
+    _ = try chunk.emit(allocator, .exec);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "exec checks the args operand's shape before the process capability gate" {
+    // Mirrors `path_exists`/`list_dir`/`path_remove`'s own ordering: an
+    // operand-shape TypeMismatch fires even with no `Host.process` granted,
+    // since the EXEC handler checks both operands' shapes itself before
+    // ever calling into `execProcess` (where the capability gate lives).
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const not_a_command = try chunk.addConstant(allocator, .{ .boolean = true });
+    _ = try chunk.emitWithOperand(allocator, .push_const, not_a_command);
+    const not_a_list = try chunk.addConstant(allocator, .{ .int = 7 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, not_a_list);
+    _ = try chunk.emit(allocator, .exec);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
 }
 
 // ---- Maps, lists, and the heap (ISA.bnf section 11) ---------------------
@@ -4565,6 +4762,9 @@ test "every RuntimeError variant has the catchability ISA.bnf section 14 documen
         RuntimeError.ListDirFailed,
         RuntimeError.RemoveFailed,
         RuntimeError.RenameFailed,
+        RuntimeError.ProcessesUnavailable,
+        RuntimeError.ProcessSpawnFailed,
+        RuntimeError.ProcessTerminatedAbnormally,
     };
     const uncatchable_variants = [_]RuntimeError{
         RuntimeError.StackOverflow,

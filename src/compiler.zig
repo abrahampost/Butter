@@ -589,6 +589,7 @@ pub const Compiler = struct {
             .list_dir => StaticType{ .scalar = .list },
             .path_remove => StaticType{ .scalar = .bool },
             .path_rename => StaticType{ .scalar = .bool },
+            .exec => StaticType{ .scalar = .map },
         };
     }
 
@@ -1062,6 +1063,11 @@ pub const Compiler = struct {
                 try self.compileExpr(r.from);
                 try self.compileExpr(r.to);
                 _ = try self.chunk.emit(self.allocator, .path_rename);
+            },
+            .exec => |x| {
+                try self.compileExpr(x.command);
+                try self.compileExpr(x.args);
+                _ = try self.chunk.emit(self.allocator, .exec);
             },
         }
     }
@@ -3184,6 +3190,95 @@ test "listDir(...)'s static type is list, remove/rename's is bool" {
     try expectCompileError(allocator, "int n := listDir(\".\")\n", SemanticError.TypeMismatch);
     try expectCompileError(allocator, "int n := remove(\"a\")\n", SemanticError.TypeMismatch);
     try expectCompileError(allocator, "int n := rename(\"a\", \"b\")\n", SemanticError.TypeMismatch);
+}
+
+// ---- Subprocess execution (GRAMMAR.bnf design note 3x, ISA.bnf section 17)
+
+/// `runProgramWithFs`'s counterpart for `Host.process` — a real
+/// `std.testing.tmpDir` grants `exec` permission to spawn processes AND a
+/// working directory to spawn them in, mirroring `Host.fs`'s own two
+/// fields exactly (`Host.Process` and `Host.Fs` have the same shape).
+fn runProgramWithProcess(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    dir: std.Io.Dir,
+    out_buf: []u8,
+    err_buf: []u8,
+) !IoResult {
+    var lex = lexer_mod.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var out = std.Io.Writer.fixed(out_buf);
+    var err = std.Io.Writer.fixed(err_buf);
+    try vm.run(&compiled, .{
+        .out = &out,
+        .err = &err,
+        .process = .{ .io = std.testing.io, .dir = dir },
+    });
+    return .{ .out = out.buffered(), .err = err.buffered() };
+}
+
+test "exec(...)'s static type is map" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int n := exec(\"a\", [])\n", SemanticError.TypeMismatch);
+}
+
+test "a program run with no process access can't use exec" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.ProcessesUnavailable, runProgramWithIo(allocator,
+        \\exec("anything", [])
+    , "", &out_buf, &err_buf));
+}
+
+test "exec(...) with a non-string element in args is TypeMismatch, even once process access is granted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgramWithProcess(allocator,
+        \\list bad_args := [1]
+        \\exec("anything", bad_args)
+    , tmp.dir, &out_buf, &err_buf));
+}
+
+test "exec(...) on a program that doesn't exist is ProcessSpawnFailed, not a crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.ProcessSpawnFailed, runProgramWithProcess(allocator,
+        \\exec("this-program-definitely-does-not-exist-anywhere-42", [])
+    , tmp.dir, &out_buf, &err_buf));
+}
+
+test "exec(...)'s ProcessSpawnFailed is catchable, naming 'exec' as the operation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [128]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithProcess(allocator,
+        \\try {
+        \\    exec("this-program-definitely-does-not-exist-anywhere-42", [])
+        \\} catch e {
+        \\    print e["error"]
+        \\    print e["operation"]
+        \\}
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("ProcessSpawnFailed\nexec\n", result.out);
 }
 
 // ---- Maps, lists, and JSON (GRAMMAR.bnf design notes 3m/3n) -------------

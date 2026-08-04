@@ -42,6 +42,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'json' | 'stringify' | 'null' | 'args' | 'exit'
                | 'try' | 'catch' | 'getenv' | 'hasenv'
                | 'exists' | 'listDir' | 'remove' | 'rename'
+               | 'exec'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -198,6 +199,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <list-dir-expr>
                       | <remove-expr>
                       | <rename-expr>
+                      | <exec-expr>
                       | 'stdin' | 'stdout' | 'stderr'
                       | 'args'
                       | IDENTIFIER
@@ -263,6 +265,10 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <list-dir-expr>     ::= 'listDir' '(' <expression> ')'
 <remove-expr>       ::= 'remove' '(' <expression> ')'
 <rename-expr>       ::= 'rename' '(' <expression> ',' <expression> ')'
+
+(* Subprocess execution (design note 3x). Like getenv/exists/rename, 'exec'
+   is not also a <type> keyword, so a bare <expr-stmt> use is legal too. *)
+<exec-expr>         ::= 'exec' '(' <expression> ',' <expression> ')'
 
 
 (* --------------------------------------------------------------------------
@@ -565,6 +571,46 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      time (same as `open`'s path and `getenv`'s name): a non-`string`
      argument is a runtime `RuntimeError.TypeMismatch`. *)
 
+(* --- Subprocess execution (design note 3x) ---
+   - `exec(command, args)` spawns `command` as a child process with `args` —
+     a `list` of `string`s — as its own argv[1..], waits for it to exit, and
+     evaluates to a fresh `map` with three keys, always all present:
+     `"stdout"`/`"stderr"` (the child's captured output, as `string`s) and
+     `"exit_code"` (an `int`). This is the first builtin with side effects
+     reaching OUTSIDE this VM's own sandboxed `fs`/stream model — a spawned
+     process can do anything the embedding process itself could, unbounded
+     by `Host.fs`'s own directory-scoped access — which is why it gets its
+     OWN capability gate (`Host.process`, ISA.bnf section 17) rather than
+     reusing `Host.fs`'s the way `exists`/`listDir`/`remove`/`rename` do:
+     `RuntimeError.ProcessesUnavailable` with no `Host.process` at all,
+     mirroring `FilesUnavailable`'s shape exactly. `command`/`args` are both
+     arbitrary expressions, not literals (matching `rename`'s two operands),
+     checked at RUNTIME, not compile time: a non-`string` `command`, a
+     non-`list` `args`, or a non-`string` element within `args` is
+     `RuntimeError.TypeMismatch`.
+   - `command` couldn't even be started (no such program, no permission, ...)
+     is `RuntimeError.ProcessSpawnFailed`. A child that ran but didn't exit
+     NORMALLY (killed by a signal, stopped, ...) is
+     `RuntimeError.ProcessTerminatedAbnormally` — there is no sane `int` in
+     0..255 to report as `"exit_code"` for a process that never really
+     "exited" at all.
+   - THE CHILD'S WORKING DIRECTORY is wherever a relative `open`/`exists`
+     path would resolve — `Host.process` and `Host.fs` share the same shape
+     (`{ io, dir }`) for exactly this reason, so an embedder that wants
+     `exec` and the filesystem builtins to agree on "here" passes the same
+     `dir` to both. Its ENVIRONMENT, by contrast, is NOT `Host.env` — that
+     only governs what `getenv`/`hasenv` see from INSIDE this Butter
+     program; the spawned child inherits the actual OS process's own real
+     environment, the same way any ordinary shelled-out command would (a
+     program cannot use `Host.env` to sandbox what a child process sees, only
+     what its own `getenv`/`hasenv` calls see).
+   - There is no way, in this pass, to pipe bytes INTO a spawned child (its
+     standard input is always empty) or to stream its output incrementally
+     (`"stdout"`/`"stderr"` are the FULL captured output, gathered only after
+     it exits) — a deliberately minimal scope matching this feature's own
+     TODO entry; a future pass could add an opt-in streaming/interactive
+     form without changing this one. *)
+
 (* --- Process exit code ---
    - `exit <expression>` halts the entire program immediately, from
      anywhere — the top level, mid-loop, mid-expression-statement, or
@@ -677,12 +723,13 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      that carries no diagnostic detail — most of them. `"error"` is the
      stable one to branch on (`if e["error"] == "KeyNotFound"`);
      `"message"`'s exact wording is not a compatibility promise.
-   - NOT EVERY ERROR IS CATCHABLE. The 22 that are, are the ones a program
+   - NOT EVERY ERROR IS CATCHABLE. The 25 that are, are the ones a program
      could plausibly do something about — `TypeMismatch`, `DivisionByZero`,
      `Overflow`, `IndexOutOfBounds`, `ByteOutOfRange`, `KeyNotFound`,
      `JsonParseFailed`, `NumberParseFailed`, `InvalidExitCode`,
-     `ListDirFailed`, `RemoveFailed`, `RenameFailed` (design note 3w), and
-     the ten stream/file ones. `StackOverflow`, `StackUnderflow`, `CallStackOverflow`
+     `ListDirFailed`, `RemoveFailed`, `RenameFailed` (design note 3w),
+     `ProcessesUnavailable`, `ProcessSpawnFailed`, `ProcessTerminatedAbnormally`
+     (design note 3x), and the ten stream/file ones. `StackOverflow`, `StackUnderflow`, `CallStackOverflow`
      and `HandlerStackOverflow` are NOT: they are VM-integrity failures, not
      program conditions, and running a handler needs the very stack room
      that has just run out. Neither is an out-of-memory failure, since

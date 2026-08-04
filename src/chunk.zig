@@ -142,6 +142,11 @@ pub const OpCode = enum(u8) {
     path_remove,
     path_rename,
 
+    // Subprocess execution (ISA.bnf section 17, GRAMMAR.bnf design note
+    // 3x). No operand: like PATH_RENAME, both the command and its argument
+    // list are ordinary popped `Value`s, not compile-time constants.
+    exec,
+
     // `exit <expr>` (ISA.bnf's addendum to section 3). No operand: the
     // requested code is an ordinary popped `Value`, exactly like every
     // other opcode that acts on an expression result rather than a
@@ -529,6 +534,20 @@ test "disassemble renders path_exists, list_dir, path_remove, and path_rename" {
     try chunk.disassemble(&writer);
 
     try std.testing.expectEqualStrings("0000 path_exists\n0001 list_dir\n0002 path_remove\n0003 path_rename\n", writer.buffered());
+}
+
+test "disassemble renders exec" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .exec);
+
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 exec\n", writer.buffered());
 }
 
 test "Program.deinit frees the main chunk and every function's chunk" {

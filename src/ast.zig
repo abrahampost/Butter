@@ -212,6 +212,13 @@ pub const Expr = union(enum) {
     /// error" split as `path_remove`). Any other failure is
     /// `RuntimeError.RenameFailed`.
     path_rename: PathRename,
+    /// `exec(command, args)` (GRAMMAR.bnf design note 3x) — spawns `command`
+    /// with `args` (a `list` of strings) as its own argv[1..], waits for it
+    /// to exit, and evaluates to a fresh `map` with three keys, always all
+    /// present: `"stdout"`/`"stderr"` (its captured output, as strings) and
+    /// `"exit_code"` (an `int`). Like `rename`, both operands are arbitrary
+    /// expressions, not literals, so a computed command/argument list works.
+    exec: Exec,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -329,6 +336,15 @@ pub const Expr = union(enum) {
     pub const PathRename = struct {
         from: *Expr,
         to: *Expr,
+    };
+
+    /// `exec(command, args)`'s two operands — `command` a general expression
+    /// that must be string-shaped at runtime, `args` one that must be
+    /// list-shaped (of strings), same "checked at runtime, not here" stance
+    /// `open`'s path and `getenv`'s name take.
+    pub const Exec = struct {
+        command: *Expr,
+        args: *Expr,
     };
 };
 
@@ -637,6 +653,13 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try printExpr(writer, r.from);
             try writer.writeAll(" ");
             try printExpr(writer, r.to);
+            try writer.writeAll(")");
+        },
+        .exec => |x| {
+            try writer.writeAll("(exec ");
+            try printExpr(writer, x.command);
+            try writer.writeAll(" ");
+            try printExpr(writer, x.args);
             try writer.writeAll(")");
         },
     }

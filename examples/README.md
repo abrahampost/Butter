@@ -16,6 +16,7 @@
 | [env_vars.butter](env_vars.butter) | **Runs today** | `getenv`/`hasenv` (GRAMMAR.bnf design note 3v, ISA.bnf section 15) — reading configuration from the environment, with a built-in default that a variable overrides, `hasenv` telling an exported-but-empty setting from an absent one, and a numeric setting parsed under `try`/`catch`. Set `EDITOR`/`BUTTER_WIDTH`/`BUTTER_HEIGHT` to see it react. |
 | [cli_args.butter](cli_args.butter) | **Runs today** | The bare `args` keyword (GRAMMAR.bnf design note 3p, ISA.bnf's PUSH_ARGS) — everything after a literal `--` on the CLI's own command line, as a `list` of strings. Needs `-- <name> ...` passed on the command line. |
 | [dir_ops.butter](dir_ops.butter) | **Runs today** | `exists`/`listDir`/`remove`/`rename` (GRAMMAR.bnf design note 3w, ISA.bnf section 16) — checking a path without opening it, listing a real directory's entries, and moving/deleting a scratch file, each showing the "absent is a no-op, not an error" bool split and a genuine failure caught via `try`/`catch`. Creates and cleans up `examples/dir_ops_scratch.txt`. |
+| [exec.butter](exec.butter) | **Runs today** | `exec(command, args)` (GRAMMAR.bnf design note 3x, ISA.bnf section 17) — spawning a real child process and capturing its `stdout`/`stderr`/`exit_code` as a `map`, plus a missing-program `ProcessSpawnFailed` caught via `try`/`catch`. Picks a small per-OS shell command via `hasenv("windir")`. |
 
 Try any of them:
 
@@ -36,6 +37,7 @@ zig build run -- --stdin < examples/basic_math.butter
 # '--' is zig build's own separator, consumed before butter ever sees it):
 zig build run -- examples/cli_args.butter -- Ada Grace
 zig build run -- examples/dir_ops.butter
+zig build run -- examples/exec.butter
 ```
 
 `env_vars.butter` reads its settings from the environment, so set some to

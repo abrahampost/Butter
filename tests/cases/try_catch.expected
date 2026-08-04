@@ -15,5 +15,6 @@ StreamClosed
 CannotCloseStandardStream
 ListDirFailed
 RenameFailed
+ProcessesUnavailable
 TooManyOpenFiles
 all handled

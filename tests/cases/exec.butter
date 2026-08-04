@@ -1,0 +1,31 @@
+# exec(command, args) (GRAMMAR.bnf design note 3x, ISA.bnf section 17) —
+# spawns a real child process and captures its stdout/stderr/exit_code.
+#
+# The actual command is host-OS-specific (there is no single program name
+# every platform has), so tests/integration_test.zig supplies it via `args`
+# instead of hardcoding one here — the same reason `args`/`env` cases are
+# injected rather than read from the real process. This source only ever
+# sees `args[0]` (the command) and the rest (its own arguments), so it stays
+# portable regardless of what actually produced "hello"/"world"/7.
+
+list cmd_args := []
+for i in 1..len(args) {
+    push(cmd_args, args[i])
+}
+
+map result := exec(args[0], cmd_args)
+print result["stdout"]
+print result["stderr"]
+print result["exit_code"]
+
+# A program that doesn't exist is a catchable ProcessSpawnFailed, not a
+# crash — this part IS portable: the name is nonsense on every platform.
+try {
+    exec("this-program-definitely-does-not-exist-anywhere-42", [])
+} catch e {
+    if e["error"] == "ProcessSpawnFailed" {
+        print "spawn failed as expected"
+    } else {
+        print "MISMATCH: " + e["error"]
+    }
+}

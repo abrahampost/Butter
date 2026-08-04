@@ -1,0 +1,33 @@
+# exec(command, args): spawning a real child process and capturing its
+# stdout/stderr/exit_code (GRAMMAR.bnf design note 3x, ISA.bnf section 17).
+#
+#   zig build run -- examples/exec.butter
+#
+# No single program name exists on every OS, so this picks a small one-line
+# shell command per platform, detected via `hasenv("WINDIR")` (set on every
+# Windows install, unset elsewhere — getenv/hasenv are byte-exact even on
+# Windows itself, GRAMMAR.bnf design note 3v, so this has to spell it in the
+# same case Windows itself does) rather than hardcoding just one.
+string cmd
+list cmd_args
+if hasenv("WINDIR") {
+    cmd := "cmd.exe"
+    cmd_args := ["/C", "echo hello from butter exec"]
+} else {
+    cmd := "/bin/sh"
+    cmd_args := ["-c", "echo hello from butter exec"]
+}
+
+map result := exec(cmd, cmd_args)
+print "stdout: " + result["stdout"]
+print "stderr: " + result["stderr"]
+print "exit_code: " + stringify(result["exit_code"])
+
+# A program that can't be started is a catchable ProcessSpawnFailed, not a
+# crash — the same "genuine failure, not a silent false" shape
+# `open`/`listDir`'s own errors have (GRAMMAR.bnf design note 3u).
+try {
+    exec("this-program-does-not-exist-anywhere", [])
+} catch e {
+    print "spawning a missing program: " + e["error"]
+}

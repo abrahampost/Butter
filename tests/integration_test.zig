@@ -15,6 +15,7 @@
 //! imports together, the way a real program would.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const butter = @import("butter");
 
 /// Runs `source` as a Butter program and returns everything it printed.
@@ -160,6 +161,55 @@ fn expectCaseOutputWithFs(comptime name: []const u8) !void {
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
+/// Runs tests/cases/<name>.butter with subprocess-spawning access (a real
+/// `std.testing.tmpDir` for `Host.process`'s working directory, mirroring
+/// `expectCaseOutputWithFs`'s own scratch-directory setup) AND `args`
+/// available to it — the combination `exec` (ISA.bnf section 17) needs to
+/// be exercised end to end: the actual command run differs per host OS
+/// (there is no single program name every platform has), so it's supplied
+/// as `args` from here rather than hardcoded into the `.butter` source,
+/// exactly the way `expectCaseOutputWithArgs` injects `args` for the same
+/// portability reason.
+fn expectCaseOutputWithProcess(comptime name: []const u8, args: []const []const u8) !void {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("cases/" ++ name ++ ".butter");
+    const expected = @embedFile("cases/" ++ name ++ ".expected");
+
+    const io = std.testing.io;
+    const scratch_path = ".zig-cache/butter-test-" ++ name;
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, scratch_path) catch {}; // left over from an interrupted run
+    var scratch = try cwd.createDirPathOpen(io, scratch_path, .{});
+    defer {
+        scratch.close(io);
+        cwd.deleteTree(io, scratch_path) catch {};
+    }
+
+    var loader = butter.module.Loader.init(allocator, io, cwd);
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(source, "<test>", ".");
+    const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry);
+
+    var compiler = butter.compiler.Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(modules.entry_index, modules.units);
+    defer compiled.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    var vm = butter.vm.Vm.init(allocator);
+    try vm.run(&compiled, .{
+        .out = &out.writer,
+        .args = args,
+        .process = .{ .io = io, .dir = scratch },
+    });
+
+    try std.testing.expectEqualStrings(expected, out.written());
+}
+
 /// Runs `source` with `args` and returns both everything it printed and
 /// the process exit code it requested via `exit` (ISA.bnf's EXIT) — `null`
 /// for a program that falls off the end (an ordinary HALT) without ever
@@ -274,6 +324,28 @@ test "env: with no host env, every variable is unset" {
 
 test "dir_ops: exists/listDir/remove/rename against a real scratch directory" {
     try expectCaseOutputWithFs("dir_ops");
+}
+
+test "exec: spawns a real process and captures stdout/stderr/exit_code" {
+    // No single program name exists on every host OS, so the command run
+    // here is chosen per-platform via `builtin.os.tag` and handed to the
+    // `.butter` source as `args` (see `expectCaseOutputWithProcess`'s own
+    // comment) — `[Console]::Out.Write`/`.Error.Write` on Windows and
+    // `printf` on POSIX are both chosen specifically because neither
+    // appends a trailing newline on its own, so the captured "hello"/
+    // "world" bytes are exactly what tests/cases/exec.expected asserts,
+    // with no platform-specific CRLF-vs-LF ambiguity to account for.
+    const args: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "[Console]::Out.Write('hello'); [Console]::Error.Write('world'); exit 7",
+        }
+    else
+        &.{ "/bin/sh", "-c", "printf %s hello; printf %s world 1>&2; exit 7" };
+
+    try expectCaseOutputWithProcess("exec", args);
 }
 
 // ---- exit_code: a grep-style tool built on `args` + `exit` ------------

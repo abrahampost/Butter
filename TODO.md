@@ -173,17 +173,50 @@ regardless of what the machine running the suite has exported; the real
 process-environment path through `main.zig` was verified by running the
 built binary with a variable set.
 
-### 11. Subprocess/exec support
-No way to shell out to another program. This blocks a large class of CLI
-tools that wrap or orchestrate other binaries.
-- Scope a minimal `exec`/`spawn` builtin: command + args in, captured
-  stdout/stderr + exit code out (shape it like the existing
-  stream/buffer conventions used by `read`/`write`).
-- Consider the security/design implications (this is the first builtin
-  with side effects outside the sandboxed `fs`/stream model — should
-  probably be gated the same way `.fs` already is, i.e. absent unless the
-  embedder opts in).
-- Document in GRAMMAR.bnf/ISA.bnf; add an integration test.
+### 11. Subprocess/exec support — DONE
+`exec(command, args)` is now a special-form expression (GRAMMAR.bnf design
+note 3x, parsed like `getenv`/`rename` — not also a `<type>` keyword, so a
+bare `exec(...)` is a legal `<expr-stmt>` too), compiling to a new `EXEC`
+opcode (ISA.bnf section 17) in [src/vm.zig](src/vm.zig). `command` is a
+`string`, `args` a `list` of `string`s (its own argv[1..], checked at
+runtime, not compile time — same stance `rename`'s two operands take); it
+spawns the process via `std.process.run`, waits for it to exit, and
+evaluates to a fresh `map` with three keys always present: `"stdout"`/
+`"stderr"` (its captured output) and `"exit_code"` (an `int`).
+
+This is the first builtin with side effects reaching outside the VM's own
+sandboxed `fs`/stream model, so — as flagged — it gets its own capability
+gate, `Host.process` (the exact same `{ io, dir }` shape `Host.fs` already
+has, so an embedder/test can point `exec` and `open`/`exists`/... at the
+same directory), defaulting to absent: `RuntimeError.ProcessesUnavailable`
+with none. A spawn failure (no such program, no permission) is
+`RuntimeError.ProcessSpawnFailed`; a child that didn't exit normally
+(killed by a signal, stopped, ...) is
+`RuntimeError.ProcessTerminatedAbnormally` — there's no sane 0..255 code to
+report for either. All three are catchable, bringing the catchable-variant
+count to 25. [src/main.zig](src/main.zig) grants the CLI's own process
+permission unconditionally, mirroring how it already grants `fs`.
+
+Deliberately minimal, matching this entry's own scope: the spawned child's
+standard input is always empty (no way to pipe bytes in), and
+`"stdout"`/`"stderr"` are the FULL captured output gathered only after it
+exits (no incremental/streaming form) — a future pass could add an opt-in
+interactive form without changing this one. The child's environment is the
+real OS process environment, not `Host.env` (which only governs this
+Butter program's own `getenv`/`hasenv`) — a program can't use `Host.env` to
+sandbox what a spawned child itself sees.
+
+Documented in GRAMMAR.bnf/ISA.bnf. Covered by lexer/parser/compiler/VM unit
+tests (capability gate, non-string command, non-list args, a non-string
+element within args, a nonexistent program's `ProcessSpawnFailed`, static
+type `map`), a `ProcessesUnavailable` case in
+[tests/cases/try_catch.butter](tests/cases/try_catch.butter), the
+[exec](tests/cases/exec.butter) integration case (which spawns a REAL
+per-host-OS process — PowerShell on Windows, `/bin/sh` on POSIX, chosen by
+`tests/integration_test.zig` via `builtin.os.tag` and handed over as
+`args` so the `.butter` source itself stays platform-agnostic, the same
+reason `args`/`env` cases are injected rather than read from the real
+process), and [examples/exec.butter](examples/exec.butter).
 
 ### 12. Directory and filesystem metadata operations — DONE
 `exists(path)`, `listDir(path)`, `remove(path)`, and `rename(from, to)`

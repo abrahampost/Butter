@@ -412,6 +412,27 @@
                                                reference — neither has a
                                                JSON representation.
 
+   EXEC                     ( command args -- map )
+                                               pops args (must be a list of
+                                               strings; TypeMismatch
+                                               otherwise), then command (must
+                                               be string-shaped; TypeMismatch
+                                               otherwise); spawns command with
+                                               args as its own argv[1..],
+                                               waits for it to exit, and
+                                               pushes a fresh map with
+                                               "stdout"/"stderr"/"exit_code".
+                                               ProcessesUnavailable with no
+                                               `Host.process`;
+                                               ProcessSpawnFailed if command
+                                               couldn't be started;
+                                               ProcessTerminatedAbnormally if
+                                               it didn't exit normally. Full
+                                               detail in section 17. What
+                                               `exec(command, args)`
+                                               (GRAMMAR.bnf design note 3x)
+                                               compiles to.
+
    EXIT                     ( code -- )        pops code (must be INT;
                                                TypeMismatch otherwise;
                                                InvalidExitCode unless
@@ -1079,13 +1100,14 @@
    "operation"/"path" from `Vm.diagnostic`, `""` when there is none. No new
    value kind is involved — it is the same map a `{...}` literal builds.
 
-   CATCHABLE vs NOT. Twenty-two RuntimeError variants are catchable:
+   CATCHABLE vs NOT. Twenty-five RuntimeError variants are catchable:
    TypeMismatch, DivisionByZero, Overflow, IndexOutOfBounds, ByteOutOfRange,
    StreamReadFailed, StreamWriteFailed, FileOpenFailed, TooManyOpenFiles,
    FileCloseFailed, StreamNotReadable, StreamNotWritable, StreamClosed,
    CannotCloseStandardStream, FilesUnavailable, KeyNotFound, JsonParseFailed,
    NumberParseFailed, InvalidExitCode, ListDirFailed, RemoveFailed,
-   RenameFailed (section 16).
+   RenameFailed (section 16), ProcessesUnavailable, ProcessSpawnFailed, and
+   ProcessTerminatedAbnormally (section 17).
 
    Four are not: StackOverflow, StackUnderflow, CallStackOverflow, and
    HandlerStackOverflow. These are VM-integrity failures rather than program
@@ -1342,4 +1364,87 @@
    grants file access has to remember to grant this too, for no added
    safety. `Host.fs` null still means the same thing it always has:
    `RuntimeError.FilesUnavailable` for all four, exactly like OPEN.
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   17. SUBPROCESS EXECUTION (EXEC — one new opcode, no new value kind beyond
+       section 11's `map`, one new runtime capability gate `Host.process`;
+       GRAMMAR.bnf design note 3x)
+   -------------------------------------------------------------------------- *)
+
+   EXEC has its full stack-effect entry in section 3; this section is the
+   capability-gate and Host-wiring detail, the same split section 10 (Files)
+   and section 16 (Directory/filesystem metadata) give OPEN and
+   PATH_EXISTS/LIST_DIR/PATH_REMOVE/PATH_RENAME respectively.
+
+   `Host.process: ?Process = null` (vm.zig) — `Process` is `{ io: std.Io,
+   dir: std.Io.Dir }`, the EXACT SAME SHAPE as `Host.Fs` (section 10). This
+   is deliberate, not incidental: an embedder (or a test) that wants `exec`'s
+   spawned children and `open`/`exists`/`listDir`/... to agree on "the
+   current directory" passes the SAME `dir` value to both `Host.fs` and
+   `Host.process`. Unlike every other capability this VM injects (`args`,
+   `env`), `process` defaults to ABSENT rather than "present but empty" or
+   "present but inert" — a spawned child can do anything the embedding
+   process itself could (read/write any file the OS lets it, open network
+   connections, spawn further children of its own), entirely unbounded by
+   whatever `Host.fs`/`Host.process.dir` scoping the embedder set up for
+   THIS Vm's own `open`/`exists`/etc. — so granting it is a strictly bigger
+   step than granting filesystem access, and gets its own opt-in rather than
+   riding along on `Host.fs` the way section 16's four opcodes deliberately
+   do (their own "REUSES Host.fs" note, above, doesn't apply here).
+
+   `Vm.execProcess` (vm.zig) implements EXEC:
+
+     1. `host.process orelse` -> `RuntimeError.ProcessesUnavailable`, with a
+        `Vm.diagnostic` (operation "exec", path = command, same shape every
+        other capability-gate failure in this VM carries).
+     2. Builds argv as `[command] ++ args` (`args`'s elements, gathered via
+        `Value.asStringBytes` — `RuntimeError.TypeMismatch` on the first one
+        that isn't string-shaped, checked lazily as each is visited rather
+        than in one up-front pass).
+     3. `std.process.run(self.allocator, process.io, .{ .argv = argv, .cwd =
+        .{ .dir = process.dir } })` — spawns the child with its OWN
+        `stdin = .ignore` (there is no way, in this pass, to pipe bytes INTO
+        a spawned child) and `stdout`/`stderr` both piped and fully
+        captured, unlimited, only once the child has actually exited (there
+        is no incremental/streaming form). A spawn failure (no such program,
+        no permission, ...) is `RuntimeError.ProcessSpawnFailed`, diagnosed
+        the same way.
+     4. The child's `std.process.Child.Term`: `.exited => |code|` becomes
+        `"exit_code"` directly (already a `u8`, so always in 0..255 — no
+        separate range check is needed the way EXIT's own operand needs
+        one, since this value came FROM a real process exit, not arbitrary
+        Butter source). Any other `Term` (`.signal`, `.stopped`, `.unknown`
+        — the child was killed, suspended, or terminated some other way
+        that isn't a normal exit) is `RuntimeError.ProcessTerminatedAbnormally`
+        instead: freeing the already-captured stdout/stderr buffers first
+        (`std.process.run` still allocates and returns them even for a
+        non-`.exited` term), since there is no sane `int` to report as
+        `"exit_code"` for a process that never "exited" in the ordinary
+        sense.
+     5. On success, builds a fresh `map` (section 11) with exactly three
+        keys, always all present: `"stdout"`/`"stderr"` — ADOPTING
+        `std.process.run`'s own returned buffers directly as each string
+        Object's owned bytes (`Vm.mapSetOwnedString`) rather than duplicating
+        them the way `Vm.mapSetText` (section 14's error map) does, since
+        nothing else holds a reference to them — and `"exit_code"` (a plain
+        scalar `int`, nothing to incref).
+
+   THE CHILD'S ENVIRONMENT IS NOT `Host.env` (section 15). `Host.env` only
+   governs what THIS Butter program's OWN `getenv`/`hasenv` calls see; EXEC
+   passes `environ_map = null` to `std.process.run`, meaning the spawned
+   child inherits this actual OS process's REAL environment whole, the same
+   way any ordinary shelled-out command from any other language would. An
+   embedder cannot use `Host.env` to sandbox what a child process itself
+   observes — only `Host.process` (present or absent) controls whether one
+   can be spawned at all.
+
+   REFCOUNTS. EXEC pops and decrefs both operands (`args` first, since it was
+   pushed last — `Vm.pop`'s usual convention, section 14's addendum); each
+   `args` element is only ever READ (`asStringBytes`), never consumed, since
+   the popped `args` list value (and everything it owns) is decreffed as a
+   whole once `execProcess` returns, success or failure. The pushed result
+   map is a fresh heap Object nobody else holds a reference to, exactly like
+   LIST_DIR's own result (section 16).
    ========================================================================== *)

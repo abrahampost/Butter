@@ -1,18 +1,22 @@
 # try/catch (GRAMMAR.bnf design note 3u, ISA.bnf section 14) — one case
 # per catchable RuntimeError variant a Butter program can actually raise.
 #
-# Five catchable variants are deliberately absent, because no program text
+# Seven catchable variants are deliberately absent, because no program text
 # can provoke them: FilesUnavailable needs an embedder that supplied no
 # filesystem, StreamWriteFailed needs an output stream that fails mid-write
 # (both covered by unit tests in src/compiler.zig), StreamReadFailed and
 # FileCloseFailed need a genuine OS-level I/O failure — src/vm.zig's
 # catchability-table test is the only per-variant coverage those two can
-# get — and RemoveFailed (design note 3w) needs a non-empty directory to
+# get — RemoveFailed (design note 3w) needs a non-empty directory to
 # remove, which nothing here can create: Butter has no `mkdir` builtin
 # (src/compiler.zig's own RemoveFailed test seeds one directly via Zig,
-# outside the language). The four NON-catchable variants have their own
-# escape tests in src/vm.zig; by construction none of them can appear here,
-# since a program that raises one never reaches its next line.
+# outside the language) — and ProcessSpawnFailed/ProcessTerminatedAbnormally
+# (design note 3x) need `exec` permission, which this case deliberately
+# doesn't have (see ProcessesUnavailable below); both are covered instead by
+# src/compiler.zig's `runProgramWithProcess` tests. The four NON-catchable
+# variants have their own escape tests in src/vm.zig; by construction none
+# of them can appear here, since a program that raises one never reaches its
+# next line.
 
 # Prints the variant name if it's the one that was expected, and something
 # unmissable otherwise — so the .expected file is just the list of names,
@@ -154,6 +158,18 @@ try {
     rename("data.txt", "no_such_dir/moved.txt")
 } catch e {
     show("RenameFailed", e)
+}
+
+# --- Subprocess execution (design note 3x) ----------------------------
+#
+# This harness grants filesystem access but not `exec` permission (see
+# this file's header comment), which is exactly what's needed to reach
+# the capability gate below.
+
+try {
+    exec("anything", [])
+} catch e {
+    show("ProcessesUnavailable", e)
 }
 
 # Last, because the handles it leaks stay open for the rest of the run —

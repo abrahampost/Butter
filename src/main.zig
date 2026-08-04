@@ -168,6 +168,11 @@ pub fn main(init: std.process.Init) !void {
         // A program run from the CLI inherits this process's environment
         // whole, the same way it inherits the current directory for `open`.
         .env = env_vars,
+        // Likewise, a program run from the CLI gets permission to spawn
+        // processes (`exec`) — the same capability-gate shape `fs` has,
+        // granted here for the same reason. An embedder that wants a
+        // sandboxed program simply passes no `process` at all.
+        .process = .{ .io = init.io, .dir = std.Io.Dir.cwd() },
     }) catch |err| {
         // Flush whatever the program managed to produce before the error,
         // so a partial run's output isn't swallowed by the diagnostic.

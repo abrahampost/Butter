@@ -600,6 +600,7 @@ pub const Parser = struct {
     ///         | <int-expr> | <float-expr>
     ///         | <getenv-expr> | <hasenv-expr>
     ///         | <exists-expr> | <list-dir-expr> | <remove-expr> | <rename-expr>
+    ///         | <exec-expr>
     ///         | 'stdin' | 'stdout' | 'stderr' | 'args' | IDENTIFIER
     fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
@@ -665,6 +666,7 @@ pub const Parser = struct {
             .kw_listdir => return self.listDirExpr(),
             .kw_remove => return self.removeExpr(),
             .kw_rename => return self.renameExpr(),
+            .kw_exec => return self.execExpr(),
             .kw_stdin => {
                 _ = self.advance();
                 return self.createExpr(.{ .stream_literal = .stdin });
@@ -1000,6 +1002,22 @@ pub const Parser = struct {
         const to = try self.expression();
         _ = try self.expect(.rparen, "expected ')' after the destination path");
         return self.createExpr(.{ .path_rename = .{ .from = from, .to = to } });
+    }
+
+    /// <exec-expr> ::= 'exec' '(' <expression> ',' <expression> ')'
+    ///
+    /// Like `getenv`/`exists`/`rename`, `exec` is a keyword in expression
+    /// position ONLY — nothing dispatches on it before expression parsing
+    /// begins — so a bare `exec("true", [])` is a legal (if pointless)
+    /// <expr-stmt> too.
+    fn execExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'exec'
+        _ = try self.expect(.lparen, "expected '(' after 'exec'");
+        const command = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the command");
+        const args = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the argument list");
+        return self.createExpr(.{ .exec = .{ .command = command, .args = args } });
     }
 };
 
@@ -1540,6 +1558,24 @@ test "exists(x)/listDir(x)/remove(x)/rename(x, y) CAN each stand alone as a top-
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), result.program.len);
+}
+
+test "parses exec(...) as an expression" {
+    try expectExprSexpr("exec(\"true\", [])", "(exec \"true\" (array))");
+    try expectExprSexpr("exec(cmd, argv)", "(exec cmd argv)");
+    try expectExprSexpr("exec(\"echo\", [\"hi\"])", "(exec \"echo\" (array \"hi\"))");
+}
+
+test "exec(x, y) CAN stand alone as a top-level statement, unlike int(x)" {
+    // Same reasoning as getenv/exists/rename above: `exec` isn't a <type>
+    // keyword, so nothing dispatches on it before expression parsing
+    // begins.
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "exec(\"true\", [])\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.program.len);
+    try std.testing.expectEqualStrings("true", result.program[0].kind.expr_stmt.exec.command.literal.string);
 }
 
 test "'listDir' without '(' is a parse error, not a bare identifier" {
