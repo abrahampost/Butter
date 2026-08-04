@@ -185,6 +185,33 @@ pub const Expr = union(enum) {
     /// exist both read as `""`. The same split `map_has` gives a map
     /// (GRAMMAR.bnf design note 3v).
     env_has: *Expr,
+    /// `exists(path)` (GRAMMAR.bnf design note 3w) — whether `path` names
+    /// anything on disk right now, as a `bool`. Never raises beyond the
+    /// `FilesUnavailable` capability gate and a non-string `TypeMismatch`:
+    /// any other reason the check can't be answered (permission denied, a
+    /// bad path, ...) reads as `false`, the same "advisory, not a
+    /// guarantee" contract `std.Io.Dir.access` itself documents.
+    path_exists: *Expr,
+    /// `listDir(path)` — the names of `path`'s own entries (files and
+    /// subdirectories, not recursive, no `.`/`..`), as a fresh `list` of
+    /// `string`s in whatever order the OS hands them back. Unlike
+    /// `path_exists`, a `path` that can't actually be listed (missing, not a
+    /// directory, no permission) is `RuntimeError.ListDirFailed` — there is
+    /// no meaningful empty-list fallback for "list this" the way there is
+    /// for "does this exist".
+    list_dir: *Expr,
+    /// `remove(path)` — deletes the file or empty directory at `path`,
+    /// evaluating to whether there was anything there to remove (the same
+    /// "present and removed" split `map_delete` gives a map key, extended to
+    /// the filesystem: removing something already gone is a no-op success,
+    /// not an error). Any other failure (no permission, a non-empty
+    /// directory, ...) is `RuntimeError.RemoveFailed`.
+    path_remove: *Expr,
+    /// `rename(from, to)` — moves/renames `from` to `to`, evaluating to
+    /// whether `from` existed to be renamed (same "absent is a no-op, not an
+    /// error" split as `path_remove`). Any other failure is
+    /// `RuntimeError.RenameFailed`.
+    path_rename: PathRename,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -295,6 +322,13 @@ pub const Expr = union(enum) {
     pub const OpenFile = struct {
         path: *Expr,
         mode: OpenMode,
+    };
+
+    /// `rename(from, to)`'s two operands — both arbitrary expressions that
+    /// must be string-shaped at runtime, same as `path_exists`/`path_remove`.
+    pub const PathRename = struct {
+        from: *Expr,
+        to: *Expr,
     };
 };
 
@@ -581,6 +615,28 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
         .env_has => |e| {
             try writer.writeAll("(hasenv ");
             try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .path_exists => |e| {
+            try writer.writeAll("(exists ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .list_dir => |e| {
+            try writer.writeAll("(listDir ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .path_remove => |e| {
+            try writer.writeAll("(remove ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .path_rename => |r| {
+            try writer.writeAll("(rename ");
+            try printExpr(writer, r.from);
+            try writer.writeAll(" ");
+            try printExpr(writer, r.to);
             try writer.writeAll(")");
         },
     }

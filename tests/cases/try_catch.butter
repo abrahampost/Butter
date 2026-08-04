@@ -1,15 +1,18 @@
 # try/catch (GRAMMAR.bnf design note 3u, ISA.bnf section 14) — one case
 # per catchable RuntimeError variant a Butter program can actually raise.
 #
-# Four catchable variants are deliberately absent, because no program text
+# Five catchable variants are deliberately absent, because no program text
 # can provoke them: FilesUnavailable needs an embedder that supplied no
 # filesystem, StreamWriteFailed needs an output stream that fails mid-write
-# (both covered by unit tests in src/compiler.zig), and StreamReadFailed and
+# (both covered by unit tests in src/compiler.zig), StreamReadFailed and
 # FileCloseFailed need a genuine OS-level I/O failure — src/vm.zig's
 # catchability-table test is the only per-variant coverage those two can
-# get. The four NON-catchable variants have their own escape tests in
-# src/vm.zig; by construction none of them can appear here, since a program
-# that raises one never reaches its next line.
+# get — and RemoveFailed (design note 3w) needs a non-empty directory to
+# remove, which nothing here can create: Butter has no `mkdir` builtin
+# (src/compiler.zig's own RemoveFailed test seeds one directly via Zig,
+# outside the language). The four NON-catchable variants have their own
+# escape tests in src/vm.zig; by construction none of them can appear here,
+# since a program that raises one never reaches its next line.
 
 # Prints the variant name if it's the one that was expected, and something
 # unmissable otherwise — so the .expected file is just the list of names,
@@ -139,6 +142,20 @@ try {
     show("CannotCloseStandardStream", e)
 }
 
+# --- Directory and filesystem metadata (design note 3w) --------------
+
+try {
+    listDir("no_such_dir")
+} catch e {
+    show("ListDirFailed", e)
+}
+
+try {
+    rename("data.txt", "no_such_dir/moved.txt")
+} catch e {
+    show("RenameFailed", e)
+}
+
 # Last, because the handles it leaks stay open for the rest of the run —
 # there is no way to close a stream whose handle was never kept.
 try {
@@ -149,6 +166,6 @@ try {
     show("TooManyOpenFiles", e)
 }
 
-# The program survived all fifteen: without try/catch, any one of them
+# The program survived all seventeen: without try/catch, any one of them
 # would have killed it on the spot.
 print "all handled"

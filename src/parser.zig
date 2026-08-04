@@ -599,6 +599,7 @@ pub const Parser = struct {
     ///         | <delete-expr> | <json-expr> | <stringify-expr>
     ///         | <int-expr> | <float-expr>
     ///         | <getenv-expr> | <hasenv-expr>
+    ///         | <exists-expr> | <list-dir-expr> | <remove-expr> | <rename-expr>
     ///         | 'stdin' | 'stdout' | 'stderr' | 'args' | IDENTIFIER
     fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
@@ -660,6 +661,10 @@ pub const Parser = struct {
             .kw_float => return self.floatParseExpr(),
             .kw_getenv => return self.getenvExpr(),
             .kw_hasenv => return self.hasenvExpr(),
+            .kw_exists => return self.existsExpr(),
+            .kw_listdir => return self.listDirExpr(),
+            .kw_remove => return self.removeExpr(),
+            .kw_rename => return self.renameExpr(),
             .kw_stdin => {
                 _ = self.advance();
                 return self.createExpr(.{ .stream_literal = .stdin });
@@ -957,6 +962,44 @@ pub const Parser = struct {
         const name = try self.expression();
         _ = try self.expect(.rparen, "expected ')' after the variable name");
         return self.createExpr(.{ .env_has = name });
+    }
+
+    /// <exists-expr> ::= 'exists' '(' <expression> ')'
+    fn existsExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'exists'
+        _ = try self.expect(.lparen, "expected '(' after 'exists'");
+        const path = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the path");
+        return self.createExpr(.{ .path_exists = path });
+    }
+
+    /// <list-dir-expr> ::= 'listDir' '(' <expression> ')'
+    fn listDirExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'listDir'
+        _ = try self.expect(.lparen, "expected '(' after 'listDir'");
+        const path = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the path");
+        return self.createExpr(.{ .list_dir = path });
+    }
+
+    /// <remove-expr> ::= 'remove' '(' <expression> ')'
+    fn removeExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'remove'
+        _ = try self.expect(.lparen, "expected '(' after 'remove'");
+        const path = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the path");
+        return self.createExpr(.{ .path_remove = path });
+    }
+
+    /// <rename-expr> ::= 'rename' '(' <expression> ',' <expression> ')'
+    fn renameExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'rename'
+        _ = try self.expect(.lparen, "expected '(' after 'rename'");
+        const from = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the source path");
+        const to = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the destination path");
+        return self.createExpr(.{ .path_rename = .{ .from = from, .to = to } });
     }
 };
 
@@ -1477,6 +1520,38 @@ test "getenv(x) CAN stand alone as a top-level statement, unlike int(x)" {
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
     try std.testing.expectEqualStrings("HOME", result.program[0].kind.expr_stmt.env_get.literal.string);
+}
+
+test "parses exists(...)/listDir(...)/remove(...)/rename(...) as expressions" {
+    try expectExprSexpr("exists(\"a.txt\")", "(exists \"a.txt\")");
+    try expectExprSexpr("listDir(\"dir\")", "(listDir \"dir\")");
+    try expectExprSexpr("remove(\"a.txt\")", "(remove \"a.txt\")");
+    try expectExprSexpr("rename(\"a.txt\", \"b.txt\")", "(rename \"a.txt\" \"b.txt\")");
+    try expectExprSexpr("exists(dir + \"/a.txt\")", "(exists (+ dir \"/a.txt\"))");
+}
+
+test "exists(x)/listDir(x)/remove(x)/rename(x, y) CAN each stand alone as a top-level statement" {
+    // None of `exists`/`listDir`/`remove`/`rename` is a <type> keyword, so
+    // (like `getenv`) nothing dispatches on them before expression parsing
+    // begins — each reaches exprStatement and parses as an ordinary
+    // discarded expression.
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "exists(\"a\")\nlistDir(\"a\")\nremove(\"a\")\nrename(\"a\", \"b\")\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), result.program.len);
+}
+
+test "'listDir' without '(' is a parse error, not a bare identifier" {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init("listDir\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
 }
 
 test "parses 'null' as a literal" {

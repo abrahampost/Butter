@@ -1,0 +1,53 @@
+# Directory and filesystem metadata (GRAMMAR.bnf design note 3w, ISA.bnf
+# section 16): exists/listDir/remove/rename against a real scratch
+# directory (this case runs via expectCaseOutputWithFs).
+
+print exists("a.txt")
+
+int f := open("a.txt", write)
+write(f, "hello")
+close f
+print exists("a.txt")
+
+int g := open("b.txt", write)
+close g
+
+# `listDir` doesn't promise an order, so this checks membership by looping
+# rather than printing the list itself — a reordering must never turn into
+# a spurious failure here.
+list entries := listDir(".")
+print len(entries)
+bool has_a := false
+bool has_b := false
+for i in 0..len(entries) {
+    if entries[i] == "a.txt" { has_a := true }
+    if entries[i] == "b.txt" { has_b := true }
+}
+print has_a
+print has_b
+
+# rename: true while the source exists, false once it's already moved —
+# the same "absent is a no-op" split `remove` gives.
+print rename("a.txt", "c.txt")
+print exists("a.txt")
+print exists("c.txt")
+print rename("a.txt", "c.txt")
+
+# remove: true the first time, false once it's already gone.
+print remove("c.txt")
+print exists("c.txt")
+print remove("c.txt")
+
+# Genuine failures (as opposed to "absent") still raise, and are catchable
+# like any other file-related RuntimeError.
+try {
+    listDir("no-such-dir")
+} catch e {
+    print e["error"]
+}
+
+try {
+    rename("b.txt", "no-such-dir/renamed.txt")
+} catch e {
+    print e["error"]
+}

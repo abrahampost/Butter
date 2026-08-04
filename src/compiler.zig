@@ -585,6 +585,10 @@ pub const Compiler = struct {
             // unset one reads as `""`, never `null` (design note 3v).
             .env_get => StaticType{ .scalar = .string },
             .env_has => StaticType{ .scalar = .bool },
+            .path_exists => StaticType{ .scalar = .bool },
+            .list_dir => StaticType{ .scalar = .list },
+            .path_remove => StaticType{ .scalar = .bool },
+            .path_rename => StaticType{ .scalar = .bool },
         };
     }
 
@@ -1041,6 +1045,23 @@ pub const Compiler = struct {
             .env_has => |e| {
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .has_env);
+            },
+            .path_exists => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .path_exists);
+            },
+            .list_dir => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .list_dir);
+            },
+            .path_remove => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .path_remove);
+            },
+            .path_rename => |r| {
+                try self.compileExpr(r.from);
+                try self.compileExpr(r.to);
+                _ = try self.chunk.emit(self.allocator, .path_rename);
             },
         }
     }
@@ -3001,6 +3022,168 @@ test "an opened file's direction is checked at runtime, not compile time" {
         \\int[4] buf
         \\read(f, buf)
     , tmp.dir, &out_buf, &err_buf));
+}
+
+// ---- Directory and filesystem metadata (GRAMMAR.bnf design note 3w) -----
+
+test "exists(...) is true for a file and a directory, false for neither" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithFs(allocator,
+        \\int f := open("a.txt", write)
+        \\close f
+        \\print exists("a.txt")
+        \\print exists("no-such-file.txt")
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("true\nfalse\n", result.out);
+}
+
+test "exists(...) static type is bool, and it's a legal bare statement" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithFs(allocator,
+        \\bool b := exists("no-such-file.txt")
+        \\print b
+        \\exists("also-nope.txt")
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("false\n", result.out);
+}
+
+test "listDir(...) lists a directory's own entries, order aside" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [256]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithFs(allocator,
+        \\int a := open("a.txt", write)
+        \\close a
+        \\int b := open("b.txt", write)
+        \\close b
+        \\list entries := listDir(".")
+        \\print len(entries)
+        \\bool has_a := false
+        \\bool has_b := false
+        \\for i in 0..len(entries) {
+        \\    if entries[i] == "a.txt" { has_a := true }
+        \\    if entries[i] == "b.txt" { has_b := true }
+        \\}
+        \\print has_a
+        \\print has_b
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("2\ntrue\ntrue\n", result.out);
+}
+
+test "listDir(...) on a missing or non-directory path is ListDirFailed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.ListDirFailed, runProgramWithFs(allocator,
+        \\listDir("no-such-dir")
+    , tmp.dir, &out_buf, &err_buf));
+
+    const result2 = runProgramWithFs(allocator,
+        \\int f := open("a.txt", write)
+        \\close f
+        \\listDir("a.txt")
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectError(vm_mod.RuntimeError.ListDirFailed, result2);
+}
+
+test "remove(...) deletes a file or empty directory, evaluating to whether one was there" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithFs(allocator,
+        \\int f := open("a.txt", write)
+        \\close f
+        \\print remove("a.txt")
+        \\print exists("a.txt")
+        \\print remove("a.txt")
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("true\nfalse\nfalse\n", result.out);
+}
+
+test "remove(...) on a non-empty directory is RemoveFailed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sub = try tmp.dir.createDirPathOpen(std.testing.io, "sub", .{});
+    var f = try sub.createFile(std.testing.io, "inside.txt", .{});
+    f.close(std.testing.io);
+    sub.close(std.testing.io);
+
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.RemoveFailed, runProgramWithFs(allocator,
+        \\remove("sub")
+    , tmp.dir, &out_buf, &err_buf));
+}
+
+test "rename(...) moves a file, evaluating to whether the source existed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithFs(allocator,
+        \\int f := open("a.txt", write)
+        \\write(f, "hi")
+        \\close f
+        \\print rename("a.txt", "b.txt")
+        \\print exists("a.txt")
+        \\print exists("b.txt")
+        \\print rename("a.txt", "c.txt")
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("true\nfalse\ntrue\nfalse\n", result.out);
+}
+
+test "rename(...) into a missing destination directory is RenameFailed, not a silent 'false'" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.RenameFailed, runProgramWithFs(allocator,
+        \\int f := open("a.txt", write)
+        \\close f
+        \\rename("a.txt", "no-such-dir/b.txt")
+    , tmp.dir, &out_buf, &err_buf));
+}
+
+test "a program run with no filesystem access can't use exists/listDir/remove/rename" {
+    const allocator = std.testing.allocator;
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.FilesUnavailable, runProgramWithIo(allocator,
+        \\exists("anything.txt")
+    , "", &out_buf, &err_buf));
+    try std.testing.expectError(vm_mod.RuntimeError.FilesUnavailable, runProgramWithIo(allocator,
+        \\listDir(".")
+    , "", &out_buf, &err_buf));
+    try std.testing.expectError(vm_mod.RuntimeError.FilesUnavailable, runProgramWithIo(allocator,
+        \\remove("anything.txt")
+    , "", &out_buf, &err_buf));
+    try std.testing.expectError(vm_mod.RuntimeError.FilesUnavailable, runProgramWithIo(allocator,
+        \\rename("a.txt", "b.txt")
+    , "", &out_buf, &err_buf));
+}
+
+test "listDir(...)'s static type is list, remove/rename's is bool" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int n := listDir(\".\")\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "int n := remove(\"a\")\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "int n := rename(\"a\", \"b\")\n", SemanticError.TypeMismatch);
 }
 
 // ---- Maps, lists, and JSON (GRAMMAR.bnf design notes 3m/3n) -------------

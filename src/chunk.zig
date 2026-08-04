@@ -132,6 +132,16 @@ pub const OpCode = enum(u8) {
     get_env,
     has_env,
 
+    // Directory and filesystem metadata (ISA.bnf section 16, GRAMMAR.bnf
+    // design note 3w). No operand for any of the four: like OPEN, the path
+    // (and, for RENAME, the destination) is an ordinary popped `Value`, not
+    // a compile-time constant — the one difference from OPEN is that none
+    // of these four has a compile-time-fixed "mode" to encode either.
+    path_exists,
+    list_dir,
+    path_remove,
+    path_rename,
+
     // `exit <expr>` (ISA.bnf's addendum to section 3). No operand: the
     // requested code is an ordinary popped `Value`, exactly like every
     // other opcode that acts on an expression result rather than a
@@ -502,6 +512,23 @@ test "disassemble renders get_env and has_env" {
     try chunk.disassemble(&writer);
 
     try std.testing.expectEqualStrings("0000 get_env\n0001 has_env\n", writer.buffered());
+}
+
+test "disassemble renders path_exists, list_dir, path_remove, and path_rename" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .path_exists);
+    _ = try chunk.emit(allocator, .list_dir);
+    _ = try chunk.emit(allocator, .path_remove);
+    _ = try chunk.emit(allocator, .path_rename);
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 path_exists\n0001 list_dir\n0002 path_remove\n0003 path_rename\n", writer.buffered());
 }
 
 test "Program.deinit frees the main chunk and every function's chunk" {

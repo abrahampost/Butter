@@ -59,6 +59,28 @@ pub const RuntimeError = error{
     /// at all (see `Host.fs`).
     FilesUnavailable,
 
+    // Directory and filesystem metadata (ISA.bnf section 16, GRAMMAR.bnf
+    // design note 3w). `path_exists` never raises any of these three — an
+    // access failure it can't otherwise classify just reads as `false` — so
+    // this trio only ever comes from `listDir`/`remove`/`rename`.
+    /// `listDir(path)` couldn't list `path`'s entries — it doesn't exist,
+    /// isn't a directory, or can't be opened for another reason (no
+    /// permission, an I/O error). Unlike `remove`/`rename` below, there is
+    /// no meaningful non-error fallback for "list this directory's
+    /// contents".
+    ListDirFailed,
+    /// `remove(path)` found something at `path` but couldn't delete it (no
+    /// permission, a non-empty directory, an I/O error). `path` simply not
+    /// existing is NOT this — `remove` reports that by evaluating to
+    /// `false` instead (mirroring `map_delete`'s "absent is a no-op, not an
+    /// error" split).
+    RemoveFailed,
+    /// `rename(from, to)` found `from` but couldn't rename it (no
+    /// permission, `to`'s parent doesn't exist, a cross-device move, an I/O
+    /// error). `from` simply not existing is NOT this, for the same reason
+    /// it isn't for `RemoveFailed`.
+    RenameFailed,
+
     // Maps, lists, and JSON (ISA.bnf sections 11 and 12).
     /// Reading a map key that isn't present. No diagnostic — the bare tag
     /// says everything there is to say, same as `StreamClosed`.
@@ -708,6 +730,87 @@ pub const Vm = struct {
         if (first_error) |err| return err;
     }
 
+    /// `exists(path)` (ISA.bnf section 16). Deliberately lenient: ANY reason
+    /// the check can't be answered — not just `error.FileNotFound`, but
+    /// permission denied, a bad path, and so on — reads as `false` rather
+    /// than raising, matching `std.Io.Dir.access`'s own documented
+    /// TOCTOU-racy, advisory-only contract (there is no way to turn a
+    /// "false" here into a guarantee the path will still be there, or still
+    /// absent, by the next instruction). The only ways this call can fail
+    /// outright are the capability gate and a non-string operand, neither of
+    /// which is about the path itself.
+    fn pathExists(self: *Vm, host: Host, path: []const u8) RuntimeError!bool {
+        const fs = host.fs orelse return self.failFile(RuntimeError.FilesUnavailable, "exists", path, "this program was run without filesystem access");
+        fs.dir.access(fs.io, path, .{}) catch return false;
+        return true;
+    }
+
+    /// `listDir(path)` (ISA.bnf section 16) — the names of `path`'s own
+    /// entries, non-recursive, in whatever order the OS iterator hands them
+    /// back (never sorted). Unlike `pathExists`, any failure to open or walk
+    /// `path` as a directory is `RuntimeError.ListDirFailed`: there's no
+    /// meaningful "couldn't tell" fallback for "list this" the way there is
+    /// for "does this exist".
+    fn listDirEntries(self: *Vm, host: Host, path: []const u8) (RuntimeError || std.mem.Allocator.Error)!Value {
+        const fs = host.fs orelse return self.failFile(RuntimeError.FilesUnavailable, "listDir", path, "this program was run without filesystem access");
+
+        var dir = fs.dir.openDir(fs.io, path, .{ .iterate = true }) catch |err| return self.failFile(RuntimeError.ListDirFailed, "listDir", path, @errorName(err));
+        defer dir.close(fs.io);
+
+        var list: std.ArrayList(Value) = .empty;
+        errdefer {
+            for (list.items) |item| item.decref(self.allocator);
+            list.deinit(self.allocator);
+        }
+        var it = dir.iterate();
+        while (it.next(fs.io) catch |err| return self.failFile(RuntimeError.ListDirFailed, "listDir", path, @errorName(err))) |entry| {
+            try list.append(self.allocator, try Value.newString(self.allocator, entry.name));
+        }
+
+        const result_obj = try Object.create(self.allocator, .{ .list = list });
+        return .{ .object = result_obj };
+    }
+
+    /// `remove(path)` (ISA.bnf section 16) — deletes the file or empty
+    /// directory at `path`. `path` simply not being there is reported by
+    /// evaluating to `false`, not an error (the same "absent is a no-op"
+    /// split `map_delete` gives a map key); any other failure — no
+    /// permission, a non-empty directory, an I/O error — is
+    /// `RuntimeError.RemoveFailed`.
+    fn removePath(self: *Vm, host: Host, path: []const u8) RuntimeError!bool {
+        const fs = host.fs orelse return self.failFile(RuntimeError.FilesUnavailable, "remove", path, "this program was run without filesystem access");
+
+        fs.dir.deleteFile(fs.io, path) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            // `deleteFile` on something that turns out to be a directory —
+            // try the directory-deletion path instead of failing outright.
+            error.IsDir => fs.dir.deleteDir(fs.io, path) catch |dir_err| switch (dir_err) {
+                error.FileNotFound => return false, // race: gone between the two calls
+                else => return self.failFile(RuntimeError.RemoveFailed, "remove", path, @errorName(dir_err)),
+            },
+            else => return self.failFile(RuntimeError.RemoveFailed, "remove", path, @errorName(err)),
+        };
+        return true;
+    }
+
+    /// `rename(from, to)` (ISA.bnf section 16) — mirrors `removePath`'s
+    /// "absent is a no-op" split: `from` not existing evaluates to `false`,
+    /// checked with an independent `access` call first rather than trusting
+    /// the underlying rename's own `error.FileNotFound`, which on some
+    /// platforms can't be told apart from `to`'s PARENT directory being
+    /// missing — a genuine failure, not a no-op. Any other failure is
+    /// `RuntimeError.RenameFailed`.
+    fn renamePath(self: *Vm, host: Host, from: []const u8, to: []const u8) RuntimeError!bool {
+        const fs = host.fs orelse return self.failFile(RuntimeError.FilesUnavailable, "rename", from, "this program was run without filesystem access");
+
+        fs.dir.access(fs.io, from, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => {},
+        };
+        fs.dir.rename(from, fs.dir, to, fs.io) catch |err| return self.failFile(RuntimeError.RenameFailed, "rename", from, @errorName(err));
+        return true;
+    }
+
     /// The reader behind a stream, or an error explaining why there isn't
     /// one. `.stdin` with no reader supplied is the one case with neither: a
     /// null result means "already at end of input" (see `Host`), which the
@@ -929,6 +1032,9 @@ pub const Vm = struct {
             error.JsonParseFailed,
             error.NumberParseFailed,
             error.InvalidExitCode,
+            error.ListDirFailed,
+            error.RemoveFailed,
+            error.RenameFailed,
             => true,
 
             // VM-integrity failures. Not a program condition, and running a
@@ -1385,6 +1491,34 @@ pub const Vm = struct {
                 defer name_val.decref(self.allocator);
                 const name = name_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 try self.push(.{ .boolean = host.lookup(name) != null });
+            },
+
+            .path_exists => {
+                const path_val = try self.pop();
+                defer path_val.decref(self.allocator);
+                const path = path_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                try self.push(.{ .boolean = try self.pathExists(host, path) });
+            },
+            .list_dir => {
+                const path_val = try self.pop();
+                defer path_val.decref(self.allocator);
+                const path = path_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                try self.push(try self.listDirEntries(host, path));
+            },
+            .path_remove => {
+                const path_val = try self.pop();
+                defer path_val.decref(self.allocator);
+                const path = path_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                try self.push(.{ .boolean = try self.removePath(host, path) });
+            },
+            .path_rename => {
+                const to_val = try self.pop();
+                defer to_val.decref(self.allocator);
+                const from_val = try self.pop();
+                defer from_val.decref(self.allocator);
+                const to = to_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                const from = from_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                try self.push(.{ .boolean = try self.renamePath(host, from, to) });
             },
 
             .add => try self.add(),
@@ -2717,6 +2851,84 @@ test "open with a non-string path is a type mismatch" {
     _ = try chunk.emit(allocator, .halt);
 
     try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+// ---- Directory and filesystem metadata (ISA.bnf section 16) -------------
+//
+// Only the capability gate and the non-string-operand path are covered
+// here, mirroring `open`'s own two VM-level tests above — real successes
+// and failures against an actual directory (ListDirFailed, RemoveFailed,
+// RenameFailed, the `false`-not-error "absent" paths) need a real
+// filesystem, which src/compiler.zig's `runProgramWithFs` (a real
+// `std.testing.tmpDir`) provides; this file has none of its own the way
+// the Files section above doesn't either.
+
+test "exists/listDir/remove/rename without filesystem access are FilesUnavailable" {
+    const allocator = std.testing.allocator;
+    inline for (.{ .path_exists, .list_dir, .path_remove }) |op| {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+
+        const path = try chunk.addConstant(allocator, try Value.newString(allocator, "nope"));
+        _ = try chunk.emitWithOperand(allocator, .push_const, path);
+        _ = try chunk.emit(allocator, op);
+        _ = try chunk.emit(allocator, .halt);
+
+        try expectRuntimeError(&chunk, RuntimeError.FilesUnavailable);
+    }
+
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+    const from = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
+    const to = try chunk.addConstant(allocator, try Value.newString(allocator, "b"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, from);
+    _ = try chunk.emitWithOperand(allocator, .push_const, to);
+    _ = try chunk.emit(allocator, .path_rename);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.FilesUnavailable);
+}
+
+test "exists/listDir/remove/rename on a non-string operand are TypeMismatch" {
+    const allocator = std.testing.allocator;
+    inline for (.{ .path_exists, .list_dir, .path_remove }) |op| {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+
+        const not_a_path = try chunk.addConstant(allocator, .{ .int = 7 });
+        _ = try chunk.emitWithOperand(allocator, .push_const, not_a_path);
+        _ = try chunk.emit(allocator, op);
+        _ = try chunk.emit(allocator, .halt);
+
+        try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+    }
+
+    // rename checks BOTH operands: a bad `to` (top of stack) ...
+    {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+        const from = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
+        const not_a_path = try chunk.addConstant(allocator, .{ .int = 7 });
+        _ = try chunk.emitWithOperand(allocator, .push_const, from);
+        _ = try chunk.emitWithOperand(allocator, .push_const, not_a_path);
+        _ = try chunk.emit(allocator, .path_rename);
+        _ = try chunk.emit(allocator, .halt);
+
+        try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+    }
+    // ... and a bad `from`, even when `to` is fine.
+    {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+        const not_a_path = try chunk.addConstant(allocator, .{ .int = 7 });
+        const to = try chunk.addConstant(allocator, try Value.newString(allocator, "b"));
+        _ = try chunk.emitWithOperand(allocator, .push_const, not_a_path);
+        _ = try chunk.emitWithOperand(allocator, .push_const, to);
+        _ = try chunk.emit(allocator, .path_rename);
+        _ = try chunk.emit(allocator, .halt);
+
+        try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+    }
 }
 
 test "closing a standard stream is refused" {
@@ -4350,6 +4562,9 @@ test "every RuntimeError variant has the catchability ISA.bnf section 14 documen
         RuntimeError.JsonParseFailed,
         RuntimeError.NumberParseFailed,
         RuntimeError.InvalidExitCode,
+        RuntimeError.ListDirFailed,
+        RuntimeError.RemoveFailed,
+        RuntimeError.RenameFailed,
     };
     const uncatchable_variants = [_]RuntimeError{
         RuntimeError.StackOverflow,

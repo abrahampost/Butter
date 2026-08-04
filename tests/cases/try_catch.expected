@@ -13,5 +13,7 @@ StreamNotReadable
 StreamNotWritable
 StreamClosed
 CannotCloseStandardStream
+ListDirFailed
+RenameFailed
 TooManyOpenFiles
 all handled

@@ -185,16 +185,60 @@ tools that wrap or orchestrate other binaries.
   embedder opts in).
 - Document in GRAMMAR.bnf/ISA.bnf; add an integration test.
 
-### 12. Directory and filesystem metadata operations
-`open`/`read`/`write`/`close` (GRAMMAR.bnf section 3, "Files") only
-operate on a path you already know exists (for `read` mode) or are
-willing to create/truncate (`write`/`append`). There's no listing,
-existence check, stat, delete, or rename.
-- Add builtins for at minimum: `exists(path)`, `listDir(path)` (→ list of
-  names), `remove(path)`, `rename(from, to)`.
-- Document in GRAMMAR.bnf/ISA.bnf; add integration tests using a temp
-  directory (mirroring how `files.butter`/`json.butter` already
-  create/overwrite fixtures under `examples/`).
+### 12. Directory and filesystem metadata operations — DONE
+`exists(path)`, `listDir(path)`, `remove(path)`, and `rename(from, to)`
+are now special-form expressions (GRAMMAR.bnf design note 3w, parsed like
+`getenv`/`open` — none is also a `<type>` keyword, so each is a legal bare
+`<expr-stmt>` too), compiling to four new opcodes in
+[src/vm.zig](src/vm.zig) (`PATH_EXISTS`/`LIST_DIR`/`PATH_REMOVE`/
+`PATH_RENAME`, ISA.bnf section 16) that reuse `open`'s existing `Host.fs`
+capability gate rather than adding a second one — a program that can
+already `open` a file can reach everything these need.
+
+`exists` is deliberately lenient: it evaluates to `bool` and only ever
+raises for the capability gate or a non-string argument — any other
+reason the check can't be answered (missing, no permission, a bad path)
+reads as `false`, matching the inherently racy, advisory nature of an
+existence check on any real filesystem. `remove`/`rename` instead extend
+`delete(map, key)`'s "absent is a no-op, not an error" split to the
+filesystem: each evaluates to whether there was something to remove/move
+(`false`, not an error, when the source was already gone), while a
+genuine failure (no permission, a non-empty directory, a missing
+destination parent, an I/O error) raises the new catchable
+`RuntimeError.RemoveFailed`/`RenameFailed`. `rename` checks whether its
+source exists via an independent `access` call first rather than trusting
+the underlying rename's own `FileNotFound`, which on at least one
+supported host can't be told apart from the destination's parent
+directory being missing — a real failure, not a no-op. `listDir` has no
+such lenient fallback (there's no meaningful "couldn't tell" empty list
+for "list this directory's contents"): any failure to open or walk `path`
+is `RuntimeError.ListDirFailed`. It evaluates to a fresh `list` of entry
+names only (no kind, not recursive, never `.`/`..`), in whatever order the
+OS iterator returns them — never sorted, matching every other host-order
+dependency this VM already has (`keys(map)` aside, which IS
+insertion-ordered).
+
+19 of Butter's `RuntimeError` variants were catchable before this task;
+`ListDirFailed`/`RemoveFailed`/`RenameFailed` bring that to 22 (design note
+3u's count updated accordingly). Butter still has no way to CREATE a
+directory (no `mkdir` builtin was in scope here), which is why
+`RemoveFailed`'s one non-empty-directory failure mode can't be exercised by
+a `.butter` program at all — [tests/cases/try_catch.butter](tests/cases/try_catch.butter)'s
+header comment documents the gap, and
+[src/compiler.zig](src/compiler.zig)'s dedicated `RemoveFailed` test seeds
+a non-empty directory directly via Zig instead.
+
+Covered by lexer/parser/compiler/VM unit tests (capability gate, type
+mismatches on one or both operands, static types `bool`/`bool`/`bool`/
+`list`), end-to-end `src/compiler.zig` tests against a real
+`std.testing.tmpDir` (success and every failure path for all four,
+including the two "genuinely fails, not just absent" cases for
+`remove`/`rename`), two new cases in
+[tests/cases/try_catch.butter](tests/cases/try_catch.butter)
+(`ListDirFailed`/`RenameFailed`), the
+[dir_ops](tests/cases/dir_ops.butter) integration case (order-independent
+by construction — it checks `listDir`'s result by membership, not
+position), and [examples/dir_ops.butter](examples/dir_ops.butter).
 
 ---
 

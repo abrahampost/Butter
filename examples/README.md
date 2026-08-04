@@ -15,6 +15,7 @@
 | [json.butter](json.butter) | **Runs today** | `map`/`list` as first-class heap values, bracket-indexing that chains through nested values, `has`/`keys`, `json(...)` parsing a byte buffer read from a real file into a map/list tree, and `stringify(...)` rendering a value back into (properly escaped) JSON text and writing it out again (GRAMMAR.bnf design notes 3m/3n/3o, ISA.bnf sections 11/12/13). Reads [data.json](data.json); creates/overwrites `dump.json`. |
 | [env_vars.butter](env_vars.butter) | **Runs today** | `getenv`/`hasenv` (GRAMMAR.bnf design note 3v, ISA.bnf section 15) — reading configuration from the environment, with a built-in default that a variable overrides, `hasenv` telling an exported-but-empty setting from an absent one, and a numeric setting parsed under `try`/`catch`. Set `EDITOR`/`BUTTER_WIDTH`/`BUTTER_HEIGHT` to see it react. |
 | [cli_args.butter](cli_args.butter) | **Runs today** | The bare `args` keyword (GRAMMAR.bnf design note 3p, ISA.bnf's PUSH_ARGS) — everything after a literal `--` on the CLI's own command line, as a `list` of strings. Needs `-- <name> ...` passed on the command line. |
+| [dir_ops.butter](dir_ops.butter) | **Runs today** | `exists`/`listDir`/`remove`/`rename` (GRAMMAR.bnf design note 3w, ISA.bnf section 16) — checking a path without opening it, listing a real directory's entries, and moving/deleting a scratch file, each showing the "absent is a no-op, not an error" bool split and a genuine failure caught via `try`/`catch`. Creates and cleans up `examples/dir_ops_scratch.txt`. |
 
 Try any of them:
 
@@ -34,6 +35,7 @@ zig build run -- --stdin < examples/basic_math.butter
 # cli_args.butter needs its own '--' for the program's args (the first
 # '--' is zig build's own separator, consumed before butter ever sees it):
 zig build run -- examples/cli_args.butter -- Ada Grace
+zig build run -- examples/dir_ops.butter
 ```
 
 `env_vars.butter` reads its settings from the environment, so set some to
@@ -67,3 +69,9 @@ shown above. It reads `data.json`, then near the end `stringify`s the
 parsed document back into JSON text and writes it to
 `examples/dump.json` — so, like `files.butter`, running it does
 create/overwrite one file on disk.
+
+`dir_ops.butter` is likewise relative-to-current-directory, and also lists
+`examples/` itself — run it from the repo root as shown above. Unlike
+`files.butter`/`json.butter`, it doesn't leave anything behind: the scratch
+file it creates gets renamed and then removed again before the program
+ends.

@@ -1079,12 +1079,13 @@
    "operation"/"path" from `Vm.diagnostic`, `""` when there is none. No new
    value kind is involved — it is the same map a `{...}` literal builds.
 
-   CATCHABLE vs NOT. Nineteen RuntimeError variants are catchable:
+   CATCHABLE vs NOT. Twenty-two RuntimeError variants are catchable:
    TypeMismatch, DivisionByZero, Overflow, IndexOutOfBounds, ByteOutOfRange,
    StreamReadFailed, StreamWriteFailed, FileOpenFailed, TooManyOpenFiles,
    FileCloseFailed, StreamNotReadable, StreamNotWritable, StreamClosed,
    CannotCloseStandardStream, FilesUnavailable, KeyNotFound, JsonParseFailed,
-   NumberParseFailed, InvalidExitCode.
+   NumberParseFailed, InvalidExitCode, ListDirFailed, RemoveFailed,
+   RenameFailed (section 16).
 
    Four are not: StackOverflow, StackUnderflow, CallStackOverflow, and
    HandlerStackOverflow. These are VM-integrity failures rather than program
@@ -1177,4 +1178,168 @@
    two apart and there is nothing to refuse: reading a variable that isn't
    there has no effect outside the VM. There is no SET_ENV counterpart;
    these two opcodes are read-only, and the environment cannot be enumerated.
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   16. DIRECTORY AND FILESYSTEM METADATA (PATH_EXISTS, LIST_DIR, PATH_REMOVE,
+       PATH_RENAME — one opcode each, no new value kind, reuses section 10's
+       `Host.fs`; GRAMMAR.bnf design note 3w)
+   -------------------------------------------------------------------------- *)
+
+   PATH_EXISTS               ( path -- bool )  pops path (must be
+                                               string-shaped; TypeMismatch
+                                               otherwise). `RuntimeError.
+                                               FilesUnavailable` if `Host.fs`
+                                               is null (the same capability
+                                               gate OPEN uses, section 10);
+                                               otherwise checks `path`
+                                               against `fs.dir` and pushes
+                                               whether it names anything
+                                               right now. UNLIKE every other
+                                               opcode this section defines,
+                                               this one has no third failure
+                                               mode: any `fs.dir.access`
+                                               error OTHER than the two above
+                                               (not found, no permission, a
+                                               bad path, ...) is swallowed and
+                                               reported as `false` rather
+                                               than propagated — deliberately
+                                               lenient, matching the
+                                               inherently advisory,
+                                               time-of-check-to-time-of-use-
+                                               racy nature of an existence
+                                               check on any real filesystem
+                                               (GRAMMAR.bnf design note 3w).
+                                               What `exists(path)` compiles
+                                               to.
+   LIST_DIR                  ( path -- list )  pops path (same TypeMismatch
+                                               rule and FilesUnavailable
+                                               gate as PATH_EXISTS). Opens
+                                               `path` against `fs.dir` with
+                                               iteration enabled and walks
+                                               it ONE LEVEL (not recursive),
+                                               pushing a FRESH list Object
+                                               (section 11) of FRESH heap
+                                               strings (`Value.newString`),
+                                               one per entry NAME only (no
+                                               kind, no path, just the bare
+                                               name a second `open`/`exists`
+                                               call could append to `path`
+                                               itself), in whatever order the
+                                               OS iterator hands them back —
+                                               never sorted, never `"."` or
+                                               `".."`. Opening `path` as an
+                                               iterable directory, or an
+                                               error partway through the
+                                               walk, is `RuntimeError.
+                                               ListDirFailed` (with a
+                                               `Vm.diagnostic`: operation
+                                               `"listDir"`, the path, and
+                                               `@errorName` of whatever the
+                                               host filesystem reported) —
+                                               UNLIKE PATH_EXISTS, this has
+                                               no lenient "couldn't tell,
+                                               call it false" fallback: there
+                                               is no empty-list reading of
+                                               "I couldn't list this" that
+                                               wouldn't be misleading. The
+                                               directory handle is closed
+                                               before this instruction
+                                               returns, success or failure,
+                                               so a program that calls
+                                               `listDir` in a loop can't
+                                               exhaust any handle table over
+                                               it. What `listDir(path)`
+                                               compiles to.
+   PATH_REMOVE                ( path -- bool ) pops path (same TypeMismatch
+                                               rule and FilesUnavailable gate
+                                               as PATH_EXISTS). Tries to
+                                               delete `path` as a file first;
+                                               if the host reports it's
+                                               actually a directory, retries
+                                               as an (empty-only) directory
+                                               delete. `path` not existing —
+                                               from EITHER attempt — pushes
+                                               `false`, not an error: the
+                                               same "absent is a no-op" split
+                                               MAP_DELETE (section 11) gives
+                                               a map key, extended to the
+                                               filesystem. Any OTHER failure
+                                               (no permission, a NON-EMPTY
+                                               directory, an I/O error) is
+                                               `RuntimeError.RemoveFailed`
+                                               (with a `Vm.diagnostic`:
+                                               operation `"remove"`, the
+                                               path, and the underlying
+                                               cause) — on success, pushes
+                                               `true`. There is no recursive
+                                               "remove a directory and
+                                               everything in it" here; a
+                                               program that wants that empties
+                                               the directory itself first (via
+                                               LIST_DIR + one PATH_REMOVE per
+                                               entry). What `remove(path)`
+                                               compiles to.
+   PATH_RENAME    ( from to -- bool )          pops to, then from (both must
+                                               be string-shaped; TypeMismatch
+                                               otherwise, checked independently
+                                               so a bad `to` doesn't mask a
+                                               bad `from` or vice versa — see
+                                               vm.zig's `renamePath`), same
+                                               FilesUnavailable gate as the
+                                               other three (diagnosed against
+                                               `from`). FIRST checks whether
+                                               `from` exists via an
+                                               independent `fs.dir.access`
+                                               call — NOT by inspecting the
+                                               rename attempt's own error,
+                                               because on at least one
+                                               supported host `error.
+                                               FileNotFound` from the rename
+                                               itself can't be told apart
+                                               from `to`'s PARENT directory
+                                               being missing, a genuine
+                                               failure rather than a no-op.
+                                               If `from` doesn't exist,
+                                               pushes `false` immediately
+                                               (same "absent is a no-op"
+                                               split as PATH_REMOVE) without
+                                               attempting the rename at all.
+                                               Otherwise renames `from` to
+                                               `to` against `fs.dir`
+                                               (replacing `to` if it already
+                                               exists, the underlying OS
+                                               rename's own behavior); any
+                                               failure at THIS point — no
+                                               permission, `to`'s parent
+                                               missing, a cross-device move,
+                                               an I/O error — is
+                                               `RuntimeError.RenameFailed`
+                                               (with a `Vm.diagnostic`:
+                                               operation `"rename"`, `from`
+                                               as the path, and the
+                                               underlying cause), never
+                                               folded into the `false` case.
+                                               Pushes `true` on success. What
+                                               `rename(from, to)` compiles
+                                               to.
+
+   NONE OF THE FOUR TAKES AN OPERAND, for the same reason GET_ENV/HAS_ENV
+   don't (section 15): every path is an ordinary popped `Value`, not a
+   compile-time constant, so a computed path
+   (`remove(dir + "/" + name)`) works with no special codegen. REFCOUNTS
+   follow `Vm.pop`'s usual convention (section 14's addendum): each pops and
+   decrefs every path operand it's handed; PATH_EXISTS/PATH_REMOVE/
+   PATH_RENAME's results are plain scalar BOOLs (nothing to incref);
+   LIST_DIR's result is a fresh heap Object nobody else holds a reference to,
+   exactly like MAP_KEYS's (section 11).
+
+   REUSES `Host.fs` (section 10) RATHER THAN ADDING A SECOND CAPABILITY GATE.
+   A program that can `open` a file can already reach everything these four
+   opcodes need — `fs.dir` is the same `std.Io.Dir` OPEN resolves a relative
+   path against — so gating them separately would only mean an embedder that
+   grants file access has to remember to grant this too, for no added
+   safety. `Host.fs` null still means the same thing it always has:
+   `RuntimeError.FilesUnavailable` for all four, exactly like OPEN.
    ========================================================================== *)

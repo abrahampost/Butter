@@ -1,0 +1,53 @@
+# Directory and filesystem metadata: exists/listDir/remove/rename against
+# real files on disk (GRAMMAR.bnf design note 3w, ISA.bnf section 16).
+#
+#   zig build run -- examples/dir_ops.butter
+#
+# Like files.butter, every path here resolves against the CURRENT
+# DIRECTORY at run time, not this source file's own directory — run from
+# the repo root as shown above.
+
+# `listDir` walks one level of a real directory — this one, in whatever
+# order the OS hands its entries back (never sorted, never "." or "..") —
+# so checking a known name's PRESENCE is the robust way to use the result,
+# rather than trusting any particular position in it.
+list entries := listDir("examples")
+print "examples/ has " + stringify(len(entries)) + " entries"
+bool found_files_example := false
+for i in 0..len(entries) {
+    if entries[i] == "files.butter" { found_files_example := true }
+}
+print "files.butter is among them: " + stringify(found_files_example)
+
+# `exists` answers "is anything there right now" without opening it —
+# useful to check before an `open(..., read)` that would otherwise raise
+# FileOpenFailed for a plain "not there yet".
+string scratch := "examples/dir_ops_scratch.txt"
+print "scratch exists before: " + stringify(exists(scratch))
+
+int f := open(scratch, write)
+write(f, "temporary")
+close f
+print "scratch exists after write: " + stringify(exists(scratch))
+
+# `rename` moves it in place, evaluating to whether there was something to
+# move — the same "absent is a no-op, not an error" split `remove` gives
+# below.
+string renamed := "examples/dir_ops_scratch_renamed.txt"
+print "renamed: " + stringify(rename(scratch, renamed))
+print "old name exists: " + stringify(exists(scratch))
+print "new name exists: " + stringify(exists(renamed))
+
+# `remove` cleans it back up — true the first time because it was there,
+# false the second because by then it isn't.
+print "removed: " + stringify(remove(renamed))
+print "removed again: " + stringify(remove(renamed))
+
+# A genuine failure (as opposed to "absent") still raises, same as
+# `open`/`close`'s own errors — caught exactly the same way (GRAMMAR.bnf
+# design note 3u).
+try {
+    listDir("examples/no-such-directory")
+} catch e {
+    print "listDir on a missing directory: " + e["error"]
+}

@@ -52,6 +52,10 @@ pub const TokenType = enum {
     kw_exit,
     kw_try,
     kw_catch,
+    kw_exists,
+    kw_listdir,
+    kw_remove,
+    kw_rename,
 
     // Operators and punctuation
     plus,
@@ -126,6 +130,10 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "exit", .kw_exit },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
+    .{ "exists", .kw_exists },
+    .{ "listDir", .kw_listdir },
+    .{ "remove", .kw_remove },
+    .{ "rename", .kw_rename },
 });
 
 pub const Token = struct {
@@ -582,6 +590,13 @@ test "'args' is recognized as a keyword" {
 test "'getenv' and 'hasenv' are recognized as keywords" {
     try expectTokenTypes("getenv hasenv getenvx hasenvx env", &.{
         .kw_getenv, .kw_hasenv, .identifier, .identifier, .identifier, .eof,
+    });
+}
+
+test "'exists'/'listDir'/'remove'/'rename' are recognized as keywords" {
+    try expectTokenTypes("exists listDir remove rename existsx listdir Remove", &.{
+        .kw_exists,  .kw_listdir, .kw_remove,  .kw_rename,
+        .identifier, .identifier, .identifier, .eof,
     });
 }
 

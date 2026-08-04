@@ -272,6 +272,10 @@ test "env: with no host env, every variable is unset" {
     try std.testing.expectEqualStrings("false\n0\n", actual);
 }
 
+test "dir_ops: exists/listDir/remove/rename against a real scratch directory" {
+    try expectCaseOutputWithFs("dir_ops");
+}
+
 // ---- exit_code: a grep-style tool built on `args` + `exit` ------------
 //
 // Same case source (tests/cases/exit_code.butter) run three ways — found,

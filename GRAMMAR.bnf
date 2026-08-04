@@ -41,6 +41,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'map' | 'list' | 'push' | 'keys' | 'has' | 'delete'
                | 'json' | 'stringify' | 'null' | 'args' | 'exit'
                | 'try' | 'catch' | 'getenv' | 'hasenv'
+               | 'exists' | 'listDir' | 'remove' | 'rename'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -193,6 +194,10 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <float-expr>
                       | <getenv-expr>
                       | <hasenv-expr>
+                      | <exists-expr>
+                      | <list-dir-expr>
+                      | <remove-expr>
+                      | <rename-expr>
                       | 'stdin' | 'stdout' | 'stderr'
                       | 'args'
                       | IDENTIFIER
@@ -250,6 +255,14 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    — same as `keys(m)`. *)
 <getenv-expr>       ::= 'getenv' '(' <expression> ')'
 <hasenv-expr>       ::= 'hasenv' '(' <expression> ')'
+
+(* Directory and filesystem metadata (design note 3w). Like getenv/hasenv,
+   none of these four is also a <type> keyword, so each is a legal bare
+   <expr-stmt> too. *)
+<exists-expr>       ::= 'exists' '(' <expression> ')'
+<list-dir-expr>     ::= 'listDir' '(' <expression> ')'
+<remove-expr>       ::= 'remove' '(' <expression> ')'
+<rename-expr>       ::= 'rename' '(' <expression> ',' <expression> ')'
 
 
 (* --------------------------------------------------------------------------
@@ -499,6 +512,59 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      variable unset. There is no way for a program to SET a variable, list
      every name, or affect its own parent — reading is the whole feature. *)
 
+(* --- Directory and filesystem metadata (design note 3w) ---
+   - `exists(path)` evaluates to whether `path` names anything on disk right
+     now, as a `bool`. Deliberately LENIENT: any reason the check can't be
+     answered — the path is missing, a parent directory doesn't exist,
+     permission is denied, the path is malformed — reads as `false`, not an
+     error; only the `open`/`getenv`-style capability gate (no filesystem at
+     all, `RuntimeError.FilesUnavailable`) and a non-`string` argument
+     (`RuntimeError.TypeMismatch`) can make it fail outright. This matches
+     the inherently advisory, time-of-check-to-time-of-use-racy nature of an
+     existence check on any real filesystem — there is no way for a `true`
+     or `false` here to be a guarantee about the NEXT instruction, only
+     about the moment `exists` ran, so treating every other failure mode the
+     same as "it isn't there right now" doesn't lose any real guarantee a
+     stricter version would have kept.
+   - `listDir(path)` evaluates to a fresh `list` of the names of `path`'s
+     own entries — files and subdirectories, not recursive, never `"."` or
+     `".."` — in WHATEVER ORDER the operating system's directory iterator
+     hands them back (not sorted, not guaranteed stable across two calls). A
+     program that needs a specific order sorts the result itself. Unlike
+     `exists`, a `path` that genuinely can't be listed (missing, not a
+     directory, no permission) is `RuntimeError.ListDirFailed` — there is no
+     meaningful "couldn't tell" fallback for "list this directory's
+     contents" the way there is for "does this exist".
+   - `remove(path)` deletes the file or EMPTY directory at `path`, evaluating
+     to whether there was anything there to remove — `true` if `path`
+     existed and was deleted, `false` if it was already absent. This mirrors
+     `delete(map, key)`'s own "absent is a no-op, not an error" split
+     (Maps and lists design notes, above), extended to the filesystem: a
+     cleanup step that removes something which may or may not be there
+     doesn't need a `try`/`catch` just to stay idempotent. Any OTHER failure
+     — no permission, a NON-EMPTY directory, an I/O error — is
+     `RuntimeError.RemoveFailed`; `remove` never recurses into a directory's
+     contents on your behalf.
+   - `rename(from, to)` moves/renames `from` to `to` (replacing `to` if it
+     already exists, exactly like the underlying OS rename), evaluating to
+     whether `from` existed to be renamed — the same "absent is a no-op"
+     split `remove` gives, for the same reason. Any other failure (no
+     permission, `to`'s parent directory doesn't exist, a cross-device move,
+     an I/O error) is `RuntimeError.RenameFailed`, NOT folded into the
+     `false` case — unlike `from` missing, none of those is something a
+     caller would want to silently treat as "nothing happened".
+   - All four are capability-gated exactly like `open` (`Host.fs`,
+     GRAMMAR.bnf's Files design notes) — `RuntimeError.FilesUnavailable`
+     with no filesystem access at all — and resolve a relative `path` the
+     same way `open` does: against the process's current directory, not any
+     source file's own directory.
+   - Every path argument is an arbitrary `<expression>`, not a literal,
+     matching `getenv`'s own name argument — so a computed path
+     (`remove(dir + "/" + name)`) works without needing string
+     interpolation. None of the four checks its argument's type at compile
+     time (same as `open`'s path and `getenv`'s name): a non-`string`
+     argument is a runtime `RuntimeError.TypeMismatch`. *)
+
 (* --- Process exit code ---
    - `exit <expression>` halts the entire program immediately, from
      anywhere — the top level, mid-loop, mid-expression-statement, or
@@ -611,11 +677,12 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      that carries no diagnostic detail — most of them. `"error"` is the
      stable one to branch on (`if e["error"] == "KeyNotFound"`);
      `"message"`'s exact wording is not a compatibility promise.
-   - NOT EVERY ERROR IS CATCHABLE. The 19 that are, are the ones a program
+   - NOT EVERY ERROR IS CATCHABLE. The 22 that are, are the ones a program
      could plausibly do something about — `TypeMismatch`, `DivisionByZero`,
      `Overflow`, `IndexOutOfBounds`, `ByteOutOfRange`, `KeyNotFound`,
-     `JsonParseFailed`, `NumberParseFailed`, `InvalidExitCode`, and the ten
-     stream/file ones. `StackOverflow`, `StackUnderflow`, `CallStackOverflow`
+     `JsonParseFailed`, `NumberParseFailed`, `InvalidExitCode`,
+     `ListDirFailed`, `RemoveFailed`, `RenameFailed` (design note 3w), and
+     the ten stream/file ones. `StackOverflow`, `StackUnderflow`, `CallStackOverflow`
      and `HandlerStackOverflow` are NOT: they are VM-integrity failures, not
      program conditions, and running a handler needs the very stack room
      that has just run out. Neither is an out-of-memory failure, since
