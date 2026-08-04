@@ -147,6 +147,15 @@ pub const OpCode = enum(u8) {
     // list are ordinary popped `Value`s, not compile-time constants.
     exec,
 
+    // Time and randomness (ISA.bnf section 18, GRAMMAR.bnf design note 3y).
+    // No operand for any of the three: like GET_ENV, the wall clock and the
+    // RNG both live on the Host passed to `Vm.run`, not the chunk. RANDOM_RANGE
+    // finds its `start`/`end` as ordinary popped `Value`s, exactly like
+    // PATH_RENAME's two operands.
+    now,
+    random_float,
+    random_range,
+
     // `exit <expr>` (ISA.bnf's addendum to section 3). No operand: the
     // requested code is an ordinary popped `Value`, exactly like every
     // other opcode that acts on an expression result rather than a
@@ -548,6 +557,22 @@ test "disassemble renders exec" {
     try chunk.disassemble(&writer);
 
     try std.testing.expectEqualStrings("0000 exec\n", writer.buffered());
+}
+
+test "disassemble renders now, random_float, and random_range" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .now);
+    _ = try chunk.emit(allocator, .random_float);
+    _ = try chunk.emit(allocator, .random_range);
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 now\n0001 random_float\n0002 random_range\n", writer.buffered());
 }
 
 test "Program.deinit frees the main chunk and every function's chunk" {

@@ -17,6 +17,7 @@
 | [cli_args.butter](cli_args.butter) | **Runs today** | The bare `args` keyword (GRAMMAR.bnf design note 3p, ISA.bnf's PUSH_ARGS) — everything after a literal `--` on the CLI's own command line, as a `list` of strings. Needs `-- <name> ...` passed on the command line. |
 | [dir_ops.butter](dir_ops.butter) | **Runs today** | `exists`/`listDir`/`remove`/`rename` (GRAMMAR.bnf design note 3w, ISA.bnf section 16) — checking a path without opening it, listing a real directory's entries, and moving/deleting a scratch file, each showing the "absent is a no-op, not an error" bool split and a genuine failure caught via `try`/`catch`. Creates and cleans up `examples/dir_ops_scratch.txt`. |
 | [exec.butter](exec.butter) | **Runs today** | `exec(command, args)` (GRAMMAR.bnf design note 3x, ISA.bnf section 17) — spawning a real child process and capturing its `stdout`/`stderr`/`exit_code` as a `map`, plus a missing-program `ProcessSpawnFailed` caught via `try`/`catch`. Picks a small per-OS shell command via `hasenv("windir")`. |
+| [time_random.butter](time_random.butter) | **Runs today** | `now()`/`random()`/`random(a, b)` (GRAMMAR.bnf design note 3y, ISA.bnf section 18) — a timestamp, a crude time+randomness unique ID, a die roll and a coin flip via `random(a, b)`'s end-exclusive range, an empty-range `InvalidRange` caught via `try`/`catch`, and a trivial `now()`-based timing measurement. |
 
 Try any of them:
 
@@ -38,6 +39,7 @@ zig build run -- --stdin < examples/basic_math.butter
 zig build run -- examples/cli_args.butter -- Ada Grace
 zig build run -- examples/dir_ops.butter
 zig build run -- examples/exec.butter
+zig build run -- examples/time_random.butter
 ```
 
 `env_vars.butter` reads its settings from the environment, so set some to
@@ -77,3 +79,8 @@ create/overwrite one file on disk.
 `files.butter`/`json.butter`, it doesn't leave anything behind: the scratch
 file it creates gets renamed and then removed again before the program
 ends.
+
+`time_random.butter` draws real wall-clock time and real entropy (the CLI
+never sets `Host.rng_seed` — see ISA.bnf section 18), so its output is
+different every run; only the tests (which inject a fixed seed) get exactly
+reproducible values.

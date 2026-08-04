@@ -219,6 +219,25 @@ pub const Expr = union(enum) {
     /// `"exit_code"` (an `int`). Like `rename`, both operands are arbitrary
     /// expressions, not literals, so a computed command/argument list works.
     exec: Exec,
+    /// `now()` (GRAMMAR.bnf design note 3y) — the current wall-clock time as
+    /// a fresh `float` of seconds since the Unix epoch, sub-second precision
+    /// included. Like `args_literal` this reads live `Host` state (NOW,
+    /// ISA.bnf section 18) rather than anything the compiler could fold; no
+    /// operand, unlike `getenv`, since there's nothing to name.
+    time_now,
+    /// `random()` — a fresh `float` uniformly distributed in `[0, 1)`, the
+    /// zero-argument form of `random(...)` (RANDOM_FLOAT, ISA.bnf section
+    /// 18). Distinguished from `random_range` purely by argument count at
+    /// parse time (parser.zig's `randomExpr`), the same way `write`'s two
+    /// forms are.
+    random_float,
+    /// `random(start, end)` — a fresh `int` uniformly distributed over
+    /// `[start, end)`, end EXCLUSIVE — the same convention the for-loop's
+    /// own `start..end` uses, though this is an ordinary two-argument call,
+    /// not `..` syntax (RANDOM_RANGE, ISA.bnf section 18). `start`/`end` are
+    /// arbitrary expressions, checked to be `int` at compile time where
+    /// possible (mirroring the for-loop's own bounds) and always at runtime.
+    random_range: RandomRange,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -345,6 +364,14 @@ pub const Expr = union(enum) {
     pub const Exec = struct {
         command: *Expr,
         args: *Expr,
+    };
+
+    /// `random(start, end)`'s two operands — both arbitrary expressions,
+    /// checked to be `int` at compile time where possible, same as the
+    /// for-loop's own bounds (ISA.bnf section 7).
+    pub const RandomRange = struct {
+        start: *Expr,
+        end: *Expr,
     };
 };
 
@@ -660,6 +687,15 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try printExpr(writer, x.command);
             try writer.writeAll(" ");
             try printExpr(writer, x.args);
+            try writer.writeAll(")");
+        },
+        .time_now => try writer.writeAll("(now)"),
+        .random_float => try writer.writeAll("(random)"),
+        .random_range => |r| {
+            try writer.writeAll("(random ");
+            try printExpr(writer, r.start);
+            try writer.writeAll(" ");
+            try printExpr(writer, r.end);
             try writer.writeAll(")");
         },
     }

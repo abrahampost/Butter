@@ -1,0 +1,44 @@
+# Time, clock, and randomness (GRAMMAR.bnf design note 3y).
+#
+# `now()` is a fresh `float` of seconds since the Unix epoch, sub-second
+# precision included — useful for both a timestamp and for timing how long
+# something took. `random()` is a fresh `float` in [0, 1); `random(a, b)` is
+# a fresh `int` in [a, b), end exclusive, the same convention the for-loop's
+# own `start..end` uses.
+
+float start := now()
+print "started at:      " + stringify(start)
+
+# A crude unique-ish ID: the current time plus a random suffix. Neither
+# alone is enough — two IDs minted in the same instant would collide on
+# `now()`, and `random()` alone says nothing about when.
+string id := stringify(now()) + "-" + stringify(random())
+print "an id:            " + id
+
+# Rolling a six-sided die: random(1, 7), end exclusive.
+print "a die roll (1-6): " + stringify(random(1, 7))
+
+# A coin flip built on random(0, 2) rather than a separate bool-random form.
+int flip := random(0, 2)
+if flip == 0 {
+    print "a coin flip:      heads"
+} else {
+    print "a coin flip:      tails"
+}
+
+# start >= end has no value to return — the empty-range case is a catchable
+# runtime error, not a crash.
+try {
+    print random(5, 5)
+} catch e {
+    print "random(5, 5):     " + e["error"]
+}
+
+# A trivial timing measurement: how long a small loop took, in seconds.
+int total := 0
+for i in 0..200000 {
+    total := total + i
+}
+float elapsed := now() - start
+print "loop sum:         " + stringify(total)
+print "elapsed (s):      " + stringify(elapsed)

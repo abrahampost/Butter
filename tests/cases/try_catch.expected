@@ -16,5 +16,7 @@ CannotCloseStandardStream
 ListDirFailed
 RenameFailed
 ProcessesUnavailable
+ClockUnavailable
+InvalidRange
 TooManyOpenFiles
 all handled

@@ -1,0 +1,7 @@
+now(): ClockUnavailable
+true
+false
+true
+5
+true
+random(7, 7): InvalidRange

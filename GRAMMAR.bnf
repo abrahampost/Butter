@@ -43,6 +43,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'try' | 'catch' | 'getenv' | 'hasenv'
                | 'exists' | 'listDir' | 'remove' | 'rename'
                | 'exec'
+               | 'now' | 'random'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -200,6 +201,8 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <remove-expr>
                       | <rename-expr>
                       | <exec-expr>
+                      | <now-expr>
+                      | <random-expr>
                       | 'stdin' | 'stdout' | 'stderr'
                       | 'args'
                       | IDENTIFIER
@@ -269,6 +272,16 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 (* Subprocess execution (design note 3x). Like getenv/exists/rename, 'exec'
    is not also a <type> keyword, so a bare <expr-stmt> use is legal too. *)
 <exec-expr>         ::= 'exec' '(' <expression> ',' <expression> ')'
+
+(* Time, clock, and randomness (design note 3y). Neither 'now' nor 'random'
+   is a <type> keyword, so a bare <expr-stmt> use of either is legal too.
+   `now` takes no operand at all — the parens are still required (matching
+   call syntax generally), just always empty. `random` has two forms,
+   distinguished purely by argument count exactly the way <write-expr>'s two
+   forms are (parser.zig's `randomExpr`). *)
+<now-expr>           ::= 'now' '(' ')'
+<random-expr>        ::= 'random' '(' ')'
+                       | 'random' '(' <expression> ',' <expression> ')'
 
 
 (* --------------------------------------------------------------------------
@@ -611,6 +624,54 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      TODO entry; a future pass could add an opt-in streaming/interactive
      form without changing this one. *)
 
+(* --- Time, clock, and randomness (design note 3y) ---
+   - `now()` evaluates to the current wall-clock time as a fresh `float` of
+     seconds since the Unix epoch (1970-01-01T00:00:00Z), sub-second
+     precision included — the minimum needed for both a timestamp and a
+     timing/benchmarking measurement (`elapsed := now() - start`). There is
+     no separate `int`-seconds form: `int(now())` (design note 3r) already
+     truncates a `float` to whole seconds via the existing float-to-int
+     cast, so a second builtin would only duplicate that.
+   - `random()` evaluates to a fresh `float` uniformly distributed in
+     `[0, 1)`. `random(start, end)` evaluates to a fresh `int` uniformly
+     distributed over `[start, end)` — end EXCLUSIVE, the same convention
+     the for-loop's own `start..end` uses (though this is an ordinary
+     two-argument call, not `..` syntax: extending `..` to a general
+     expression position was out of scope here). The two forms are
+     distinguished purely by argument count, the same way `write`'s two
+     forms are (Byte-stream I/O notes, above).
+   - `start >= end` has no value to return — an empty range is
+     `RuntimeError.InvalidRange`, not a crash or a silently-wrong result.
+     Checked BEFORE any entropy is drawn, so it never needs clock access
+     (below) at all, even in an embedding that grants none.
+   - `random(start, end)`'s `start`/`end` are each checked to be `int` at
+     COMPILE time where possible (design note 3t), mirroring the for-loop's
+     own bounds exactly — a `float` operand is `SemanticError.TypeMismatch`
+     even though `int` widens to `float` in the other direction (an `int`
+     result assigned to a declared `float` local is fine); both are always
+     re-checked at RUNTIME too, same as every other statically-checked
+     position in this language.
+   - Both `now()` and `random()`/`random(start, end)` are capability-gated
+     exactly like `open`/`exec` (`Host.clock`, ISA.bnf section 18) —
+     `RuntimeError.ClockUnavailable` with no clock access at all. This
+     Zig VM's own wall-clock and OS-entropy access both go through the same
+     host interface `Host.fs`/`Host.process` already route file/process
+     access through, which is why "no clock" is a real, distinct capability
+     rather than something always on by default.
+   - `random()`/`random(start, end)` have a SECOND way around that gate:
+     `Host.rng_seed`, an embedder-supplied fixed seed that makes their
+     output exactly reproducible run to run, bypassing `Host.clock`
+     entirely — the deterministic test mode this feature needs to be
+     testable at all (its own TODO entry). A seeded generator draws a
+     genuine SEQUENCE across multiple calls in one run, not the same value
+     repeated; it is seeded lazily, on the first `random`/`random(...)` call
+     that program actually makes, not eagerly at startup — a program that
+     never calls either never touches `Host.clock`/`rng_seed` at all.
+     `now()` has no such override: a timestamp that could be pinned to an
+     arbitrary fixed value would defeat its own purpose, so its tests
+     instead assert PLAUSIBILITY (a real clock, checked against a wide
+     sane range) rather than an exact value. *)
+
 (* --- Process exit code ---
    - `exit <expression>` halts the entire program immediately, from
      anywhere — the top level, mid-loop, mid-expression-statement, or
@@ -723,13 +784,14 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      that carries no diagnostic detail — most of them. `"error"` is the
      stable one to branch on (`if e["error"] == "KeyNotFound"`);
      `"message"`'s exact wording is not a compatibility promise.
-   - NOT EVERY ERROR IS CATCHABLE. The 25 that are, are the ones a program
+   - NOT EVERY ERROR IS CATCHABLE. The 27 that are, are the ones a program
      could plausibly do something about — `TypeMismatch`, `DivisionByZero`,
      `Overflow`, `IndexOutOfBounds`, `ByteOutOfRange`, `KeyNotFound`,
      `JsonParseFailed`, `NumberParseFailed`, `InvalidExitCode`,
      `ListDirFailed`, `RemoveFailed`, `RenameFailed` (design note 3w),
      `ProcessesUnavailable`, `ProcessSpawnFailed`, `ProcessTerminatedAbnormally`
-     (design note 3x), and the ten stream/file ones. `StackOverflow`, `StackUnderflow`, `CallStackOverflow`
+     (design note 3x), `ClockUnavailable`, `InvalidRange` (design note 3y),
+     and the ten stream/file ones. `StackOverflow`, `StackUnderflow`, `CallStackOverflow`
      and `HandlerStackOverflow` are NOT: they are VM-integrity failures, not
      program conditions, and running a handler needs the very stack room
      that has just run out. Neither is an out-of-memory failure, since

@@ -601,6 +601,7 @@ pub const Parser = struct {
     ///         | <getenv-expr> | <hasenv-expr>
     ///         | <exists-expr> | <list-dir-expr> | <remove-expr> | <rename-expr>
     ///         | <exec-expr>
+    ///         | <now-expr> | <random-expr>
     ///         | 'stdin' | 'stdout' | 'stderr' | 'args' | IDENTIFIER
     fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
@@ -667,6 +668,8 @@ pub const Parser = struct {
             .kw_remove => return self.removeExpr(),
             .kw_rename => return self.renameExpr(),
             .kw_exec => return self.execExpr(),
+            .kw_now => return self.nowExpr(),
+            .kw_random => return self.randomExpr(),
             .kw_stdin => {
                 _ = self.advance();
                 return self.createExpr(.{ .stream_literal = .stdin });
@@ -1018,6 +1021,38 @@ pub const Parser = struct {
         const args = try self.expression();
         _ = try self.expect(.rparen, "expected ')' after the argument list");
         return self.createExpr(.{ .exec = .{ .command = command, .args = args } });
+    }
+
+    /// <now-expr> ::= 'now' '(' ')'
+    ///
+    /// Like `getenv`/`exists`/`exec`, `now` is a keyword in expression
+    /// position ONLY — nothing dispatches on it before expression parsing
+    /// begins — so a bare `now()` is a legal (if pointless) <expr-stmt> too.
+    /// Unlike every other special form here, it takes no operand at all: the
+    /// parens are still required (matching call syntax generally), just
+    /// always empty.
+    fn nowExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'now'
+        _ = try self.expect(.lparen, "expected '(' after 'now'");
+        _ = try self.expect(.rparen, "'now' takes no arguments; expected ')'");
+        return self.createExpr(.time_now);
+    }
+
+    /// <random-expr> ::= 'random' '(' ')' | 'random' '(' <expression> ',' <expression> ')'
+    ///
+    /// Two forms distinguished purely by argument count, exactly the way
+    /// `writeExpr` tells its two forms apart: an empty argument list is the
+    /// `[0, 1)` float form, anything else must be exactly `start, end`.
+    fn randomExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'random'
+        _ = try self.expect(.lparen, "expected '(' after 'random'");
+        if (self.match(.rparen)) return self.createExpr(.random_float);
+
+        const start = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the range's start, or ')' to call random() with no arguments");
+        const end = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the range's end");
+        return self.createExpr(.{ .random_range = .{ .start = start, .end = end } });
     }
 };
 
@@ -1576,6 +1611,47 @@ test "exec(x, y) CAN stand alone as a top-level statement, unlike int(x)" {
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
     try std.testing.expectEqualStrings("true", result.program[0].kind.expr_stmt.exec.command.literal.string);
+}
+
+test "parses now()/random()/random(a, b) as expressions" {
+    try expectExprSexpr("now()", "(now)");
+    try expectExprSexpr("random()", "(random)");
+    try expectExprSexpr("random(0, 10)", "(random 0 10)");
+    try expectExprSexpr("random(lo, hi)", "(random lo hi)");
+}
+
+test "now()/random() CAN stand alone as a top-level statement, unlike int(x)" {
+    // Neither `now` nor `random` is a <type> keyword, so (like `getenv`)
+    // nothing dispatches on them before expression parsing begins.
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "now()\nrandom()\nrandom(0, 1)\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.program.len);
+}
+
+test "now() requires empty parens" {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init("now(1)\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
+}
+
+test "random(a) with exactly one argument is a parse error" {
+    const allocator = std.testing.allocator;
+    var lex = lexer.Lexer.init("random(1)\n");
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = Parser.init(allocator, tokens);
+    defer parser.deinit();
+
+    try std.testing.expectError(Error.UnexpectedToken, parser.parseProgram());
 }
 
 test "'listDir' without '(' is a parse error, not a bare identifier" {

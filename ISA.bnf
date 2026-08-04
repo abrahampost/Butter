@@ -1100,14 +1100,15 @@
    "operation"/"path" from `Vm.diagnostic`, `""` when there is none. No new
    value kind is involved — it is the same map a `{...}` literal builds.
 
-   CATCHABLE vs NOT. Twenty-five RuntimeError variants are catchable:
+   CATCHABLE vs NOT. Twenty-seven RuntimeError variants are catchable:
    TypeMismatch, DivisionByZero, Overflow, IndexOutOfBounds, ByteOutOfRange,
    StreamReadFailed, StreamWriteFailed, FileOpenFailed, TooManyOpenFiles,
    FileCloseFailed, StreamNotReadable, StreamNotWritable, StreamClosed,
    CannotCloseStandardStream, FilesUnavailable, KeyNotFound, JsonParseFailed,
    NumberParseFailed, InvalidExitCode, ListDirFailed, RemoveFailed,
-   RenameFailed (section 16), ProcessesUnavailable, ProcessSpawnFailed, and
-   ProcessTerminatedAbnormally (section 17).
+   RenameFailed (section 16), ProcessesUnavailable, ProcessSpawnFailed,
+   ProcessTerminatedAbnormally (section 17), ClockUnavailable, and
+   InvalidRange (section 18).
 
    Four are not: StackOverflow, StackUnderflow, CallStackOverflow, and
    HandlerStackOverflow. These are VM-integrity failures rather than program
@@ -1447,4 +1448,138 @@
    whole once `execProcess` returns, success or failure. The pushed result
    map is a fresh heap Object nobody else holds a reference to, exactly like
    LIST_DIR's own result (section 16).
+   ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   18. TIME AND RANDOMNESS (NOW, RANDOM_FLOAT, RANDOM_RANGE — three new
+       opcodes, no new value kind, one new runtime capability gate
+       `Host.clock` plus a non-gating `Host.rng_seed` override; GRAMMAR.bnf
+       design note 3y)
+   -------------------------------------------------------------------------- *)
+
+   NOW                       ( -- float )       `host.clock orelse` ->
+                                               `RuntimeError.ClockUnavailable`
+                                               (with a `Vm.diagnostic`:
+                                               operation "now", same shape
+                                               every other capability-gate
+                                               failure in this VM carries).
+                                               Otherwise reads
+                                               `std.Io.Clock.real.now(io)`
+                                               (wall-clock time, POSIX/Unix
+                                               epoch — `std.Io`'s own `Clock.
+                                               real` doc comment), split into
+                                               whole seconds and a fractional
+                                               nanosecond remainder BEFORE
+                                               converting either half to
+                                               `f64` (see below for why), and
+                                               pushes their sum as a FLOAT.
+                                               What `now()` compiles to.
+   RANDOM_FLOAT               ( -- float )      `Vm.randomInterface` (below)
+                                               for a generator, then pushes
+                                               `r.float(f64)` — uniformly
+                                               distributed in `[0, 1)`,
+                                               `std.Random.float`'s own
+                                               documented range. What
+                                               `random()` (no arguments)
+                                               compiles to.
+   RANDOM_RANGE   ( start end -- int )          pops end, then start (both
+                                               must be INT; TypeMismatch
+                                               otherwise, decreffing
+                                               whichever operand(s) are heap
+                                               objects — e.g. a STRING passed
+                                               where an INT was expected, the
+                                               same accounting `popNumericPair`
+                                               already does). `RuntimeError.
+                                               InvalidRange` if `start >=
+                                               end` — CHECKED BEFORE calling
+                                               `Vm.randomInterface`, so an
+                                               invalid range never draws any
+                                               entropy or needs `Host.clock`/
+                                               `rng_seed` at all. Otherwise
+                                               gets a generator the same way
+                                               RANDOM_FLOAT does and pushes
+                                               `r.intRangeLessThan(i64, start,
+                                               end)` as an INT — end
+                                               EXCLUSIVE, mirroring the
+                                               for-loop's own `start..end`
+                                               (section 7). What `random(start,
+                                               end)` compiles to.
+
+   NONE OF THE THREE TAKES AN OPERAND. NOW needs none for the same reason
+   GET_ENV/HAS_ENV don't (section 15): the clock is live `Vm.run` state, not
+   anything in the chunk. RANDOM_RANGE's `start`/`end` are ordinary popped
+   values instead, exactly like PATH_RENAME's `from`/`to` (section 16) — a
+   computed range (`random(lo, lo + n)`) works with no special codegen.
+
+   WHY NOW SPLITS SECONDS FROM NANOSECONDS BEFORE CONVERTING. `Io.Timestamp.
+   nanoseconds` is an `i96` — nanoseconds since the epoch is already past
+   `f64`'s ~53-bit exact-integer range (roughly 1.7e18 against a ~9.007e15
+   ceiling), so a direct `@floatFromInt(ns) / 1e9` would round away exactly
+   the sub-second precision this opcode exists to provide. Splitting into
+   `whole_seconds = @divTrunc(ns, ns_per_s)` (~1.7e9, comfortably exact as an
+   `f64`) and `frac_ns = @mod(ns, ns_per_s)` (always < 1e9, likewise exact)
+   BEFORE converting either half keeps the result accurate to the underlying
+   clock's own resolution instead of merely to the nearest whole second.
+
+   `Vm.randomInterface(host)` — the seeding logic RANDOM_FLOAT/RANDOM_RANGE
+   share:
+
+     1. If already seeded this `run` (`Vm.prng_seeded`), returns
+        `self.prng.random()` directly — no re-seeding, so a program that
+        calls `random`/`random(...)` more than once gets a genuine SEQUENCE
+        of values, not the same one repeated.
+     2. Otherwise, `host.rng_seed` WINS IF SET: seeds `std.Random.
+        DefaultPrng.init(seed)` directly from it, entirely bypassing
+        `host.clock` — a seeded program never touches clock access at all,
+        even if the embedder also granted it.
+     3. Otherwise, `host.clock orelse` -> the SAME `RuntimeError.
+        ClockUnavailable` NOW raises (with `Vm.diagnostic`'s operation set
+        to "random" instead of "now", the only difference between the two
+        capability-gate failures); if present, draws 8 bytes via `io.
+        random(&buf)` (`std.Io`'s own fast, non-blocking OS-entropy source —
+        NOT `io.randomSecure`, since a seed for a general-purpose PRNG has
+        no need for cryptographic strength) and seeds `DefaultPrng` from
+        those, interpreted as a little-endian `u64`.
+     4. Either way, marks `Vm.prng_seeded = true` and caches the seeded
+        generator in `Vm.prng` (a `std.Random.DefaultPrng`, a field of `Vm`
+        itself — this VM has no allocator-free-at-runtime constraint the way
+        the fixed open-file/handler tables do, section 10/14, but the
+        seed-once-per-run shape is the same idea) for the rest of this
+        `run`.
+
+   `Host.clock: ?std.Io = null` (vm.zig) — gated exactly like `Host.fs`
+   (section 10) and `Host.process` (section 17): `null` is a refusal, not
+   "present but inert". Unlike THOSE two, though, this is not a "the program
+   could do real damage" gate — reading the clock or drawing entropy has no
+   side effect reaching outside the VM the way a file write or a spawned
+   process does. It is a capability gate anyway because Zig's own wall-clock
+   and OS-entropy access both go through `std.Io` in this compiler version
+   (`std.Io.Clock.real.now`/`Io.random`) rather than a global ambient
+   function the way an older Zig's `std.time.timestamp`/`std.crypto.random`
+   were — so `Host.clock` is what an embedder hands over to make either
+   builtin work AT ALL, the same reason `Host.fs`/`Host.process` exist,
+   even though the THREAT MODEL motivating each is different.
+
+   `Host.rng_seed: ?u64 = null` (vm.zig) is NOT a capability gate — it is an
+   override, checked before `Host.clock` is even consulted (`randomInterface`
+   step 2, above). This is the deterministic test mode this feature's own
+   TODO entry called for: a test (or an embedder that wants reproducible
+   output for its own reasons) sets a fixed seed and gets EXACTLY the same
+   sequence of `random`/`random(...)` results every run, with no `Host.clock`
+   needed at all. `now()` has no equivalent override — pinning wall-clock
+   time to an arbitrary fixed value would defeat its own purpose, so its own
+   tests instead assert PLAUSIBILITY (a real clock, e.g. `std.testing.io`,
+   checked against a wide sane range) rather than an exact value, and
+   integration coverage (tests/cases/time_random.butter) reaches it only
+   through its OWN capability gate (no `Host.clock` granted, `try`/`catch`
+   around it) rather than a real timestamp.
+
+   REFCOUNTS. NOW pops nothing (nothing to decref) and pushes a plain scalar
+   FLOAT (nothing to incref). RANDOM_FLOAT likewise pushes a plain scalar
+   FLOAT. RANDOM_RANGE pops two plain scalar INTs on the success path (no
+   refcounting) but must still decref whichever operand(s) are heap objects
+   on the TypeMismatch path (`Vm.pop`'s usual convention, section 14's
+   addendum) — the one place in this section refcounting is actually live,
+   since a non-INT `start`/`end` could be a STRING.
    ========================================================================== *)

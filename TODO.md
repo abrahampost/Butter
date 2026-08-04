@@ -298,14 +298,50 @@ and stringly-typed field access.
   sugar over `map` (cheaper) or a genuinely new runtime value kind.
 - Write a design note before implementation.
 
-### 15. Time, clock, and random-number access
-No timestamp, duration, or random-value builtins — blocks anything
-needing unique IDs, timing/benchmarking, or randomized behavior.
-- Add minimal builtins: `now()` (unix timestamp, `int` or `float`) and
-  `random()` (float in `[0, 1)`, or an `int` range form matching the
-  `for`-loop's existing `start..end` convention).
-- Document in GRAMMAR.bnf/ISA.bnf; add tests (random needs a
-  seeded/deterministic test mode to be testable at all — design that in).
+### 15. Time, clock, and random-number access — DONE
+`now()`, `random()`, and `random(start, end)` are now special-form
+expressions (GRAMMAR.bnf design note 3y, parsed like `getenv`/`exec` —
+neither `now` nor `random` is also a `<type>` keyword, so a bare use of
+either is a legal `<expr-stmt>` too), compiling to three new opcodes
+(`NOW`/`RANDOM_FLOAT`/`RANDOM_RANGE`, ISA.bnf section 18) in
+[src/vm.zig](src/vm.zig). `now()` evaluates to a fresh `float` of seconds
+since the Unix epoch, sub-second precision included; `random()`/
+`random(start, end)` are distinguished purely by argument count (the same
+way `write`'s two forms are) and evaluate to a fresh `float` in `[0, 1)` or
+a fresh `int` in `[start, end)` respectively — end EXCLUSIVE, the same
+convention the for-loop's own `start..end` uses. `random(start, end)`'s
+bounds are checked to be `int` at compile time where possible, mirroring
+the for-loop's own bounds exactly, and always at runtime; `start >= end` is
+the new catchable `RuntimeError.InvalidRange`, checked before any entropy is
+drawn.
+
+Both builtins are capability-gated exactly like `open`/`exec`
+(`Host.clock: ?std.Io`, defaulting to absent — `RuntimeError.
+ClockUnavailable` with none), since this Zig version's own wall-clock and
+OS-entropy access both go through `std.Io` rather than a global ambient
+function. `random()`/`random(start, end)` have a second way around that
+gate — `Host.rng_seed: ?u64`, an override that makes their output exactly
+reproducible run to run, bypassing `Host.clock` entirely and seeded lazily
+on first use so a program gets a genuine sequence rather than one value
+repeated. This is the deterministic test mode this task called for
+designing in; `now()` has no such override (pinning wall-clock time would
+defeat its own purpose), so its own coverage instead asserts plausibility
+against a real clock (`std.testing.io`) rather than an exact value.
+[src/main.zig](src/main.zig) grants `Host.clock` unconditionally (mirroring
+`fs`/`process`) but never sets `rng_seed`, so a program run from the CLI
+always draws real entropy.
+
+This brings the catchable-`RuntimeError` count from 25 to 27 (design note
+3u's count updated accordingly). Documented in GRAMMAR.bnf/ISA.bnf. Covered
+by lexer/parser/compiler/VM unit tests (capability gate, seeded
+determinism and cross-run reproducibility, range validation before entropy
+is drawn, non-int/float operand rejection matching the for-loop's own
+bounds, static types `float`/`float`/`int`), two new cases in
+[tests/cases/try_catch.butter](tests/cases/try_catch.butter)
+(`ClockUnavailable`/`InvalidRange`), the
+[time_random](tests/cases/time_random.butter) integration case (run with a
+fixed `Host.rng_seed` and no clock, so its `.expected` output is exactly
+reproducible), and [examples/time_random.butter](examples/time_random.butter).
 
 ---
 

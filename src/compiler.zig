@@ -590,6 +590,9 @@ pub const Compiler = struct {
             .path_remove => StaticType{ .scalar = .bool },
             .path_rename => StaticType{ .scalar = .bool },
             .exec => StaticType{ .scalar = .map },
+            .time_now => StaticType{ .scalar = .float },
+            .random_float => StaticType{ .scalar = .float },
+            .random_range => StaticType{ .scalar = .int },
         };
     }
 
@@ -1068,6 +1071,15 @@ pub const Compiler = struct {
                 try self.compileExpr(x.command);
                 try self.compileExpr(x.args);
                 _ = try self.chunk.emit(self.allocator, .exec);
+            },
+            .time_now => _ = try self.chunk.emit(self.allocator, .now),
+            .random_float => _ = try self.chunk.emit(self.allocator, .random_float),
+            .random_range => |r| {
+                try self.checkExpectedType(r.start, .int, "random", "random's start must be an int");
+                try self.checkExpectedType(r.end, .int, "random", "random's end must be an int");
+                try self.compileExpr(r.start);
+                try self.compileExpr(r.end);
+                _ = try self.chunk.emit(self.allocator, .random_range);
             },
         }
     }
@@ -3689,6 +3701,124 @@ test "a program run with no environment sees every variable as unset" {
         \\print len(getenv("EDITOR"))
     , &buf);
     try std.testing.expectEqualStrings("false\n0\n", output);
+}
+
+// ---- Time and randomness (GRAMMAR.bnf design note 3y) --------------------
+
+/// `runProgram` with clock access (`std.testing.io` — a real clock, since
+/// there's no meaningful fake one to inject at this layer) available to
+/// `now()`/an unseeded `random()`.
+fn runProgramWithClock(allocator: std.mem.Allocator, source: []const u8, buf: []u8) ![]const u8 {
+    var lex = lexer_mod.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var writer = std.Io.Writer.fixed(buf);
+    try vm.run(&compiled, .{ .out = &writer, .clock = std.testing.io });
+    return writer.buffered();
+}
+
+/// `runProgram` with `Host.rng_seed` set, so `random()`/`random(start, end)`
+/// are exactly reproducible without needing any clock access at all.
+fn runProgramWithSeed(allocator: std.mem.Allocator, source: []const u8, seed: u64, buf: []u8) ![]const u8 {
+    var lex = lexer_mod.Lexer.init(source);
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var writer = std.Io.Writer.fixed(buf);
+    try vm.run(&compiled, .{ .out = &writer, .rng_seed = seed });
+    return writer.buffered();
+}
+
+test "now()'s static type lets it initialize a float local" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgramWithClock(allocator,
+        \\float t := now()
+        \\print t > 0.0
+    , &buf);
+    try std.testing.expectEqualStrings("true\n", output);
+}
+
+test "random()/random(a, b)'s static types let them initialize float/int locals" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgramWithSeed(allocator,
+        \\float f := random()
+        \\int n := random(0, 10)
+        \\print f >= 0.0 and f < 1.0
+        \\print n >= 0 and n < 10
+    , 7, &buf);
+    try std.testing.expectEqualStrings("true\ntrue\n", output);
+}
+
+test "now()/random()/random(a, b)'s static types are checked against the declared type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int n := now()\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "string s := random()\n", SemanticError.TypeMismatch);
+    // `random(a, b)`'s own static type is `int`, which is NOT what's wrong
+    // with `float f := random(0, 10)` — `int` widens to `float` wherever one
+    // is expected (design note 3t), so that assignment is legal. `bool`
+    // never accepts either, which is what actually exercises the check.
+    try expectCompileError(allocator, "bool b := random(0, 10)\n", SemanticError.TypeMismatch);
+}
+
+test "int widens to float for random(a, b) too, matching design note 3t" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgramWithSeed(allocator,
+        \\float f := random(0, 10)
+        \\print f >= 0.0 and f < 10.0
+    , 7, &buf);
+    try std.testing.expectEqualStrings("true\n", output);
+}
+
+test "random(start, end)'s bounds are checked at compile time, like a for-loop's" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "random(\"a\", 10)\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "random(0, 3.5)\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "random(0.0, 10)\n", SemanticError.TypeMismatch);
+}
+
+test "random(start, end)'s bounds may be any expression, not just a literal" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgramWithSeed(allocator,
+        \\int lo := 0
+        \\int hi := lo + 10
+        \\int n := random(lo, hi)
+        \\print n >= lo and n < hi
+    , 3, &buf);
+    try std.testing.expectEqualStrings("true\n", output);
+}
+
+test "now()/random() without clock access or a seed are a runtime ClockUnavailable" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.ClockUnavailable, runProgram(allocator, "print now()\n", &buf));
+    try std.testing.expectError(vm_mod.RuntimeError.ClockUnavailable, runProgram(allocator, "print random()\n", &buf));
+}
+
+test "random(start, end) with start >= end is a runtime InvalidRange" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.InvalidRange, runProgram(allocator, "print random(5, 5)\n", &buf));
 }
 
 // ---- Static type checking (GRAMMAR.bnf design note 3t) -------------------

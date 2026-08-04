@@ -172,6 +172,26 @@ try {
     show("ProcessesUnavailable", e)
 }
 
+# --- Time and randomness (design note 3y) -----------------------------
+#
+# This harness grants filesystem access but no clock (see this file's
+# header comment) — exactly what's needed to reach `now()`'s capability
+# gate. `random(a, b)`'s own InvalidRange path doesn't need clock access at
+# all (it's checked before any entropy is drawn), so it's reachable here
+# too, unseeded.
+
+try {
+    print now()
+} catch e {
+    show("ClockUnavailable", e)
+}
+
+try {
+    print random(5, 5)
+} catch e {
+    show("InvalidRange", e)
+}
+
 # Last, because the handles it leaks stay open for the rest of the run —
 # there is no way to close a stream whose handle was never kept.
 try {
@@ -182,6 +202,6 @@ try {
     show("TooManyOpenFiles", e)
 }
 
-# The program survived all seventeen: without try/catch, any one of them
+# The program survived all twenty: without try/catch, any one of them
 # would have killed it on the spot.
 print "all handled"

@@ -57,6 +57,8 @@ pub const TokenType = enum {
     kw_remove,
     kw_rename,
     kw_exec,
+    kw_now,
+    kw_random,
 
     // Operators and punctuation
     plus,
@@ -136,6 +138,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "remove", .kw_remove },
     .{ "rename", .kw_rename },
     .{ "exec", .kw_exec },
+    .{ "now", .kw_now },
+    .{ "random", .kw_random },
 });
 
 pub const Token = struct {
@@ -608,6 +612,12 @@ test "'exit' is recognized as a keyword" {
 
 test "'exec' is recognized as a keyword" {
     try expectTokenTypes("exec execx", &.{ .kw_exec, .identifier, .eof });
+}
+
+test "'now' and 'random' are recognized as keywords" {
+    try expectTokenTypes("now random nowx randomx", &.{
+        .kw_now, .kw_random, .identifier, .identifier, .eof,
+    });
 }
 
 test "'try' and 'catch' are recognized as keywords" {

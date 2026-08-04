@@ -173,6 +173,13 @@ pub fn main(init: std.process.Init) !void {
         // granted here for the same reason. An embedder that wants a
         // sandboxed program simply passes no `process` at all.
         .process = .{ .io = init.io, .dir = std.Io.Dir.cwd() },
+        // Clock/entropy access for `now()`/`random()` — an unconditional
+        // grant, the same as `fs`/`process` above and for the same reason:
+        // an embedder that wants a sandboxed program simply passes no
+        // `clock` at all. `rng_seed` is deliberately left unset, so a
+        // program run from the CLI draws real entropy rather than a fixed
+        // sequence.
+        .clock = init.io,
     }) catch |err| {
         // Flush whatever the program managed to produce before the error,
         // so a partial run's output isn't swallowed by the diagnostic.

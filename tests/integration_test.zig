@@ -116,6 +116,43 @@ fn expectCaseOutputWithEnv(comptime name: []const u8, env: []const butter.vm.Hos
     try std.testing.expectEqualStrings(expected, actual);
 }
 
+/// Same as `run`, but with `Host.rng_seed` set, so `random()`/
+/// `random(start, end)` (ISA.bnf section 18) are exactly reproducible
+/// without needing any clock access at all — the deterministic test mode
+/// this feature needs to be testable end to end.
+fn runWithSeed(allocator: std.mem.Allocator, source: []const u8, seed: u64) ![]u8 {
+    var loader = butter.module.Loader.init(allocator, std.testing.io, std.Io.Dir.cwd());
+    defer loader.deinit();
+
+    const entry = try loader.loadEntry(source, "<test>", ".");
+    const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry);
+
+    var compiler = butter.compiler.Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(modules.entry_index, modules.units);
+    defer compiled.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    var vm = butter.vm.Vm.init(allocator);
+    try vm.run(&compiled, .{ .out = &out.writer, .rng_seed = seed });
+
+    return out.toOwnedSlice();
+}
+
+/// Same as `expectCaseOutput`, but running with `Host.rng_seed` set.
+fn expectCaseOutputWithSeed(comptime name: []const u8, seed: u64) !void {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("cases/" ++ name ++ ".butter");
+    const expected = @embedFile("cases/" ++ name ++ ".expected");
+
+    const actual = try runWithSeed(allocator, source, seed);
+    defer allocator.free(actual);
+
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
 /// Runs tests/cases/<name>.butter with a real filesystem available to it,
 /// rooted at a scratch directory of its own that is deleted afterward.
 ///
@@ -324,6 +361,10 @@ test "env: with no host env, every variable is unset" {
 
 test "dir_ops: exists/listDir/remove/rename against a real scratch directory" {
     try expectCaseOutputWithFs("dir_ops");
+}
+
+test "time_random: random()/random(a, b) are exactly reproducible under a fixed seed" {
+    try expectCaseOutputWithSeed("time_random", 20260804);
 }
 
 test "exec: spawns a real process and captures stdout/stderr/exit_code" {

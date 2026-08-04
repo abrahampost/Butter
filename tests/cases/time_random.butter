@@ -1,0 +1,41 @@
+# Time, clock, and randomness (GRAMMAR.bnf design note 3y, ISA.bnf section
+# 18). This harness (tests/integration_test.zig's `expectCaseOutputWithSeed`)
+# supplies a fixed `Host.rng_seed` but no clock, so `random()`/
+# `random(start, end)` are exactly reproducible run to run, and `now()`
+# reaches its own capability gate deterministically too — the seeded test
+# mode this feature needs to be testable at all.
+
+try {
+    print now()
+} catch e {
+    print "now(): " + e["error"]
+}
+
+# random() -- a float in [0, 1).
+float f := random()
+print f >= 0.0 and f < 1.0
+
+# Called again in the same run, it's a genuine SEQUENCE, not the same value
+# repeated.
+float g := random()
+print f == g
+
+# random(start, end) -- an int in [start, end), end exclusive.
+int n := random(0, 10)
+print n >= 0 and n < 10
+
+# A single-value range always returns that one value.
+print random(5, 6)
+
+# Bounds may be any expression, not just a literal.
+int lo := 2
+int hi := lo + 3
+int m := random(lo, hi)
+print m >= lo and m < hi
+
+# start >= end has no value to return.
+try {
+    print random(7, 7)
+} catch e {
+    print "random(7, 7): " + e["error"]
+}

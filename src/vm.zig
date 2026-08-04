@@ -119,6 +119,21 @@ pub const RuntimeError = error{
     /// stance the rest of this VM already takes (overflow-checked
     /// arithmetic, `ByteOutOfRange` on WRITE_BYTES).
     InvalidExitCode,
+
+    // Time and randomness (ISA.bnf section 18, GRAMMAR.bnf design note 3y).
+    /// The embedder gave the VM no clock access, so `now()` cannot work at
+    /// all (see `Host.clock`) — the same capability-gate shape
+    /// `FilesUnavailable`/`ProcessesUnavailable` give `open`/`exec`.
+    /// `random()`/`random(start, end)` raise this too, but ONLY when
+    /// `Host.rng_seed` is also unset: a seeded program never needs the
+    /// clock at all.
+    ClockUnavailable,
+    /// `random(start, end)` with `start >= end` — an empty range has no
+    /// value to return. `RuntimeError.IndexOutOfBounds` didn't fit (nothing
+    /// is being indexed); this gets its own tag instead, the same way
+    /// `InvalidExitCode` does for a value that's the right TYPE but the
+    /// wrong one.
+    InvalidRange,
 };
 
 const stack_max = 1024;
@@ -190,6 +205,23 @@ pub const Host = struct {
     /// something every `Vm` has by default. `null` fails `exec` with
     /// `RuntimeError.ProcessesUnavailable`.
     process: ?Process = null,
+    /// Wall-clock and entropy access for `now()`/`random()` (ISA.bnf section
+    /// 18, GRAMMAR.bnf design note 3y) — gated exactly like `fs`/`process`:
+    /// `null` fails `now()` with `RuntimeError.ClockUnavailable`, and fails
+    /// `random()`/`random(start, end)` the same way too, UNLESS `rng_seed`
+    /// below is set (a seeded program never touches the clock at all). This
+    /// Zig version's own wall-clock and OS-entropy access both go through
+    /// `std.Io` (`Clock.real.now`/`Io.random`), which is why this is an
+    /// `Io` rather than a `bool`/`void` flag the way a simpler capability
+    /// might be.
+    clock: ?std.Io = null,
+    /// Overrides `random()`/`random(start, end)`'s own seed with a fixed
+    /// value instead of drawing fresh entropy from `clock`, making its
+    /// output exactly reproducible run to run — the deterministic test mode
+    /// this feature needs to be testable at all. Absent by default (real
+    /// entropy via `clock`, drawn once and cached for the life of this
+    /// `run` — see `Vm.randomInterface`).
+    rng_seed: ?u64 = null,
 
     /// The filesystem as the program sees it: `io` performs the operations,
     /// and `dir` is what a relative path in `open` resolves against.
@@ -357,6 +389,15 @@ pub const Vm = struct {
     /// treat as exit code 0, exactly as if `exit(0)` had been the program's
     /// last statement.
     exit_code: ?u8 = null,
+    /// `random()`/`random(start, end)`'s own generator (ISA.bnf section 18),
+    /// seeded lazily on first use (`randomInterface`) rather than eagerly in
+    /// `init`/`run` — a program that never calls `random` never touches
+    /// `Host.clock`/`rng_seed` at all, and re-seeding per call would make
+    /// `rng_seed` produce the SAME value every time instead of a sequence.
+    /// `undefined` until `prng_seeded` is true, mirroring `OpenFile`'s own
+    /// "the table slot is what's live, not this field" shape.
+    prng: std.Random.DefaultPrng = undefined,
+    prng_seeded: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Vm {
         return .{ .allocator = allocator };
@@ -674,6 +715,32 @@ pub const Vm = struct {
     fn failFile(self: *Vm, comptime err: RuntimeError, operation: []const u8, path: []const u8, cause: []const u8) RuntimeError {
         self.diagnostic = .{ .operation = operation, .path = path, .cause = cause };
         return err;
+    }
+
+    /// `random()`/`random(start, end)`'s generator (ISA.bnf section 18),
+    /// seeded on first use and cached in `self.prng` for the rest of this
+    /// `run` — so a seeded program (`Host.rng_seed`) gets a genuine
+    /// SEQUENCE of values, not the same one repeated, and an unseeded one
+    /// draws real entropy from `Host.clock` exactly once rather than per
+    /// call.
+    ///
+    /// `Host.rng_seed` wins when set, entirely bypassing `Host.clock` — a
+    /// seeded program never needs clock access at all. Otherwise `clock`
+    /// must be present: `RuntimeError.ClockUnavailable` (`Vm.diagnostic`'s
+    /// `operation` is `"random"`, distinguishing this from `now()`'s own use
+    /// of the same tag).
+    fn randomInterface(self: *Vm, host: Host) RuntimeError!std.Random {
+        if (!self.prng_seeded) {
+            const seed = host.rng_seed orelse blk: {
+                const io = host.clock orelse return self.failFile(RuntimeError.ClockUnavailable, "random", "", "this program was run without clock access and no rng_seed was set");
+                var seed_bytes: [8]u8 = undefined;
+                io.random(&seed_bytes);
+                break :blk std.mem.readInt(u64, &seed_bytes, .little);
+            };
+            self.prng = std.Random.DefaultPrng.init(seed);
+            self.prng_seeded = true;
+        }
+        return self.prng.random();
     }
 
     /// Opens `path` and records it in the first free table slot, returning
@@ -1125,6 +1192,8 @@ pub const Vm = struct {
             error.ProcessesUnavailable,
             error.ProcessSpawnFailed,
             error.ProcessTerminatedAbnormally,
+            error.ClockUnavailable,
+            error.InvalidRange,
             => true,
 
             // VM-integrity failures. Not a program condition, and running a
@@ -1638,6 +1707,46 @@ pub const Vm = struct {
                 if (args_val != .object or args_val.object.payload != .list) return RuntimeError.TypeMismatch;
                 const command = command_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 try self.push(try self.execProcess(host, command, args_val.object.payload.list.items));
+            },
+
+            // ---- Time and randomness (ISA.bnf section 18) ----
+
+            .now => {
+                const io = host.clock orelse return self.failFile(RuntimeError.ClockUnavailable, "now", "", "this program was run without clock access");
+                const ns = std.Io.Clock.real.now(io).nanoseconds;
+                // Split into whole seconds + a fractional remainder BEFORE
+                // converting to f64: `ns` is nanoseconds since 1970, already
+                // past f64's ~53-bit exact-integer range, so a direct
+                // `@floatFromInt(ns) / 1e9` would round away the very
+                // sub-second precision this is for. Both halves individually
+                // fit f64 exactly (whole_seconds ~1.7e9, frac_ns < 1e9).
+                const whole_seconds = @divTrunc(ns, std.time.ns_per_s);
+                const frac_ns = @mod(ns, std.time.ns_per_s);
+                const seconds: f64 = @floatFromInt(whole_seconds);
+                const fraction: f64 = @as(f64, @floatFromInt(frac_ns)) / @as(f64, std.time.ns_per_s);
+                try self.push(.{ .float = seconds + fraction });
+            },
+            .random_float => {
+                var r = try self.randomInterface(host);
+                try self.push(.{ .float = r.float(f64) });
+            },
+            .random_range => {
+                const end_val = try self.pop();
+                const start_val = try self.pop();
+                if (start_val != .int or end_val != .int) {
+                    // Neither operand is ever pushed back on this path, so
+                    // whichever one might be a heap object (a string, from
+                    // e.g. `random("a", 5)`) needs releasing here rather
+                    // than silently discarded — a no-op for a plain int.
+                    start_val.decref(self.allocator);
+                    end_val.decref(self.allocator);
+                    return RuntimeError.TypeMismatch;
+                }
+                if (start_val.int >= end_val.int) return self.failFile(RuntimeError.InvalidRange, "random", "", "start must be less than end");
+                // Checked (and failed) before drawing any entropy, so an
+                // invalid range never needs `Host.clock`/`rng_seed` at all.
+                var r = try self.randomInterface(host);
+                try self.push(.{ .int = r.intRangeLessThan(i64, start_val.int, end_val.int) });
             },
 
             .add => try self.add(),
@@ -3169,6 +3278,244 @@ test "exec checks the args operand's shape before the process capability gate" {
     _ = try chunk.emit(allocator, .halt);
 
     try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+// ---- Time and randomness (ISA.bnf section 18) ----------------------------
+//
+// `now()` has exactly one unit-testable path beyond its capability gate: a
+// sanity check against a REAL clock (`std.testing.io`) — there's no exact
+// expected value for wall-clock time the way every other opcode in this file
+// has. `random()`/`random(start, end)`'s determinism under `Host.rng_seed`
+// is what makes THEM testable at all here (this feature's own TODO entry);
+// a real, unseeded draw is covered only by the shared capability-gate test,
+// the same asymmetry `exec`'s "a real spawn needs a real command" note lives
+// under.
+
+fn runTimeRandom(chunk: *const Chunk, buf: []u8, clock: ?std.Io, rng_seed: ?u64) ![]const u8 {
+    var vm = Vm.init(std.testing.allocator);
+    var writer = std.Io.Writer.fixed(buf);
+    const program = chunk_mod.Program{ .main = chunk.*, .functions = &.{} };
+    try vm.run(&program, .{ .out = &writer, .clock = clock, .rng_seed = rng_seed });
+    return buf[0..writer.end];
+}
+
+test "now without clock access is ClockUnavailable" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .now);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.ClockUnavailable);
+}
+
+test "now() with clock access returns a plausible unix timestamp" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .now);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const output = try runTimeRandom(&chunk, &buf, std.testing.io, null);
+    const value = try std.fmt.parseFloat(f64, output[0 .. output.len - 1]); // drop PRINT's trailing '\n'
+
+    // Year 2020 through year 2100 — comfortably brackets "whenever this test
+    // actually runs" without hardcoding today's date.
+    try std.testing.expect(value > 1_577_836_800.0 and value < 4_102_444_800.0);
+}
+
+test "random()/random(start, end) without clock access or a seed are ClockUnavailable" {
+    const allocator = std.testing.allocator;
+    for ([_]chunk_mod.OpCode{.random_float}) |op| {
+        var chunk: Chunk = .{};
+        defer chunk.deinit(allocator);
+        _ = try chunk.emit(allocator, op);
+        _ = try chunk.emit(allocator, .halt);
+        try expectRuntimeError(&chunk, RuntimeError.ClockUnavailable);
+    }
+
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+    const zero = try chunk.addConstant(allocator, .{ .int = 0 });
+    const ten = try chunk.addConstant(allocator, .{ .int = 10 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero);
+    _ = try chunk.emitWithOperand(allocator, .push_const, ten);
+    _ = try chunk.emit(allocator, .random_range);
+    _ = try chunk.emit(allocator, .halt);
+    try expectRuntimeError(&chunk, RuntimeError.ClockUnavailable);
+}
+
+test "random(start, end) with an empty range is InvalidRange, without needing clock access" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const five = try chunk.addConstant(allocator, .{ .int = 5 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, five);
+    _ = try chunk.emitWithOperand(allocator, .push_const, five);
+    _ = try chunk.emit(allocator, .random_range);
+    _ = try chunk.emit(allocator, .halt);
+
+    // No `.clock`/`.rng_seed` at all — proves the range is validated before
+    // any entropy is drawn.
+    try expectRuntimeError(&chunk, RuntimeError.InvalidRange);
+}
+
+test "random(start, end) with start > end is also InvalidRange" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const ten = try chunk.addConstant(allocator, .{ .int = 10 });
+    const three = try chunk.addConstant(allocator, .{ .int = 3 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, ten);
+    _ = try chunk.emitWithOperand(allocator, .push_const, three);
+    _ = try chunk.emit(allocator, .random_range);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.InvalidRange);
+}
+
+test "random(start, end) with a non-int operand is TypeMismatch, with no leak" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    // A heap string as `start`, so a rejected operand that isn't decreffed
+    // leaks a heap object `std.testing.allocator` will catch.
+    const not_an_int = try chunk.addConstant(allocator, try Value.newString(allocator, "not an int"));
+    const ten = try chunk.addConstant(allocator, .{ .int = 10 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, not_an_int);
+    _ = try chunk.emitWithOperand(allocator, .push_const, ten);
+    _ = try chunk.emit(allocator, .random_range);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "random(start, end) rejects float operands - no implicit int/float widening" {
+    // Mirrors the for-loop's own bounds (ISA.bnf section 7): only a genuine
+    // `int` is accepted, matching design note 3t's "float never narrows to
+    // int implicitly" stance.
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const zero = try chunk.addConstant(allocator, .{ .float = 0.0 });
+    const ten = try chunk.addConstant(allocator, .{ .int = 10 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, zero);
+    _ = try chunk.emitWithOperand(allocator, .push_const, ten);
+    _ = try chunk.emit(allocator, .random_range);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "random() with a seed is exactly reproducible across independent runs" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .random_float);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .random_float);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const a = try runTimeRandom(&chunk, &buf_a, null, 42);
+    const b = try runTimeRandom(&chunk, &buf_b, null, 42);
+    try std.testing.expectEqualStrings(a, b);
+
+    // A seeded generator draws a SEQUENCE, not the same value twice: the two
+    // lines this program printed must differ from each other.
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, a, "\n"), '\n');
+    const first = lines.next().?;
+    const second = lines.next().?;
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "random() with a different seed produces different output" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .random_float);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const a = try runTimeRandom(&chunk, &buf_a, null, 1);
+    const b = try runTimeRandom(&chunk, &buf_b, null, 2);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+}
+
+test "random() draws a float in [0, 1)" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .random_float);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const output = try runTimeRandom(&chunk, &buf, null, 7);
+    const value = try std.fmt.parseFloat(f64, output[0 .. output.len - 1]);
+    try std.testing.expect(value >= 0.0 and value < 1.0);
+}
+
+test "random(start, end) with a seed is deterministic and always lands in range" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const zero = try chunk.addConstant(allocator, .{ .int = 0 });
+    const ten = try chunk.addConstant(allocator, .{ .int = 10 });
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        _ = try chunk.emitWithOperand(allocator, .push_const, zero);
+        _ = try chunk.emitWithOperand(allocator, .push_const, ten);
+        _ = try chunk.emit(allocator, .random_range);
+        _ = try chunk.emit(allocator, .print);
+    }
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf_a: [512]u8 = undefined;
+    var buf_b: [512]u8 = undefined;
+    const a = try runTimeRandom(&chunk, &buf_a, null, 99);
+    const b = try runTimeRandom(&chunk, &buf_b, null, 99);
+    try std.testing.expectEqualStrings(a, b);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, a, "\n"), '\n');
+    while (lines.next()) |line| {
+        const n = try std.fmt.parseInt(i64, line, 10);
+        try std.testing.expect(n >= 0 and n < 10);
+    }
+}
+
+test "random(start, end) with a seed but a single-value range always returns that value" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const five = try chunk.addConstant(allocator, .{ .int = 5 });
+    const six = try chunk.addConstant(allocator, .{ .int = 6 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, five);
+    _ = try chunk.emitWithOperand(allocator, .push_const, six);
+    _ = try chunk.emit(allocator, .random_range);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const output = try runTimeRandom(&chunk, &buf, null, 123);
+    try std.testing.expectEqualStrings("5\n", output);
 }
 
 // ---- Maps, lists, and the heap (ISA.bnf section 11) ---------------------
@@ -4765,6 +5112,8 @@ test "every RuntimeError variant has the catchability ISA.bnf section 14 documen
         RuntimeError.ProcessesUnavailable,
         RuntimeError.ProcessSpawnFailed,
         RuntimeError.ProcessTerminatedAbnormally,
+        RuntimeError.ClockUnavailable,
+        RuntimeError.InvalidRange,
     };
     const uncatchable_variants = [_]RuntimeError{
         RuntimeError.StackOverflow,
