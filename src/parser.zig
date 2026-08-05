@@ -369,10 +369,12 @@ pub const Parser = struct {
                 const field_type = try self.parseType();
                 const field_name = try self.expect(.identifier, "expected a field name");
                 try fields.append(self.allocator(), .{ .type = field_type.type, .named_type = field_type.named_type, .name = field_name.lexeme });
+                const had_newline = self.check(.newline);
                 self.skipNewlines();
-                if (!self.match(.comma)) break;
-                self.skipNewlines();
-                if (self.check(.rbrace)) break; // trailing comma
+                const had_comma = self.match(.comma);
+                if (had_comma) self.skipNewlines();
+                if (!had_newline and !had_comma) break;
+                if (self.check(.rbrace)) break; // trailing separator before '}'
             }
         }
         self.skipNewlines();
@@ -403,10 +405,12 @@ pub const Parser = struct {
             while (true) {
                 const variant_tok = try self.expect(.identifier, "expected a variant name");
                 try variants.append(self.allocator(), variant_tok.lexeme);
+                const had_newline = self.check(.newline);
                 self.skipNewlines();
-                if (!self.match(.comma)) break;
-                self.skipNewlines();
-                if (self.check(.rbrace)) break; // trailing comma
+                const had_comma = self.match(.comma);
+                if (had_comma) self.skipNewlines();
+                if (!had_newline and !had_comma) break;
+                if (self.check(.rbrace)) break; // trailing separator before '}'
             }
         }
         self.skipNewlines();
@@ -2378,6 +2382,90 @@ test "'export' works on an enum declaration" {
 test "a struct/enum declaration allows a trailing comma" {
     const allocator = std.testing.allocator;
     var result = try parseProgramSource(allocator, "struct Point { int x, int y, }\nenum Color { Red, Green, }\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.program[0].kind.struct_decl.fields.len);
+    try std.testing.expectEqual(@as(usize, 2), result.program[1].kind.enum_decl.variants.len);
+}
+
+test "a struct/enum field list may be separated by newlines alone, with no commas" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\struct Queue {
+        \\    map items
+        \\    int head
+        \\    int tail
+        \\}
+        \\enum Color {
+        \\    Red
+        \\    Green
+        \\    Blue
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const s = result.program[0].kind.struct_decl;
+    try std.testing.expectEqual(@as(usize, 3), s.fields.len);
+    try std.testing.expectEqualStrings("items", s.fields[0].name);
+    try std.testing.expectEqualStrings("head", s.fields[1].name);
+    try std.testing.expectEqualStrings("tail", s.fields[2].name);
+
+    const e = result.program[1].kind.enum_decl;
+    try std.testing.expectEqual(@as(usize, 3), e.variants.len);
+    try std.testing.expectEqualStrings("Red", e.variants[0]);
+    try std.testing.expectEqualStrings("Blue", e.variants[2]);
+}
+
+test "a struct/enum field list may be separated by commas alone, on a single line" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "struct Point { int x, int y }\nenum Color { Red, Green, Blue }\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.program[0].kind.struct_decl.fields.len);
+    try std.testing.expectEqual(@as(usize, 3), result.program[1].kind.enum_decl.variants.len);
+}
+
+test "a struct/enum field list may mix commas and newlines as separators" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\struct Point {
+        \\    int x,
+        \\    int y
+        \\    int z,
+        \\    int w
+        \\}
+        \\enum Color {
+        \\    Red,
+        \\    Green
+        \\    Blue,
+        \\    Yellow
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const s = result.program[0].kind.struct_decl;
+    try std.testing.expectEqual(@as(usize, 4), s.fields.len);
+    try std.testing.expectEqualStrings("x", s.fields[0].name);
+    try std.testing.expectEqualStrings("y", s.fields[1].name);
+    try std.testing.expectEqualStrings("z", s.fields[2].name);
+    try std.testing.expectEqualStrings("w", s.fields[3].name);
+
+    const e = result.program[1].kind.enum_decl;
+    try std.testing.expectEqual(@as(usize, 4), e.variants.len);
+}
+
+test "a struct/enum declaration allows a trailing comma followed by a newline before '}'" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\struct Point {
+        \\    int x,
+        \\    int y,
+        \\}
+        \\enum Color {
+        \\    Red,
+        \\    Green,
+        \\}
+    );
     defer result.parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), result.program[0].kind.struct_decl.fields.len);
