@@ -1,0 +1,95 @@
+# throw (GRAMMAR.bnf design note 3u, ISA.bnf section 14) — a program raising
+# its own catchable errors, on top of (never in place of) the internal ones
+# try_catch.butter already covers.
+#
+#   zig build run -- tests/cases/throw.butter
+
+func show(string want, Error e) -> int {
+    if e.error == want {
+        print want
+    } else {
+        print "MISMATCH: wanted " + want + ", got " + e.error
+    }
+    return 0
+}
+
+# A thrown value's four fields come through the catch binding exactly as
+# constructed — no rebuilding through the internal-error machinery.
+try {
+    throw Error{error: "Custom", message: "bad input", operation: "validate", path: "config.json"}
+} catch e {
+    show("Custom", e)
+    print e.message
+    print e.operation
+    print e.path
+}
+
+# A program can validate its own input and raise an error for it, the same
+# way a built-in operation would for a condition it detects itself.
+func validate(int x) -> int {
+    if x < 0 {
+        throw Error{error: "Negative", message: "x must be >= 0", operation: "", path: ""}
+    }
+    return x
+}
+
+try {
+    print validate(-1)
+} catch e {
+    show("Negative", e)
+    print e.message
+}
+
+print validate(5)
+
+# Nesting: the innermost enclosing try wins, same as an internal error.
+try {
+    try {
+        throw Error{error: "Inner", message: "", operation: "", path: ""}
+    } catch inner {
+        show("Inner", inner)
+    }
+    print "resumed"
+} catch outer {
+    print "never"
+}
+
+# A throw inside a catch block escapes to the enclosing try, not its own
+# already-spent handler.
+try {
+    try {
+        print 1 / 0
+    } catch inner {
+        throw Error{error: "FromCatch", message: "", operation: "", path: ""}
+    }
+} catch outer {
+    show("FromCatch", outer)
+}
+
+# Several call frames deep, same as an internal error would unwind.
+func deep(int n) -> int {
+    if n == 0 {
+        throw Error{error: "TooDeep", message: "", operation: "", path: ""}
+    }
+    return deep(n - 1)
+}
+
+try {
+    print deep(5)
+} catch e {
+    show("TooDeep", e)
+}
+
+# A caught error can be re-thrown after inspection, unmodified.
+try {
+    try {
+        throw Error{error: "ReThrown", message: "passed through", operation: "", path: ""}
+    } catch e {
+        throw e
+    }
+} catch outer {
+    show("ReThrown", outer)
+    print outer.message
+}
+
+print "all handled"

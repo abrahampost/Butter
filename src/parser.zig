@@ -745,6 +745,7 @@ pub const Parser = struct {
         if (self.check(.kw_return)) return self.returnStatement();
         if (self.check(.kw_close)) return self.closeStatement();
         if (self.check(.kw_exit)) return self.exitStatement();
+        if (self.check(.kw_throw)) return self.throwStatement();
         return self.exprStatement();
     }
 
@@ -779,6 +780,19 @@ pub const Parser = struct {
         const code = try self.expression();
         try self.consumeEnd();
         return ast.Stmt{ .kind = .{ .exit_stmt = code }, .line = line };
+    }
+
+    /// <throw-stmt> ::= 'throw' <expression> <end>
+    ///
+    /// A statement, not an expression, for the same reason `exit` is — a
+    /// caught `throw` never returns control to what follows it, and an
+    /// uncaught one halts the program outright.
+    fn throwStatement(self: *Parser) Error!ast.Stmt {
+        const line = self.peek().line;
+        _ = self.advance(); // 'throw'
+        const value = try self.expression();
+        try self.consumeEnd();
+        return ast.Stmt{ .kind = .{ .throw_stmt = value }, .line = line };
     }
 
     /// <return-stmt> ::= 'return' <expression> <end>

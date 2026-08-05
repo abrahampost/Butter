@@ -337,6 +337,10 @@ test "try_catch: one caught case per catchable RuntimeError a program can raise"
     try expectCaseOutputWithFs("try_catch");
 }
 
+test "throw: a program raising and catching its own Error values, nested, re-thrown, and several frames deep" {
+    try expectCaseOutput("throw");
+}
+
 test "callback: a named function passed as a value, through both a parameter and a local, then called dynamically" {
     try expectCaseOutput("callback");
 }

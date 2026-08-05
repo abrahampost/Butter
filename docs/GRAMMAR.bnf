@@ -162,6 +162,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <statement>         ::= <print-stmt>
                       | <close-stmt>
                       | <exit-stmt>
+                      | <throw-stmt>
                       | <return-stmt>
                       | <expr-stmt>
 
@@ -170,6 +171,12 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <close-stmt>        ::= 'close' <expression> <end>
 
 <exit-stmt>         ::= 'exit' <expression> <end>
+
+(* Legal anywhere a <statement> is, unrestricted like <exit-stmt> — not
+   scoped to a function body the way <return-stmt> is (design note 3u).
+   <expression> must statically be the built-in `Error` struct
+   (`SemanticError.TypeMismatch` otherwise). *)
+<throw-stmt>        ::= 'throw' <expression> <end>
 
 (* Legal anywhere a <statement> is, but a semantic error outside a function
    body. *)
@@ -1113,8 +1120,9 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      first statement of the catch block, with IDENTIFIER bound to a fresh
      instance of the built-in `Error` struct (design note 3z) describing the
      failure. A try block that completes without error skips the catch
-     block entirely. This is the only way a Butter program can observe a
-     `RuntimeError` at all; before it, every one of them killed the process.
+     block entirely. Before this feature existed, an internal `RuntimeError`
+     always killed the process outright; `throw` (below) extends the same
+     mechanism to errors a program raises itself.
    - BOTH HALVES TAKE MANDATORY BRACES, unlike `if`/`while`/`for`, which
      accept a bare <declaration>: both are load-bearing scopes (the catch
      block's is what the binding lives in), and a braceless try body reads
@@ -1160,6 +1168,23 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      raised INSIDE a catch block is not caught by its own `try` — that
      handler is already spent by the time the catch block runs — so it
      propagates to the next enclosing `try`, or terminates the program.
+   - `throw <expression>` (grammar above) lets a program raise a catchable
+     error of its OWN, not just observe one a built-in operation raised.
+     `<expression>` must statically be the built-in `Error` struct — the
+     same static type `catch`'s own binding has — so a program constructs
+     one with an ordinary `Error{error: "...", message: "...", operation:
+     "...", path: "..."}` literal (or throws one it already has, e.g. a
+     caught `e` re-thrown after inspection) and hands it to `throw` as-is;
+     anything else is `SemanticError.TypeMismatch`. A caught `throw`'s
+     binding is that exact value, unchanged — not a copy, not rebuilt —
+     so whatever `error`/`message`/`operation`/`path` the program chose are
+     exactly what the handler reads. Placement is unrestricted, like `exit`,
+     not scoped to a function body the way `return` is. It is bound by
+     every rule above exactly like an internal error: the innermost
+     enclosing `try` wins, a `throw` inside a catch block escapes to the
+     NEXT enclosing `try` (not its own, spent, handler), and an uncaught
+     `throw` terminates the program — printing its own `message` to stderr
+     and exiting non-zero — the same way an uncaught internal error does.
    - `return` inside a try block returns from the enclosing function
      normally, abandoning the handler. `exit` inside a try block still halts
      the whole program immediately (design note 3q): it is not an error, so

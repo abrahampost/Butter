@@ -50,6 +50,7 @@ pub const TokenType = enum {
     kw_getenv,
     kw_hasenv,
     kw_exit,
+    kw_throw,
     kw_try,
     kw_catch,
     kw_exists,
@@ -136,6 +137,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "getenv", .kw_getenv },
     .{ "hasenv", .kw_hasenv },
     .{ "exit", .kw_exit },
+    .{ "throw", .kw_throw },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
     .{ "exists", .kw_exists },
@@ -764,6 +766,10 @@ test "'exists'/'listDir'/'remove'/'rename' are recognized as keywords" {
 
 test "'exit' is recognized as a keyword" {
     try expectTokenTypes("exit exitx", &.{ .kw_exit, .identifier, .eof });
+}
+
+test "'throw' is recognized as a keyword" {
+    try expectTokenTypes("throw throwx", &.{ .kw_throw, .identifier, .eof });
 }
 
 test "'exec' is recognized as a keyword" {

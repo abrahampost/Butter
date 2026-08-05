@@ -500,6 +500,34 @@
                                                leaves `Vm.exit_code` null)
                                                purely by checking that field.
 
+   THROW                    ( err -- )          pops err (already a
+                                               fully-formed `Error` struct —
+                                               compiled the same as any other
+                                               expression, e.g. an
+                                               `Error{...}` literal through
+                                               MAKE_STRUCT below). With a
+                                               handler on the stack: same
+                                               unwind PUSH_HANDLER's own
+                                               entry describes (rewind sp/
+                                               chunk/bp/frame_count/
+                                               return_width to it), then
+                                               pushes err verbatim at the
+                                               binding's slot — a pure move,
+                                               no incref/decref, and
+                                               critically no `errorValue`
+                                               rebuild: unlike an internal
+                                               error, err already IS what the
+                                               handler expects to bind. With
+                                               none: stores err on
+                                               `Vm.uncaught_throw` and
+                                               returns `UncaughtThrow`
+                                               (section 14's addendum below),
+                                               which `run` reports exactly
+                                               like any other uncaught error.
+                                               What `throw <expression>`
+                                               (GRAMMAR.bnf design note 3u)
+                                               compiles to.
+
    MAKE_STRUCT  #type_index  ( f1..fn -- struct )
                                                n = struct_types[type_index]
                                                .field_names.len (never a
@@ -1170,9 +1198,9 @@
 
 
 (* --------------------------------------------------------------------------
-   14. ERROR HANDLING (PUSH_HANDLER, POP_HANDLER — section 3; one new runtime
-       table; no new value kind — the binding is an ordinary RECORD, section
-       19)
+   14. ERROR HANDLING (PUSH_HANDLER, POP_HANDLER, THROW — section 3; one new
+       runtime table; no new value kind — the binding is an ordinary RECORD,
+       section 19)
    -------------------------------------------------------------------------- *)
 
    What `try <block> catch IDENTIFIER <block>` (GRAMMAR.bnf design note 3u)
@@ -1247,6 +1275,22 @@
    EXIT is not in either list: it is not an error. It returns from `Vm.run`
    normally (section 3's EXIT entry), which bypasses the handler stack with
    no special case — `exit` inside a try block still halts the program.
+
+   THROW (section 3's own entry) is also not in either list, but for the
+   opposite reason EXIT isn't: it never goes through `catchable`/
+   `unwindToHandler` at all. It searches `Exec.handler_count` itself, at the
+   moment it runs, and either unwinds straight to what it finds (reusing
+   PUSH_HANDLER's own recorded state — `rewindToHandler`, factored out of
+   `unwindToHandler` for exactly this sharing) or, finding nothing, stores
+   the popped value on `Vm.uncaught_throw` and returns a dedicated marker,
+   `RuntimeError.UncaughtThrow` — absent from both lists above, and
+   deliberately uncatchable for the same structural reason EXIT needs no
+   entry at all: by the time it's raised, THROW has already done the only
+   handler search that could ever have caught it. `Vm.run`'s own uncaught-
+   error reporting (its caller, e.g. the CLI) checks `Vm.uncaught_throw`
+   before `Vm.diagnostic`, since a thrown value already IS the message —
+   there is nothing to derive the way an internal error's report is derived
+   from `@errorName`/`Vm.diagnostic`.
 
    RET DROPS STALE HANDLERS. A `return` from inside a try block would
    otherwise leave that frame's handler installed with an ip into a chunk

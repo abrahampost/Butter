@@ -58,7 +58,10 @@ pub const OpCode = enum(u8) {
     // machine state instead, since none of it is known at compile time —
     // the same instruction can be reached with any number of frames under
     // it. POP_HANDLER takes no operand: discarding the innermost handler is
-    // all "the guarded block finished without failing" has to mean.
+    // all "the guarded block finished without failing" has to mean. THROW
+    // (see below, alongside EXIT) is the other way into this machinery — an
+    // internal RuntimeError isn't the only thing that can trigger a handler
+    // unwind now.
     push_handler,
     pop_handler,
 
@@ -189,6 +192,16 @@ pub const OpCode = enum(u8) {
     // other opcode that acts on an expression result rather than a
     // compile-time constant.
     exit,
+
+    // `throw <expr>` (GRAMMAR.bnf design note 3u, ISA.bnf section 14). No
+    // operand: pops an already-fully-formed `Error` struct `Value` off the
+    // stack (compiled the same way any other expression is — a struct
+    // literal compiles through MAKE_STRUCT like any other) and either
+    // unwinds to the innermost handler with it, or, with no handler live,
+    // hands it to `Vm.run`'s caller the same way an uncaught internal error
+    // is. Unlike an internal error, no `Vm.errorValue` call is needed — the
+    // value is already exactly what a handler expects to bind.
+    throw,
 
     // Records (ISA.bnf section 19, GRAMMAR.bnf design note 3z). MAKE_STRUCT's
     // operand is an index into `Program.struct_types` — the field COUNT

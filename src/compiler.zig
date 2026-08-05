@@ -196,6 +196,14 @@ const DeclaredType = struct {
     }
 };
 
+/// The declared type `throw <expression>` (design note 3u) checks its
+/// operand against — the built-in `Error` struct, the same static type
+/// `compileTry`'s catch binding uses. Can't be `DeclaredType.builtin`, which
+/// asserts away `.named` types entirely.
+fn errorDeclaredType() DeclaredType {
+    return .{ .type = .named, .named_ref = .{ .index = error_type_index, .is_enum = false } };
+}
+
 /// One field of a registered struct type — `type` is already fully
 /// resolved (never a bare unresolved name), unlike `ast.FieldDecl`.
 const FieldInfo = struct {
@@ -1183,6 +1191,11 @@ pub const Compiler = struct {
                 try self.checkExpectedType(e, DeclaredType.builtin(.int), "exit", "exit code must be an int");
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .exit);
+            },
+            .throw_stmt => |e| {
+                try self.checkExpectedType(e, errorDeclaredType(), "throw", "thrown value must be the built-in Error struct");
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .throw);
             },
             .try_stmt => |t| try self.compileTry(t),
         }
@@ -5144,6 +5157,12 @@ test "exit's code must be int" {
     try expectCompileError(allocator, "exit \"x\"\n", SemanticError.TypeMismatch);
 }
 
+test "throw's operand must be the built-in Error struct" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "throw 5\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "throw \"oops\"\n", SemanticError.TypeMismatch);
+}
+
 test "binary operators reject mismatched operand types" {
     const allocator = std.testing.allocator;
     try expectCompileError(allocator, "print 1 + true\n", SemanticError.TypeMismatch);
@@ -5619,6 +5638,135 @@ test "a try block's locals do not permanently consume slots" {
         \\print after
     , &buf);
     try std.testing.expectEqualStrings("3\n99\n", output);
+}
+
+// ---- throw (GRAMMAR.bnf design note 3u, ISA.bnf section 14) ---------------
+
+test "a thrown Error's four fields come through the catch binding unchanged" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    // Custom, program-chosen values in every field — proving THROW doesn't
+    // rebuild the value through `Vm.errorValue` the way an internal error
+    // does; what the handler binds is exactly what was thrown.
+    const output = try runProgram(allocator,
+        \\try {
+        \\    throw Error{error: "Custom", message: "bad input", operation: "validate", path: "config.json"}
+        \\} catch e {
+        \\    print e.error
+        \\    print e.message
+        \\    print e.operation
+        \\    print e.path
+        \\}
+    , &buf);
+    try std.testing.expectEqualStrings("Custom\nbad input\nvalidate\nconfig.json\n", output);
+}
+
+test "an uncaught throw propagates out of Vm.run and reports its own message" {
+    const allocator = std.testing.allocator;
+    var lex = lexer_mod.Lexer.init(
+        \\print "before"
+        \\throw Error{error: "Custom", message: "boom", operation: "", path: ""}
+    );
+    const tokens = try lex.tokenizeAll(allocator);
+    defer allocator.free(tokens);
+
+    var parser = parser_mod.Parser.init(allocator, tokens);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var compiled = try compile(allocator, program);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    // Unlike the CLI (which exits the process immediately after printing,
+    // needing no cleanup of its own), a test using the leak-checking
+    // allocator has to release the value itself — nothing else holds a
+    // reference to it once `run` has returned.
+    defer if (vm.uncaught_throw) |thrown| thrown.decref(allocator);
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try std.testing.expectError(vm_mod.RuntimeError.UncaughtThrow, vm.run(&compiled, .{ .out = &writer }));
+
+    try std.testing.expectEqualStrings("before\n", writer.buffered());
+    try std.testing.expect(vm.uncaught_throw != null);
+    const rec = vm.uncaught_throw.?.object.payload.record;
+    try std.testing.expectEqualStrings("Custom", rec.fields[0].asStringBytes().?);
+    try std.testing.expectEqualStrings("boom", rec.fields[1].asStringBytes().?);
+    try std.testing.expectEqual(@as(?u32, 2), vm.line);
+}
+
+test "throw nests, and the innermost enclosing try wins" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\try {
+        \\    try {
+        \\        throw Error{error: "Inner", message: "", operation: "", path: ""}
+        \\    } catch inner {
+        \\        print "inner " + inner.error
+        \\    }
+        \\    print "resumed"
+        \\} catch outer {
+        \\    print "never"
+        \\}
+    , &buf);
+    try std.testing.expectEqualStrings("inner Inner\nresumed\n", output);
+}
+
+test "a throw inside a catch block escapes to the enclosing try, not its own" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\try {
+        \\    try {
+        \\        print 1 / 0
+        \\    } catch inner {
+        \\        throw Error{error: "FromCatch", message: "", operation: "", path: ""}
+        \\    }
+        \\} catch outer {
+        \\    print outer.error
+        \\}
+    , &buf);
+    try std.testing.expectEqualStrings("FromCatch\n", output);
+}
+
+test "a throw several call frames deep unwinds to the handler" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func deep(int n) -> int {
+        \\    if n == 0 {
+        \\        throw Error{error: "TooDeep", message: "", operation: "", path: ""}
+        \\    }
+        \\    return deep(n - 1)
+        \\}
+        \\try {
+        \\    print deep(5)
+        \\} catch e {
+        \\    print e.error
+        \\}
+        \\print "after"
+    , &buf);
+    try std.testing.expectEqualStrings("TooDeep\nafter\n", output);
+}
+
+test "throw inside a function: caught by a try in the caller, several frames up" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func validate(int x) -> int {
+        \\    if x < 0 {
+        \\        throw Error{error: "Negative", message: "x must be >= 0", operation: "", path: ""}
+        \\    }
+        \\    return x
+        \\}
+        \\try {
+        \\    print validate(-1)
+        \\} catch e {
+        \\    print e.error + ": " + e.message
+        \\}
+    , &buf);
+    try std.testing.expectEqualStrings("Negative: x must be >= 0\n", output);
 }
 
 // ---- Function values (GRAMMAR.bnf design note 3ad) ------------------------

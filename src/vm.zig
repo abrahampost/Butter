@@ -143,6 +143,16 @@ pub const RuntimeError = error{
     /// the right-type-wrong-shape case, the same split `InvalidExitCode`/
     /// `InvalidRange` already make.
     InvalidCharLength,
+
+    /// A `throw <expr>` (GRAMMAR.bnf design note 3u) reached `Vm.run`'s
+    /// dispatch loop with no enclosing `try` to catch it — the value itself
+    /// is on `Vm.uncaught_throw`, not carried by this tag (a Zig error
+    /// value can't hold a payload). Deliberately NOT catchable: unlike
+    /// every variant above, by the time this is raised the handler search
+    /// has already happened (inside the THROW opcode itself, ISA.bnf
+    /// section 14) and come up empty, so there is nothing left for an
+    /// enclosing `try` further out to do differently.
+    UncaughtThrow,
 };
 
 const stack_max = 1024;
@@ -392,6 +402,15 @@ pub const Vm = struct {
     /// Detail for the last file error raised, since a Zig error value can't
     /// carry a payload. Set only on the errors documented to have one.
     diagnostic: ?Diagnostic = null,
+    /// The value a `throw <expr>` (design note 3u) was carrying when it
+    /// reached the top with no enclosing `try` to catch it — set by the
+    /// THROW opcode right before it returns `RuntimeError.UncaughtThrow`,
+    /// the same moment `diagnostic` would be set for an internal error with
+    /// detail. Checked ahead of `diagnostic` by anything reporting an
+    /// uncaught error, since a thrown value already IS the fully-formed
+    /// `Error` struct there is nothing left to derive. `null` after a
+    /// successful run, and for every uncaught error that isn't a `throw`.
+    uncaught_throw: ?Value = null,
     /// The source line the last UNCAUGHT runtime error happened on, if the
     /// failing instruction's chunk had line info recorded (`Chunk.lineAt`).
     /// Set in `run`'s own catch, right before an error that no `try` block
@@ -1243,6 +1262,11 @@ pub const Vm = struct {
             error.StackUnderflow,
             error.CallStackOverflow,
             error.HandlerStackOverflow,
+            // The THROW opcode has already searched for a handler itself
+            // (ISA.bnf section 14) and found none by the time this is
+            // raised — there is nothing left for an enclosing `try` to
+            // intercept.
+            error.UncaughtThrow,
             => false,
 
             else => false,
@@ -1262,7 +1286,26 @@ pub const Vm = struct {
     fn unwindToHandler(self: *Vm, ex: *Exec, err: anyerror) !void {
         ex.handler_count -= 1;
         const handler = ex.handlers[ex.handler_count];
+        self.rewindToHandler(ex, handler);
 
+        // Built before `diagnostic` is cleared, since that's where the
+        // operation/path detail comes from. If this fails (only OOM can),
+        // the error propagates out of `run` with the stack already rewound —
+        // harmless, since the errdefer there sweeps whatever is left.
+        const info = try self.errorValue(err, ex.program);
+        self.diagnostic = null;
+        try self.push(info);
+    }
+
+    /// The part of abandoning a `try` block's guarded region that both
+    /// `unwindToHandler` (an internal error) and the THROW opcode (design
+    /// note 3u) need identically: discard everything the region pushed and
+    /// resume execution at the handler's own recorded position. What
+    /// differs between the two callers is only what gets pushed at the end
+    /// of the resumed catch block's own slot — a freshly built error struct
+    /// for an internal error, or the already-fully-formed value THROW
+    /// popped — which is why that step isn't done here.
+    fn rewindToHandler(self: *Vm, ex: *Exec, handler: Handler) void {
         // Everything the abandoned region pushed is discarded — across as
         // many frames as it spans, since the value stack is one flat array
         // regardless of how many calls are layered on it (the same reason
@@ -1276,14 +1319,6 @@ pub const Vm = struct {
         ex.bp = handler.bp;
         ex.frame_count = handler.frame_count;
         ex.return_width = handler.return_width;
-
-        // Built before `diagnostic` is cleared, since that's where the
-        // operation/path detail comes from. If this fails (only OOM can),
-        // the error propagates out of `run` with the stack already rewound —
-        // harmless, since the errdefer there sweeps whatever is left.
-        const info = try self.errorValue(err, ex.program);
-        self.diagnostic = null;
-        try self.push(info);
     }
 
     /// `self.types`/`Program.struct_types` index the built-in `Error` type
@@ -2242,6 +2277,34 @@ pub const Vm = struct {
                 self.decrefStack();
                 self.exit_code = @intCast(code_val.int);
                 return .halted;
+            },
+
+            // `throw <expr>` (GRAMMAR.bnf design note 3u, ISA.bnf section
+            // 14). `val` is already a fully-formed `Error` struct — unlike
+            // an internal error, there is no `errorValue` call: the value a
+            // handler binds is exactly the one the program built.
+            .throw => {
+                const val = try self.pop();
+                if (ex.handler_count == 0) {
+                    // No handler anywhere on the stack: hand the value to
+                    // whoever called `run` the same way an uncaught
+                    // internal error already does, via a dedicated
+                    // non-catchable marker (`catchable`, above) — `val`
+                    // itself rides on `Vm.uncaught_throw`, since a Zig
+                    // error can't carry a payload. `run`'s own catch sets
+                    // `self.line` for us, the same way it does for every
+                    // other uncaught error.
+                    self.uncaught_throw = val;
+                    return RuntimeError.UncaughtThrow;
+                }
+                ex.handler_count -= 1;
+                const handler = ex.handlers[ex.handler_count];
+                self.rewindToHandler(ex, handler);
+                // A pure move: `val`'s single reference relocates from the
+                // stack slot THROW's own POP took it from into the catch
+                // block's binding slot, so no incref/decref of it here
+                // either (the same reasoning RET's own return value gets).
+                try self.push(val);
             },
 
             // Closing here (rather than only in the errdefer above) is
@@ -5754,6 +5817,7 @@ test "every RuntimeError variant has the catchability ISA.bnf section 14 documen
         RuntimeError.StackUnderflow,
         RuntimeError.CallStackOverflow,
         RuntimeError.HandlerStackOverflow,
+        RuntimeError.UncaughtThrow,
     };
     // Every variant appears in exactly one of the two lists above.
     try std.testing.expectEqual(

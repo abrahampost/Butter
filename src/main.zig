@@ -185,7 +185,20 @@ pub fn main(init: std.process.Init) !void {
         // so a partial run's output isn't swallowed by the diagnostic.
         stdout_writer.flush() catch {};
         stderr_writer.flush() catch {};
-        if (vm.diagnostic) |diag| {
+        if (vm.uncaught_throw) |thrown| {
+            // A `throw <expr>` (GRAMMAR.bnf design note 3u) that reached the
+            // top uncaught already carries a fully-formed `Error` struct —
+            // no `diagnostic`/`@errorName` to derive a message from, the way
+            // an internal error needs; its own `message` field IS the
+            // message, formatted identically to how a caught one's would
+            // read.
+            const message = thrown.object.payload.record.fields[1].asStringBytes().?;
+            if (vm.line) |line| {
+                std.debug.print("runtime error at line {d}: {s}\n", .{ line, message });
+            } else {
+                std.debug.print("runtime error: {s}\n", .{message});
+            }
+        } else if (vm.diagnostic) |diag| {
             if (diag.path.len > 0) {
                 if (vm.line) |line| {
                     std.debug.print("runtime error at line {d}: {s} '{s}': {s}\n", .{ line, diag.operation, diag.path, diag.cause });

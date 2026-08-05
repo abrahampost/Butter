@@ -569,6 +569,13 @@ pub const StmtKind = union(enum) {
     /// same reason `close`/`print` are: it produces no value to a caller
     /// that, by definition, never gets to run.
     exit_stmt: *Expr,
+    /// `throw <expression>` (design note 3u) — raises `expression` (which
+    /// must statically be the built-in `Error` struct) as a catchable error:
+    /// caught by the nearest enclosing `try` exactly like an internal one,
+    /// or, uncaught, terminates the program the same way an uncaught
+    /// internal error does. A statement, not an expression, for the same
+    /// reason `exit`/`close`/`print` are.
+    throw_stmt: *Expr,
     /// `try <block> catch IDENTIFIER <block>` (design note 3u) — runs
     /// `body`, and if a catchable runtime error is raised anywhere while it
     /// does (including several call frames deep), abandons the rest of it
@@ -1090,6 +1097,11 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
         },
         .exit_stmt => |e| {
             try writer.writeAll("(exit ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .throw_stmt => |e| {
+            try writer.writeAll("(throw ");
             try printExpr(writer, e);
             try writer.writeAll(")");
         },
