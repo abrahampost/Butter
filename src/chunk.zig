@@ -143,6 +143,15 @@ pub const OpCode = enum(u8) {
     // MAP_DELETE's two-operand pop.
     join,
 
+    // String interpolation (ISA.bnf section 23, GRAMMAR.bnf design note
+    // 3ae). TO_STRING has no operand: the value to render is an ordinary
+    // popped `Value`, not a compile-time constant. INTERP_CONCAT's operand
+    // is a piece count — like MAKE_LIST/MAKE_MAP, the compiler already
+    // knows exactly how many values it just pushed (one per literal-text/
+    // `${...}` part of the original string literal).
+    to_string,
+    interp_concat,
+
     // Environment variables (ISA.bnf section 15, GRAMMAR.bnf design note
     // 3v). No operand, for the same reason PUSH_ARGS has none: the
     // environment lives on the Host passed to `Vm.run`, not in the chunk.

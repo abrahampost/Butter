@@ -21,6 +21,7 @@ which test one stage (lexer, parser, compiler, VM) in isolation.
 | [string_utils.butter](cases/string_utils.butter) | Word stats (count, longest, case conversion, join/split/trim/pad/classify) via the bundled `string.std.butter`. |
 | [string_indexing.butter](cases/string_indexing.butter) | Hand-rolled `key=value;...` parsing via `s[i]` (single-character compare) and `s[a..b]` (slicing), plus basic index/slice reads. |
 | [strings.butter](cases/strings.butter) | String concatenation (`+`) and lexicographic ordering (`<`/`<=`/`>`/`>=`), including a bubble sort by string value. |
+| [string_interpolation.butter](cases/string_interpolation.butter) | `"...${expr}..."` interpolation — variables, arithmetic, struct fields, calls, list/map values and indexing, an enum, escaping `\$`, and nesting. |
 | [args.butter](cases/args.butter) | The bare `args` keyword — run with `expectCaseOutputWithArgs`, which passes a fixed argv instead of the default empty one. |
 | [exit_code.butter](cases/exit_code.butter) | A grep-style tool built on `args` + `exit`: exits 0 with a match printed, 1 with nothing found, or 2 with a usage line and no argument at all. Has no single `.expected` (three different argv scenarios, three different outputs) — run directly with `runCapture`, which returns both the printed output and the requested exit code. |
 

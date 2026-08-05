@@ -1791,6 +1791,79 @@ pub const Vm = struct {
                 try self.push(.{ .object = obj });
             },
 
+            // ---- String interpolation (ISA.bnf section 23) ----
+
+            .to_string => {
+                const v = try self.pop();
+                defer v.decref(self.allocator);
+                // Renders exactly like PRINT (`Value.print`'s unquoted,
+                // top-level rendering) into a FRESH heap string instead of
+                // to a stream — unlike JSON_STRINGIFY, this never fails
+                // beyond OOM: there is no value kind `Value.print` doesn't
+                // already have a rendering for.
+                var out: std.Io.Writer.Allocating = .init(self.allocator);
+                defer out.deinit();
+                v.print(&out.writer) catch return error.OutOfMemory; // only failure: the allocator behind `out`
+                const bytes = try out.toOwnedSlice();
+                const obj = Object.create(self.allocator, .{ .string = bytes }) catch |err| {
+                    self.allocator.free(bytes);
+                    return err;
+                };
+                try self.push(.{ .object = obj });
+            },
+
+            .interp_concat => {
+                const n = instr.operand;
+                const base = self.sp - n;
+                // Consumed up front, exactly like MAKE_MAP's own `base`
+                // (section 11). Every piece is decreffed via an EXPLICIT,
+                // immediate loop on each exit path below, never a `defer`
+                // over `self.stack[base..]` — by the time any deferred code
+                // ran, `self.push` below would already have overwritten
+                // `self.stack[base]` with the freshly built result, so a
+                // lazily-re-read deferred loop would decref THAT instead of
+                // the original pieces.
+                self.sp = base;
+
+                // Two passes over the n pieces, exactly like JOIN (section
+                // 22): the first measures the exact output length (and
+                // validates every piece is string-shaped — defense in
+                // depth, since `compileStringInterp` only ever pushes a
+                // string constant or a TO_STRING result here, never
+                // anything else), so the second can copy into one
+                // already-correctly-sized allocation. ONE allocation, not
+                // n — the entire reason this opcode exists over compiling
+                // interpolation as sugar for a chain of ADD (which would
+                // copy the growing prefix over and over, O(n^2) total bytes
+                // copied for a template with many pieces).
+                var total_len: usize = 0;
+                for (self.stack[base..][0..n]) |v| {
+                    const bytes = v.asStringBytes() orelse {
+                        for (self.stack[base..][0..n]) |v2| v2.decref(self.allocator);
+                        return RuntimeError.TypeMismatch;
+                    };
+                    total_len += bytes.len;
+                }
+
+                const out = self.allocator.alloc(u8, total_len) catch |err| {
+                    for (self.stack[base..][0..n]) |v| v.decref(self.allocator);
+                    return err;
+                };
+                var offset: usize = 0;
+                for (self.stack[base..][0..n]) |v| {
+                    const bytes = v.asStringBytes().?; // already validated above
+                    @memcpy(out[offset..][0..bytes.len], bytes);
+                    offset += bytes.len;
+                    v.decref(self.allocator); // done with this piece now that its bytes are copied
+                }
+
+                const obj = Object.create(self.allocator, .{ .string = out }) catch |err| {
+                    self.allocator.free(out);
+                    return err;
+                };
+                try self.push(.{ .object = obj });
+            },
+
             // ---- Environment variables (ISA.bnf section 15) ----
 
             .get_env => {
@@ -4799,6 +4872,180 @@ test "join on a list containing a non-string element is TypeMismatch" {
     _ = try chunk.emit(allocator, .halt);
 
     try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+// ---- String interpolation (ISA.bnf section 23) ---------------------------
+
+/// Runs a one-instruction PUSH_CONST/TO_STRING/PRINT program over `v` and
+/// returns what it printed (minus the trailing newline PRINT itself adds).
+fn expectToString(v: Value, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const idx = try chunk.addConstant(allocator, v);
+    _ = try chunk.emitWithOperand(allocator, .push_const, idx);
+    _ = try chunk.emit(allocator, .to_string);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [128]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expect(len > 0 and buf[len - 1] == '\n');
+    try std.testing.expectEqualStrings(expected, buf[0 .. len - 1]);
+}
+
+test "to_string renders each scalar value kind exactly like print" {
+    try expectToString(.{ .int = 42 }, "42");
+    try expectToString(.{ .float = 3.5 }, "3.5");
+    try expectToString(.{ .boolean = true }, "true");
+    try expectToString(.null_value, "null");
+}
+
+test "to_string on a string value is the string itself, unquoted" {
+    // `expectToString`'s chunk constant pool takes sole ownership of
+    // whatever Value it's handed (same as PUSH_CONST elsewhere in this
+    // file) — build the string in place rather than also holding (and
+    // separately decreffing) a reference to it here.
+    try expectToString(try Value.newString(std.testing.allocator, "hi"), "hi");
+}
+
+test "to_string on a list/map renders quoted elements, like print" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emitWithOperand(allocator, .make_list, 1);
+    _ = try chunk.emit(allocator, .to_string);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("[\"a\"]\n", buf[0..len]);
+}
+
+test "to_string produces a fresh, independently-owned string (source is decreffed, not aliased)" {
+    // Regression guard for the obvious wrong implementation: reusing the
+    // popped operand's own bytes instead of rendering into a fresh
+    // allocation. Decreffing the original string to 0 here would leave a
+    // dangling read behind `result` if TO_STRING had aliased it instead of
+    // copying — std.testing.allocator's leak/use-after-free detection is
+    // the actual check.
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "hi"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .to_string);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("hi\n", buf[0..len]);
+}
+
+test "interp_concat joins n pieces, in order, with one allocation" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
+    const b = try chunk.addConstant(allocator, try Value.newString(allocator, "-b-"));
+    const c = try chunk.addConstant(allocator, try Value.newString(allocator, "c"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emitWithOperand(allocator, .push_const, b);
+    _ = try chunk.emitWithOperand(allocator, .push_const, c);
+    _ = try chunk.emitWithOperand(allocator, .interp_concat, 3);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("a-b-c\n", buf[0..len]);
+}
+
+test "interp_concat on a single piece is the identity (n=1)" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "solo"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emitWithOperand(allocator, .interp_concat, 1);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("solo\n", buf[0..len]);
+}
+
+test "interp_concat on zero pieces is the empty string" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emitWithOperand(allocator, .interp_concat, 0);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("\n", buf[0..len]);
+}
+
+test "interp_concat on a non-string piece is TypeMismatch (defense in depth)" {
+    // Never reachable from compiled Butter source (compileStringInterp only
+    // ever pushes a string constant or a TO_STRING result here) — same
+    // "defense in depth" stance MAKE_MAP takes on a non-string key.
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
+    const n = try chunk.addConstant(allocator, .{ .int = 1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emitWithOperand(allocator, .push_const, n);
+    _ = try chunk.emitWithOperand(allocator, .interp_concat, 2);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "interp_concat decrefs its own borrowed references, not the constant pool's permanent one" {
+    // Regression guard for the exact bug this opcode had during
+    // development: a lazily-re-read `defer` over live stack memory ended up
+    // decref-ing the freshly built RESULT (which the PUSH below had just
+    // written into the same stack slot) instead of the original pieces —
+    // std.testing.allocator's double-free/use-after-free detection caught
+    // it. Re-pushing and re-printing the same constants afterward exercises
+    // that the constant pool's own permanent reference (PUSH_CONST increfs
+    // a fresh copy for interp_concat to consume, leaving the pool's own
+    // count untouched) is still intact and usable.
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
+    const b = try chunk.addConstant(allocator, try Value.newString(allocator, "b"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emitWithOperand(allocator, .push_const, b);
+    _ = try chunk.emitWithOperand(allocator, .interp_concat, 2);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emitWithOperand(allocator, .push_const, b);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("ab\na\nb\n", buf[0..len]);
 }
 
 // ---- Environment variables (ISA.bnf section 15) --------------------------

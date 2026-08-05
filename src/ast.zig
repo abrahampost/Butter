@@ -340,6 +340,31 @@ pub const Expr = union(enum) {
     /// kind, by pairing this with the existing `list`/`push` (ISA.bnf
     /// section 22).
     list_join: Join,
+    /// `"literal ${expr} literal"` (GRAMMAR.bnf design note 3ae) — a STRING
+    /// literal containing one or more `${...}` interpolations, split at
+    /// parse time into an alternating sequence of literal-text and
+    /// sub-expression parts (`parser.zig`'s `parseStringOrInterp`). A STRING
+    /// token with no `${` at all never produces this node — it's still a
+    /// plain `.literal.string`, exactly as before this feature existed; this
+    /// is purely additive. Always evaluates to `string` (`compiler.zig`
+    /// desugars it to PUSH_CONST/TO_STRING per part plus one INTERP_CONCAT
+    /// naming the piece count — ISA.bnf section 23 — no new heap value
+    /// kind, the same stance `join` already takes, and no O(n^2) growth
+    /// the way a chain of ADD would have).
+    string_interp: []InterpPart,
+
+    /// One piece of an interpolated string: either literal text (already
+    /// escape-decoded, same four-plus-`\$` rules `Literal.string` itself
+    /// gets) or a `${...}` sub-expression, in source order. A literal part
+    /// may be empty (`""`), and always appears immediately before/after/
+    /// between the expression parts — `parser.zig` emits one for every gap,
+    /// including empty ones at the very start/end, so `compiler.zig` only
+    /// ever has to reason about ordinary literal/expr alternation, never
+    /// "was there text before the first `${`?" as a special case.
+    pub const InterpPart = union(enum) {
+        literal: []const u8,
+        expr: *Expr,
+    };
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -899,6 +924,17 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try printExpr(writer, r.start);
             try writer.writeAll(" ");
             try printExpr(writer, r.end);
+            try writer.writeAll(")");
+        },
+        .string_interp => |parts| {
+            try writer.writeAll("(interp");
+            for (parts) |part| {
+                try writer.writeAll(" ");
+                switch (part) {
+                    .literal => |s| try writer.print("\"{s}\"", .{s}),
+                    .expr => |e| try printExpr(writer, e),
+                }
+            }
             try writer.writeAll(")");
         },
     }

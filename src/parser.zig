@@ -106,15 +106,21 @@ pub const Parser = struct {
         return node;
     }
 
-    /// Decodes `\n`/`\t`/`\\`/`\"` in a STRING token's already-unquoted
-    /// contents (GRAMMAR.bnf design note 3s). The lexer has already
-    /// validated that every backslash in `raw` starts one of those four
-    /// sequences (`lexer.zig`'s `string()`), so this never fails — it just
-    /// copies bytes through, shrinking two-character escapes to one.
-    /// A literal with no backslash at all (the common case) returns `raw`
-    /// unchanged, borrowed straight from the source text same as before
-    /// this feature existed; only a literal that actually uses an escape
-    /// pays for an arena allocation.
+    /// Decodes `\n`/`\t`/`\\`/`\"`/`\$` in a STRING token's already-unquoted
+    /// contents (GRAMMAR.bnf design note 3s, extended to five escapes by
+    /// design note 3ae). The lexer has already validated that every
+    /// backslash in `raw` starts one of those five sequences (`lexer.zig`'s
+    /// `string()`), so this never fails — it just copies bytes through,
+    /// shrinking two-character escapes to one. A literal with no backslash
+    /// at all (the common case) returns `raw` unchanged, borrowed straight
+    /// from the source text same as before this feature existed; only a
+    /// literal that actually uses an escape pays for an arena allocation.
+    ///
+    /// Used for an `import` path and a map-literal key — unlike an ordinary
+    /// string-literal atom (`parseStringOrInterp`), neither ever recognizes
+    /// `${...}` as interpolation: both are static text by design (GRAMMAR.bnf
+    /// design notes on imports/maps), so a literal `${` in either is left
+    /// completely alone, ordinary text like any other character.
     fn unescapeString(self: *Parser, raw: []const u8) std.mem.Allocator.Error![]const u8 {
         if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
 
@@ -129,7 +135,8 @@ pub const Parser = struct {
                     't' => '\t',
                     '\\' => '\\',
                     '"' => '"',
-                    else => unreachable, // lexer guarantees only these four escapes reach here
+                    '$' => '$',
+                    else => unreachable, // lexer guarantees only these five escapes reach here
                 };
                 i += 2;
             } else {
@@ -139,6 +146,163 @@ pub const Parser = struct {
             j += 1;
         }
         return buf[0..j];
+    }
+
+    /// Splits a string-literal atom's raw (quote-stripped) contents into
+    /// literal text and `${<expression>}` interpolation parts (GRAMMAR.bnf
+    /// design note 3ae). Fast path: no `$` anywhere at all (the overwhelming
+    /// majority of string literals) is exactly `unescapeString` — same
+    /// borrowed-unchanged-when-possible behavior as before this feature
+    /// existed.
+    ///
+    /// The slow path decodes `\n`/`\t`/`\\`/`\"`/`\$` in literal runs exactly
+    /// like `unescapeString`, and for each unescaped `${`, isolates its inner
+    /// text (`findInterpEnd`, mirroring the depth-tracking `lexer.zig`
+    /// already did while first scanning this same token) and recursively
+    /// re-lexes/parses it as an independent `<expression>` (`parseInterpExpr`)
+    /// — a full recursive parse, not a token splice, so any expression form
+    /// works inside `${...}` exactly as it would anywhere else. If every `$`
+    /// turns out to be escaped (`\$`) or a lone `$` never followed by `{`,
+    /// this still collapses back to a plain `.literal.string` — only a
+    /// genuine `${` produces `.string_interp`.
+    fn parseStringOrInterp(self: *Parser, raw: []const u8, tok: Token) Error!*ast.Expr {
+        if (std.mem.indexOfScalar(u8, raw, '$') == null) {
+            return self.createExpr(.{ .literal = .{ .string = try self.unescapeString(raw) } });
+        }
+
+        var literal: std.ArrayList(u8) = .empty;
+        var parts: std.ArrayList(ast.Expr.InterpPart) = .empty;
+        var i: usize = 0;
+        while (i < raw.len) {
+            if (raw[i] == '\\') {
+                try literal.append(self.allocator(), switch (raw[i + 1]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    '\\' => '\\',
+                    '"' => '"',
+                    '$' => '$',
+                    else => unreachable, // lexer guarantees only these five escapes reach here
+                });
+                i += 2;
+                continue;
+            }
+            if (raw[i] == '$' and i + 1 < raw.len and raw[i + 1] == '{') {
+                try parts.append(self.allocator(), .{ .literal = try literal.toOwnedSlice(self.allocator()) });
+                const inner_start = i + 2;
+                const inner_end = findInterpEnd(raw, inner_start);
+                try parts.append(self.allocator(), .{ .expr = try self.parseInterpExpr(raw[inner_start..inner_end], tok) });
+                i = inner_end + 1; // skip the closing '}'
+                continue;
+            }
+            try literal.append(self.allocator(), raw[i]);
+            i += 1;
+        }
+
+        if (parts.items.len == 0) {
+            // Every '$' in `raw` was escaped or never followed by '{' — no
+            // real interpolation after all.
+            return self.createExpr(.{ .literal = .{ .string = try literal.toOwnedSlice(self.allocator()) } });
+        }
+        try parts.append(self.allocator(), .{ .literal = try literal.toOwnedSlice(self.allocator()) });
+        return self.createExpr(.{ .string_interp = try parts.toOwnedSlice(self.allocator()) });
+    }
+
+    /// Finds the index in `raw` of the `}` that closes the `${` whose inner
+    /// text starts at `start`, mirroring the exact recursive depth-tracking
+    /// `lexer.zig`'s `scanStringBody` already performed once while first
+    /// scanning this token: nested `{`/`}` (e.g. a map literal) nest, and a
+    /// `"` opens a nested string skipped over whole via `skipNestedString`
+    /// (below) — which may itself contain further interpolation, nested to
+    /// any depth, exactly as the lexer allows. Trusted to always find a
+    /// matching `}` — the lexer already rejected any STRING token where it
+    /// wouldn't (`Error.UnterminatedString`), so this never needs to fail.
+    fn findInterpEnd(raw: []const u8, start: usize) usize {
+        var depth: usize = 0;
+        var i = start;
+        while (i < raw.len) {
+            switch (raw[i]) {
+                '{' => {
+                    depth += 1;
+                    i += 1;
+                },
+                '}' => {
+                    if (depth == 0) return i;
+                    depth -= 1;
+                    i += 1;
+                },
+                '"' => i = skipNestedString(raw, i + 1),
+                else => i += 1,
+            }
+        }
+        unreachable; // lexer already guaranteed a matching '}' exists
+    }
+
+    /// Skips a string nested inside an interpolation, starting right after
+    /// its opening `"` (already consumed by the caller, at `start`),
+    /// returning the index right after its closing `"`. Recognizes the same
+    /// five escapes and, recursively via `findInterpEnd`, the same `${...}`
+    /// interpolation a top-level string literal does — the `skipNestedString`
+    /// counterpart to `lexer.zig`'s `scanStringBody` recursing into itself
+    /// for the same shape.
+    fn skipNestedString(raw: []const u8, start: usize) usize {
+        var i = start;
+        while (i < raw.len and raw[i] != '"') {
+            if (raw[i] == '\\') {
+                i += 2;
+            } else if (raw[i] == '$' and i + 1 < raw.len and raw[i + 1] == '{') {
+                i = findInterpEnd(raw, i + 2) + 1; // position just past the '}'
+            } else {
+                i += 1;
+            }
+        }
+        return i + 1; // closing '"'
+    }
+
+    /// Parses `src` (an interpolation's inner text, already isolated by
+    /// `findInterpEnd`) as one independent `<expression>`, reusing this same
+    /// arena so the resulting nodes live exactly as long as the rest of this
+    /// parse's AST — freed together by the outer `Parser.deinit`, never
+    /// separately. Temporarily swaps in a fresh token stream (re-lexed from
+    /// `src`) and restores the original one afterward, rather than
+    /// constructing a whole second `Parser` — this reuses every existing
+    /// grammar production (`expression`, `primary`, ...) as-is.
+    ///
+    /// A syntax error here (or trailing tokens after the expression, e.g.
+    /// `${1 2}`) is reported at `outer_tok`'s own position, not an offset
+    /// within `src` — the re-lexed source starts its own line/column count
+    /// over from 1 (a string literal may itself already span multiple
+    /// source lines), so rebasing it against the real file is out of scope
+    /// for this pass; pointing at the whole string literal, with a message
+    /// that says "inside string interpolation", is judged clear enough.
+    fn parseInterpExpr(self: *Parser, src: []const u8, outer_tok: Token) Error!*ast.Expr {
+        var sub_lexer = lexer.Lexer.init(src);
+        const sub_tokens = sub_lexer.tokenizeAll(self.allocator()) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            self.diagnostic = .{ .line = outer_tok.line, .column = outer_tok.column, .message = "invalid expression inside string interpolation" };
+            return Error.UnexpectedToken;
+        };
+
+        const saved_tokens = self.tokens;
+        const saved_pos = self.pos;
+        self.tokens = sub_tokens;
+        self.pos = 0;
+        defer {
+            self.tokens = saved_tokens;
+            self.pos = saved_pos;
+        }
+
+        const expr = self.expression() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.UnexpectedToken => {
+                self.diagnostic = .{ .line = outer_tok.line, .column = outer_tok.column, .message = "invalid expression inside string interpolation" };
+                return Error.UnexpectedToken;
+            },
+        };
+        if (!self.isAtEnd()) {
+            self.diagnostic = .{ .line = outer_tok.line, .column = outer_tok.column, .message = "unexpected trailing text inside string interpolation" };
+            return Error.UnexpectedToken;
+        }
+        return expr;
     }
 
     // ---- <program> ---------------------------------------------------
@@ -820,10 +984,11 @@ pub const Parser = struct {
             .string => {
                 _ = self.advance();
                 // Strip the surrounding quotes captured in the lexeme, then
-                // decode any \n/\t/\\/\" escapes (design note 3s).
+                // split out any `${...}` interpolations (design note 3ae),
+                // decoding \n/\t/\\/\"/\$ escapes (design note 3s) along the
+                // way.
                 const contents = tok.lexeme[1 .. tok.lexeme.len - 1];
-                const decoded = try self.unescapeString(contents);
-                return self.createExpr(.{ .literal = .{ .string = decoded } });
+                return self.parseStringOrInterp(contents, tok);
             },
             .kw_true => {
                 _ = self.advance();
@@ -2208,6 +2373,91 @@ test "escapes decode in a map-literal string key" {
     ,
         \\(map ("a
         \\b" 1))
+    );
+}
+
+// ---- String interpolation (GRAMMAR.bnf design note 3ae) ----------------
+
+test "a string with no '$' at all parses as a plain literal, unaffected" {
+    var result = try parseProgramSource(std.testing.allocator, "print \"hello\"\n");
+    defer result.parser.deinit();
+    try std.testing.expect(result.program[0].kind.print_stmt.* == .literal);
+    try std.testing.expectEqualStrings("hello", result.program[0].kind.print_stmt.literal.string);
+}
+
+test "a lone '$' or an escaped '\\$' never produces interpolation" {
+    try expectExprSexpr(
+        \\"$5 and \$6"
+    ,
+        \\"$5 and $6"
+    );
+}
+
+test "parses a single interpolation into literal/expr/literal parts" {
+    try expectExprSexpr(
+        \\"hello ${name}!"
+    ,
+        \\(interp "hello " name "!")
+    );
+}
+
+test "an interpolation glued to the quotes produces empty literal parts" {
+    try expectExprSexpr(
+        \\"${x}"
+    ,
+        \\(interp "" x "")
+    );
+}
+
+test "multiple interpolations in one string" {
+    try expectExprSexpr(
+        \\"${a} + ${b} = ${a + b}"
+    ,
+        \\(interp "" a " + " b " = " (+ a b) "")
+    );
+}
+
+test "an interpolation's inner text is parsed as a full expression, not just a name" {
+    try expectExprSexpr(
+        \\"sum: ${1 + 2 * 3}"
+    ,
+        \\(interp "sum: " (+ 1 (* 2 3)) "")
+    );
+}
+
+test "nested '{'/'}' (a map literal) inside an interpolation nest correctly" {
+    try expectExprSexpr(
+        \\"${ {"a": 1}["a"] }"
+    ,
+        \\(interp "" (index (map ("a" 1)) "a") "")
+    );
+}
+
+test "interpolation nests arbitrarily deep — a string inside '${...}' may itself interpolate" {
+    try expectExprSexpr(
+        \\"${ "${x}" }"
+    ,
+        \\(interp "" (interp "" x "") "")
+    );
+}
+
+test "a syntax error inside '${...}' is a parse error" {
+    try expectExprParseError(
+        \\"bad: ${1 +}"
+    );
+}
+
+test "trailing tokens after the expression inside '${...}' are a parse error" {
+    try expectExprParseError(
+        \\"bad: ${1 2}"
+    );
+}
+
+test "a call, indexing, and field access all work inside an interpolation" {
+    try expectExprSexpr(
+        \\"${len(xs)} ${xs[0]} ${p.field}"
+    ,
+        \\(interp "" (len xs) " " (index xs 0) " " (. p field) "")
     );
 }
 

@@ -1,0 +1,8 @@
+hello, world! next year you'll be 8
+point: (3, 4), doubled x: 6
+scores: [10, 20, 30], first: 10, count: 3
+counts: {"a": 1, "b": 2}, a: 1
+favorite color: Green
+literal dollar-brace: ${not_interpolated} and a lone $sign
+nested: inner(7)
+no interpolation here at all

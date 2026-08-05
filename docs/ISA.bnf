@@ -1979,3 +1979,96 @@
    mutable than it already is, or introduces a value kind this language
    doesn't already have.
    ========================================================================== *)
+
+
+(* --------------------------------------------------------------------------
+   23. STRING INTERPOLATION (TO_STRING — one new opcode, no new value kind;
+       GRAMMAR.bnf design note 3ae)
+   -------------------------------------------------------------------------- *)
+
+   TO_STRING              ( v -- string )     pops v, decrefs it, pushes a
+                                               FRESH heap STRING of its
+                                               rendering — exactly PRINT's
+                                               own rendering (`Value.print`,
+                                               section 3's PRINT entry), NOT
+                                               JSON_STRINGIFY's: a `list`/
+                                               `map` renders bracketed and
+                                               comma-separated with quoted
+                                               string elements (matching
+                                               `print [1, "a"]`, not JSON
+                                               specifically, though the two
+                                               happen to coincide for plain
+                                               scalars); an enum value
+                                               renders as its bare variant
+                                               name; a stream renders as
+                                               `<stdout>`/`<file N>`. Unlike
+                                               JSON_STRINGIFY, TO_STRING has
+                                               NO failure mode beyond OOM —
+                                               `Value.print` already handles
+                                               every value kind (that's what
+                                               PRINT itself relies on), so
+                                               there is nothing for TO_STRING
+                                               to reject.
+
+   No operand: like JSON_STRINGIFY, the value to render is an ordinary
+   popped `Value`, not a compile-time constant.
+
+   INTERP_CONCAT #n        ( v1 .. vn -- string )
+                                               pops n values (each must be
+                                               string-shaped —
+                                               `RuntimeError.TypeMismatch`
+                                               otherwise, defense in depth:
+                                               compiled code only ever pushes
+                                               a string constant or a
+                                               TO_STRING result here), in the
+                                               order they were pushed
+                                               (`v1` first/leftmost). Two
+                                               passes, exactly like JOIN
+                                               (section 22) minus the
+                                               separator: the first measures
+                                               the exact total output length,
+                                               the second copies each
+                                               piece's bytes, in order, into
+                                               one buffer allocated to
+                                               exactly that size. Pushes the
+                                               result as a fresh STRING.
+
+   #n IS A COMPILE-TIME CONSTANT, LIKE MAKE_LIST/MAKE_MAP's OWN COUNT
+   OPERAND (section 11) — NOT A RUNTIME LIST THE WAY JOIN'S OWN OPERAND IS.
+   This is what makes a single count-operand opcode possible at all here:
+   the compiler already knows, from the source text alone, exactly how many
+   PUSH_CONST/TO_STRING instructions it just emitted for a given
+   interpolated string, the same way it already knows an array-literal's
+   element count for MAKE_LIST's own operand.
+
+   WHAT `"...${expr}..."` COMPILES TO. A STRING literal containing one or
+   more `${...}` interpolations (GRAMMAR.bnf design note 3ae) is split at
+   PARSE time into an alternating sequence of literal-text and expression
+   parts; COMPILE time lowers that sequence to one PUSH_CONST per literal
+   part (skipping an empty one — the common case of an interpolation glued
+   directly to a quote or to another `${...}`) and one
+   compile-the-expression-then-TO_STRING per expression part, followed by
+   one INTERP_CONCAT naming the total piece count — UNLESS exactly one
+   piece survives (`"${x}"` alone), in which case INTERP_CONCAT is skipped
+   entirely, since there is nothing to concatenate a single piece with.
+   `"a: ${x}, b: ${y}"` with `x`/`y` both already `string`-shaped still runs
+   TO_STRING on each — TO_STRING on an already-STRING value is the identity
+   rendering (`Value.print`'s `.string` arm, unquoted at top level), so this
+   never double-renders or corrupts a string that was already one.
+
+   NO NEW VALUE KIND, THE SAME STANCE JOIN (section 22) AND THE FOR-LOOP
+   (section 7) ALREADY TAKE — still an ordinary heap STRING, built by a
+   measure-then-copy-once pass exactly like JOIN's own.
+
+   ONE ALLOCATION, NOT A CHAIN OF THEM — THE SAME REASON JOIN EXISTS OVER A
+   RUNTIME LOOP OF ADD (section 22's own design note). Compiling
+   interpolation as sugar for a chain of ADD (section 3) was considered and
+   rejected: each ADD allocates a fresh copy of BOTH operands, so a chain of
+   many interpolated parts would re-copy the accumulated prefix every
+   time — O(n^2) total bytes copied for a template with many pieces, the
+   exact growth JOIN itself exists to avoid. INTERP_CONCAT's own two-pass
+   shape is O(n) instead, for the same reason JOIN's is: the piece count
+   is known up front (here, at COMPILE time, from the source text itself,
+   rather than JOIN's own runtime list length), so one exactly-sized
+   allocation replaces what would otherwise be n-1 growing, re-copied ones.
+   ========================================================================== *)

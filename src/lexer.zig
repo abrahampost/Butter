@@ -290,23 +290,78 @@ pub const Lexer = struct {
     /// escaped quote must not end the string early, and a `\\` immediately
     /// before a real closing `"` must not be misread as `\"`.
     fn string(self: *Lexer) Error!Token {
-        while (!self.isAtEnd() and self.peek() != '"') {
-            if (self.peek() == '\\') {
-                _ = self.advance(); // consume '\'
-                if (self.isAtEnd()) break; // reported as UnterminatedString below
-                switch (self.peek()) {
-                    'n', 't', '\\', '"' => _ = self.advance(),
-                    else => return self.fail(Error.InvalidEscapeSequence, "invalid escape sequence (only \\n, \\t, \\\\, \\\" are supported)"),
+        try self.scanStringBody();
+        return self.makeToken(.string);
+    }
+
+    /// Scans a string's body — the caller has already consumed its opening
+    /// '"' — through and including its closing '"'. Tracks whether the scan
+    /// is currently inside a `${...}` interpolation (GRAMMAR.bnf design note
+    /// 3ae) via `interp_depth`, purely to know where the string itself ends:
+    /// an unescaped `${` at depth 0 opens one, nested `{`/`}` (e.g. a map
+    /// literal inside it) nest, and a `"` encountered while
+    /// `interp_depth > 0` consumes its own opening quote and RECURSES into
+    /// this same method for a nested string literal — which may itself
+    /// contain further interpolation, nested to any depth
+    /// (`${ "${ "${x}" } " }"`, ...), rather than ending the outer string
+    /// early. `parser.zig`'s `findInterpEnd`/`skipNestedString` mirror this
+    /// exact recursive structure to actually split the raw text back into
+    /// literal/interpolation parts once the lexer is done; this method never
+    /// interprets what's inside a `${...}`, only where it ends.
+    fn scanStringBody(self: *Lexer) Error!void {
+        var interp_depth: usize = 0;
+        while (!self.isAtEnd() and (interp_depth > 0 or self.peek() != '"')) {
+            if (interp_depth == 0) {
+                if (self.peek() == '\\') {
+                    _ = self.advance(); // consume '\'
+                    if (self.isAtEnd()) break; // reported as UnterminatedString below
+                    switch (self.peek()) {
+                        'n', 't', '\\', '"', '$' => _ = self.advance(),
+                        else => return self.fail(Error.InvalidEscapeSequence, "invalid escape sequence (only \\n, \\t, \\\\, \\\", \\$ are supported)"),
+                    }
+                    continue;
                 }
-            } else {
+                if (self.peek() == '$' and self.peekNext() == '{') {
+                    _ = self.advance(); // '$'
+                    _ = self.advance(); // '{'
+                    interp_depth = 1;
+                    continue;
+                }
                 _ = self.advance();
+                continue;
+            }
+
+            // interp_depth > 0: scanning raw interpolation-expression text,
+            // just far enough to find where it ends. A bare '\' here has no
+            // special meaning at this level — it's ordinary expression text
+            // (Butter itself has no backslash syntax), left for the
+            // re-lex/parse of this segment (parser.zig) to reject on its own
+            // if it's actually invalid.
+            switch (self.peek()) {
+                '{' => {
+                    interp_depth += 1;
+                    _ = self.advance();
+                },
+                '}' => {
+                    interp_depth -= 1;
+                    _ = self.advance();
+                },
+                '"' => {
+                    _ = self.advance(); // nested string's own opening '"'
+                    try self.scanStringBody(); // recurse — consumes through its closing '"'
+                },
+                else => _ = self.advance(),
             }
         }
 
-        if (self.isAtEnd()) return self.fail(Error.UnterminatedString, "unterminated string literal");
+        if (self.isAtEnd()) {
+            return self.fail(Error.UnterminatedString, if (interp_depth > 0)
+                "unterminated string interpolation (missing '}')"
+            else
+                "unterminated string literal");
+        }
 
         _ = self.advance(); // consume closing '"'
-        return self.makeToken(.string);
     }
 
     /// Scans and returns the next token. Returns a `.eof` token forever
@@ -482,6 +537,85 @@ test "\\n, \\t, \\\\, and \\\" all scan as part of the same string token" {
     try std.testing.expectEqualStrings(
         \\"\n\t\\\""
     , tok.lexeme);
+}
+
+test "\\$ is recognized as a fifth escape sequence (design note 3ae)" {
+    var lexer = Lexer.init(
+        \\"\$"
+    );
+    const tok = try lexer.next();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings(
+        \\"\$"
+    , tok.lexeme);
+}
+
+test "a lone '$' not followed by '{' is ordinary text, not an escape or interpolation" {
+    var lexer = Lexer.init(
+        \\"$5 $ ${x}"
+    );
+    const tok = try lexer.next();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings(
+        \\"$5 $ ${x}"
+    , tok.lexeme);
+}
+
+test "'${...}' interpolation scans as part of the same string token" {
+    var lexer = Lexer.init(
+        \\"hello ${name}!"
+    );
+    const tok = try lexer.next();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings(
+        \\"hello ${name}!"
+    , tok.lexeme);
+}
+
+test "nested '{'/'}' inside an interpolation (a map literal) still nest correctly" {
+    var lexer = Lexer.init(
+        \\"${ {"a": 1}["a"] }"
+    );
+    const tok = try lexer.next();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings(
+        \\"${ {"a": 1}["a"] }"
+    , tok.lexeme);
+}
+
+test "a '}' that closes the interpolation does not end the string early" {
+    var lexer = Lexer.init(
+        \\"${x} and ${y}"
+    );
+    const tok = try lexer.next();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings(
+        \\"${x} and ${y}"
+    , tok.lexeme);
+}
+
+test "a nested string literal inside an interpolation does not end the outer string" {
+    var lexer = Lexer.init(
+        \\"${a + "}"} tail"
+    );
+    const tok = try lexer.next();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings(
+        \\"${a + "}"} tail"
+    , tok.lexeme);
+}
+
+test "an unterminated interpolation is a distinct diagnostic message" {
+    var lexer = Lexer.init("\"${x");
+    try std.testing.expectError(Error.UnterminatedString, lexer.next());
+    try std.testing.expect(std.mem.indexOf(u8, lexer.diagnostic.?.message, "interpolation") != null);
+}
+
+test "an unterminated nested string inside an interpolation is an error" {
+    var lexer = Lexer.init(
+        \\"${"
+    );
+    try std.testing.expectError(Error.UnterminatedString, lexer.next());
 }
 
 test "keywords are recognized distinctly from identifiers" {

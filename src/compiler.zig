@@ -1044,6 +1044,7 @@ pub const Compiler = struct {
             .random_range => StaticType{ .scalar = .int },
             .char_ord => StaticType{ .scalar = .int },
             .list_join => StaticType{ .scalar = .string },
+            .string_interp => StaticType{ .scalar = .string },
         };
     }
 
@@ -1646,7 +1647,45 @@ pub const Compiler = struct {
                 try self.compileExpr(r.end);
                 _ = try self.chunk.emit(self.allocator, .random_range);
             },
+            .string_interp => |parts| try self.compileStringInterp(parts),
         }
+    }
+
+    /// Desugars `"literal ${expr} literal"` (GRAMMAR.bnf design note 3ae)
+    /// into PUSH_CONST/TO_STRING per part followed by one INTERP_CONCAT
+    /// (ISA.bnf section 23) — no new heap value kind (still just ordinary
+    /// heap strings, same as `join`), but ONE allocation for the whole
+    /// result rather than a chain of ADDs that would re-copy the growing
+    /// prefix at every step (the same O(n^2) shape `join`'s own design note,
+    /// GRAMMAR.bnf design note 3ac, calls out for a RUNTIME loop of
+    /// concatenation — avoidable here too, since the piece count is fixed at
+    /// COMPILE time, exactly like MAKE_LIST/MAKE_MAP's own count operand).
+    ///
+    /// An empty literal part (the common case of an interpolation glued
+    /// directly to the opening/closing quote, or to another `${...}`) is
+    /// skipped rather than pushed — `parts` always has at least one `.expr`
+    /// part (that's the only reason this node exists at all), so `count` is
+    /// always at least 1. Exactly one surviving part (`"${x}"` alone, with
+    /// nothing but empty literal parts around it) skips INTERP_CONCAT
+    /// entirely — that one part's own value is already the whole result, so
+    /// there's nothing to concatenate it with.
+    fn compileStringInterp(self: *Compiler, parts: []ast.Expr.InterpPart) CompileError!void {
+        var count: u32 = 0;
+        for (parts) |part| {
+            switch (part) {
+                .literal => |s| {
+                    if (s.len == 0) continue;
+                    const idx = try self.chunk.addConstant(self.allocator, try Value.newString(self.allocator, s));
+                    _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
+                },
+                .expr => |e| {
+                    try self.compileExpr(e);
+                    _ = try self.chunk.emit(self.allocator, .to_string);
+                },
+            }
+            count += 1;
+        }
+        if (count > 1) _ = try self.chunk.emitWithOperand(self.allocator, .interp_concat, count);
     }
 
     /// Calls resolve against the function table built in `compileModules`'s
@@ -5662,4 +5701,144 @@ test "a function value prints as <func name> and compares equal only to itself" 
         \\print f == square
     , &buf);
     try std.testing.expectEqualStrings("<func square>\ntrue\n", output);
+}
+
+// ---- String interpolation (GRAMMAR.bnf design note 3ae) -------------------
+
+test "a string with no interpolation compiles and runs exactly as before" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator, "print \"hello, world\"\n", &buf);
+    try std.testing.expectEqualStrings("hello, world\n", output);
+}
+
+test "interpolates a variable into a string" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\string name := "world"
+        \\print "hello, ${name}!"
+    , &buf);
+    try std.testing.expectEqualStrings("hello, world!\n", output);
+}
+
+test "interpolates an arbitrary expression, not just a bare variable" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int age := 7
+        \\print "next year: ${age + 1}"
+    , &buf);
+    try std.testing.expectEqualStrings("next year: 8\n", output);
+}
+
+test "every non-string value kind renders the same way print/write would" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int n := 42
+        \\float f := 3.5
+        \\bool b := true
+        \\list xs := [1, 2]
+        \\map m := {"a": 1}
+        \\print "${n} ${f} ${b} ${xs} ${m}"
+    , &buf);
+    try std.testing.expectEqualStrings("42 3.5 true [1, 2] {\"a\": 1}\n", output);
+}
+
+test "an enum value interpolates as its bare variant name" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\enum Color { Red, Green }
+        \\print "color: ${Color.Red}"
+    , &buf);
+    try std.testing.expectEqualStrings("color: Red\n", output);
+}
+
+test "multiple interpolations in one string, in order" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int a := 2
+        \\int b := 3
+        \\print "${a} + ${b} = ${a + b}"
+    , &buf);
+    try std.testing.expectEqualStrings("2 + 3 = 5\n", output);
+}
+
+test "a call, indexing, and struct field access all work inside an interpolation" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\func double(int n) -> int { return n * 2 }
+        \\list xs := [10, 20]
+        \\Point p := Point{x: 1, y: 2}
+        \\print "${double(4)} ${xs[1]} ${p.x}"
+    , &buf);
+    try std.testing.expectEqualStrings("8 20 1\n", output);
+}
+
+test "a map index using a string key works inside an interpolation despite the nested quotes" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\map m := {"a": 1}
+        \\print "value: ${m["a"]}"
+    , &buf);
+    try std.testing.expectEqualStrings("value: 1\n", output);
+}
+
+test "'\\$' escapes a literal '$', suppressing interpolation" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\print "\${not_interpolated} and \$5"
+    , &buf);
+    try std.testing.expectEqualStrings("${not_interpolated} and $5\n", output);
+}
+
+test "interpolation nests — a string literal inside '${...}' may itself interpolate" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\string x := "deep"
+        \\print "${ "inner: ${x}" }"
+    , &buf);
+    try std.testing.expectEqualStrings("inner: deep\n", output);
+}
+
+test "an interpolated string's static type is string, usable to initialize a string local" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int n := 5
+        \\string s := "n is ${n}"
+        \\print s
+    , &buf);
+    try std.testing.expectEqualStrings("n is 5\n", output);
+}
+
+test "an interpolated string's static type is checked against the declared type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int n := \"${1}\"\n", SemanticError.TypeMismatch);
+}
+
+test "an interpolated string composes with '+' like any other string" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int n := 1
+        \\print "a: " + "${n}" + " b"
+    , &buf);
+    try std.testing.expectEqualStrings("a: 1 b\n", output);
+}
+
+test "a syntax error inside '${...}' is a compile error" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(parser_mod.SyntaxError.UnexpectedToken, runProgram(allocator,
+        \\print "bad: ${1 +}"
+    , &buf));
 }

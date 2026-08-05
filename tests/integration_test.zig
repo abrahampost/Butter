@@ -341,6 +341,10 @@ test "callback: a named function passed as a value, through both a parameter and
     try expectCaseOutput("callback");
 }
 
+test "string_interpolation: ${expr} spliced into string literals, incl. structs, enums, maps, and nesting" {
+    try expectCaseOutput("string_interpolation");
+}
+
 test "args: the bare 'args' keyword sees the host's argv, in order" {
     try expectCaseOutputWithArgs("args", &.{ "alpha", "beta", "gamma" });
 }

@@ -28,8 +28,14 @@
 IDENTIFIER   ::= <alpha> { <alphanum> }
 INT          ::= <digit> { <digit> }
 FLOAT        ::= <digit> { <digit> } '.' <digit> { <digit> }
-STRING       ::= '"' { <escape> | any character except '"' or '\' } '"'
-<escape>     ::= '\' ( 'n' | 't' | '\' | '"' )
+STRING       ::= '"' { <escape> | <interp> | any character except '"', '\', or '$' } '"'
+<escape>     ::= '\' ( 'n' | 't' | '\' | '"' | '$' )
+(* `<interp>` (design note 3ae) is an unescaped '$' immediately followed by
+   '{', then any sequence of characters/nested STRINGs/nested <interp>s with
+   balanced '{'/'}', up to the first '}' that brings the brace count back to
+   the level it was at when this '$' '{' was seen — see the design note for
+   the full recursive shape. A bare '$' not immediately followed by '{' is
+   just an ordinary character, not part of any production above. *)
 NEWLINE      ::= '\n'
 EOF          ::= (* end of input *)
 
@@ -60,10 +66,15 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    access / enum variant reference, design notes 3z/3aa) exactly like ':'
    already does; '..' is still its own two-character token, checked first,
    so a single '.' never gets confused with it. ':=' is its own two-
-   character token. STRING supports exactly four escape sequences — `\n`,
-   `\t`, `\\`, `\"` (design note 3s) — decoded when the token's contents are
-   read; any other character following a `\` is a lexer error, and `\"`
-   does not end the string early. *)
+   character token. STRING supports exactly five escape sequences — `\n`,
+   `\t`, `\\`, `\"`, `\$` (design notes 3s, 3ae) — decoded when the token's
+   contents are read; any other character following a `\` is a lexer error,
+   and `\"`/`\$` do not end the string or open an interpolation,
+   respectively. STRING also recognizes `${...}` interpolation (design note
+   3ae) — tracked by the lexer only far enough to know where the token
+   itself ends (nested `{`/`}` nest, a nested `"..."` may itself interpolate,
+   to any depth); parsing what's actually inside one happens later, in
+   parser.zig. *)
 
 
 (* --------------------------------------------------------------------------
@@ -643,6 +654,92 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      string owns freshly copied bytes, independent of `list`'s own storage,
      the same independence `MAP_KEYS` already gives its returned list
      versus the map it read from. *)
+
+(* --- String interpolation: "...${expr}..." (design note 3ae) ---
+   - A `${` inside a STRING literal that isn't escaped (`\$`, immediately
+     below) opens an INTERPOLATION: everything up to the matching `}` is
+     parsed as an ordinary `<expression>` — any production this grammar
+     allows anywhere else (a call, indexing, a struct/enum reference, an
+     arithmetic or logical expression, another string literal with its own
+     interpolation, ...) — and its value is rendered and spliced into the
+     surrounding text at that point. `"hello, ${name}!"` is the motivating
+     case: string-building without reaching for `+`/`join` for the common
+     "some literal text around a few values" shape.
+   - DELIMITED BY `${`/`}`, NOT A BARE `{name}`. Two reasons: a bare `{`/`}`
+     is already ordinary, unescaped text in every STRING literal written
+     before this feature existed (nothing in this codebase's examples/tests
+     used one), so making `{`/`}` alone significant would silently change
+     what those already meant; `${` is a two-character sequence that did not
+     appear anywhere in this codebase before this feature either, so
+     choosing it introduces no such hazard. A lone `$` not immediately
+     followed by `{` is simply ordinary text — no escaping needed for `$` by
+     itself, only for a literal `${` (below).
+   - `\$` IS A FIFTH ESCAPE SEQUENCE, extending design note 3s's four
+     (`\n`/`\t`/`\\`/`\"`) — the same reasoning that motivated `\"` (`"`
+     needs an escape or there'd be no way to put one inside a string at all)
+     applies to `${`: without `\$`, there would be no way to write the two
+     literal characters `$` then `{` next to each other in a string without
+     it being read as an interpolation. `\$` decodes to a lone `$`, which is
+     never itself special (only the un-escaped two-character sequence `${`
+     is), so escaping just the `$` is enough to suppress it.
+   - AN EXPRESSION, NOT JUST A NAME. `${expr}` accepts anything
+     `<expression>` does — `${a + b}`, `${xs[i]}`, `${p.field}`,
+     `${f(x)}`, `${m["k"]}`, `${Color.Red}` — because it compiles to one
+     (`compiler.zig`'s `compileStringInterp`), not a restricted
+     "interpolate a variable name" mini-grammar of its own.
+   - NON-STRING VALUES RENDER THE WAY `print`/`write` ALREADY DO
+     (`Value.print`, ISA.bnf section 23's TO_STRING), not the way
+     `stringify` does: `${42}` is `42`, `${true}` is `true`, `${xs}` for a
+     `list` is `[1, 2]` (bracketed, comma-separated, matching `print`), and
+     an enum value or a stream renders exactly as `print` would too — TO_STRING
+     has no failure mode beyond OOM, unlike `stringify`, which refuses a
+     stream/array-reference/enum/function value outright (JSON has no shape
+     for those). Choosing `print`'s rendering over `stringify`'s is exactly
+     why: interpolation is for building human-facing text, the same
+     audience `print` already targets, not machine-readable JSON.
+   - RECURSES TO ANY DEPTH. A string literal nested inside `${...}` is an
+     ordinary STRING in every sense, including its own right to contain
+     `${...}` — `"${ "inner: ${x}" }"` interpolates `x` inside the nested
+     string first, then splices that whole rendered string into the outer
+     one. This falls out for free from how it's implemented (below), not
+     from any special-cased handling of nesting.
+   - DESUGARS TO PUSH_CONST/TO_STRING/INTERP_CONCAT — NO NEW HEAP VALUE
+     KIND, THE SAME STANCE `join` ALREADY TAKES, BUT NOT VIA `join` ITSELF.
+     `compiler.zig` splits a STRING token's raw contents into an alternating
+     sequence of literal-text and `${...}`-expression parts at PARSE time
+     (mirroring design note 3s's own "decoding happens once the surrounding
+     quotes are stripped" stance — the lexer only tracks enough nesting to
+     know where the STRING token itself ends, GRAMMAR.bnf's lexical grammar
+     note above; splitting the content is the parser's job), then compiles
+     that sequence into ordinary PUSH_CONST (literal parts) and
+     compile-then-TO_STRING (expression parts) instructions, followed by ONE
+     INTERP_CONCAT (ISA.bnf section 23) naming exactly how many pieces it
+     just pushed — the same "count is a compile-time-known operand" shape
+     MAKE_LIST/MAKE_MAP already use, not `join`'s own two-argument
+     (list, separator) shape, since there's no separator here and the piece
+     count is fixed at compile time rather than discovered by measuring a
+     runtime list. An interpolation reduced to exactly one surviving part
+     (`"${x}"` alone) skips INTERP_CONCAT entirely — nothing to concatenate
+     a single piece with.
+   - ONE ALLOCATION, NOT A CHAIN OF THEM — THE SAME REASON `join` EXISTS
+     OVER A RUNTIME LOOP OF `+` (above). INTERP_CONCAT measures every
+     piece's length in one pass and copies into one exactly-sized buffer in
+     a second, exactly like JOIN's own two-pass shape (ISA.bnf section 23) —
+     it does NOT compile to a chain of ADD, which would reallocate and
+     re-copy the growing prefix at every step (O(n^2) total bytes copied for
+     a template with many pieces, the exact growth `join`'s own design note
+     calls out). The number of pieces being fixed at compile time (as
+     opposed to `join`'s runtime-sized list) is what makes a single
+     count-operand opcode possible here at all, the same way MAKE_LIST's own
+     `#n` operand is possible only because the compiler already knows
+     exactly how many values it just pushed.
+   - A SYNTAX ERROR INSIDE `${...}` (`${1 +}`, trailing tokens like `${1 2}`,
+     ...) is a compile-time `SyntaxError.UnexpectedToken`, reported at the
+     position of the WHOLE STRING LITERAL, not an exact offset inside
+     `${...}` — the inner text is re-lexed independently (its own line/
+     column count restarts at 1), and a string literal may itself already
+     span multiple source lines, so rebasing a precise inner position against
+     the real file is out of scope for this pass. *)
 
 (* --- Program arguments ---
    - `args` is a bare keyword, like `stdin`/`stdout`/`stderr`, but unlike

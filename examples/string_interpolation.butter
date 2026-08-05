@@ -1,0 +1,25 @@
+struct Point {
+    int x
+    int y
+}
+
+enum Color { Red, Green, Blue }
+
+func double(int n) -> int {
+    return n * 2
+}
+
+string name := "world"
+int age := 7
+Point p := Point{x: 3, y: 4}
+list scores := [10, 20, 30]
+map counts := {"a": 1, "b": 2}
+
+print "hello, ${name}! next year you'll be ${age + 1}"
+print "point: (${p.x}, ${p.y}), doubled x: ${double(p.x)}"
+print "scores: ${scores}, first: ${scores[0]}, count: ${len(scores)}"
+print "counts: ${counts}, a: ${counts["a"]}"
+print "favorite color: ${Color.Green}"
+print "literal dollar-brace: \${not_interpolated} and a lone \$sign"
+print "nested: ${ "inner(${age})" }"
+print "no interpolation here at all"
