@@ -240,11 +240,25 @@ pub fn unpackIndexOperand(operand: u32) IndexOperand {
 pub const Chunk = struct {
     code: std.ArrayList(Instruction) = .empty,
     constants: std.ArrayList(Value) = .empty,
+    /// One entry per `code` instruction, in lockstep — the source line it was
+    /// compiled from. Used to prefix an uncaught runtime error with `at line
+    /// N`, the same way a compile error already is (main.zig). Populated by
+    /// `emit`/`emitWithOperand` from `current_line`, below; a `Chunk` built
+    /// by hand (as most of this file's and vm.zig's own tests do, never
+    /// touching `current_line`) simply leaves every entry at 0, which
+    /// `Vm.run` treats as "no line info available" rather than a real line.
+    lines: std.ArrayList(u32) = .empty,
+    /// The line to stamp onto the NEXT instruction `emit`/`emitWithOperand`
+    /// appends. The compiler sets this to the current statement's line
+    /// (`Compiler.compileStmt`) before compiling it, mirroring
+    /// `Compiler.current_line` itself; nothing here advances it on its own.
+    current_line: u32 = 0,
 
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
         for (self.constants.items) |v| v.decref(allocator);
         self.code.deinit(allocator);
         self.constants.deinit(allocator);
+        self.lines.deinit(allocator);
     }
 
     pub fn emit(self: *Chunk, allocator: std.mem.Allocator, op: OpCode) !usize {
@@ -256,7 +270,19 @@ pub const Chunk = struct {
     pub fn emitWithOperand(self: *Chunk, allocator: std.mem.Allocator, op: OpCode, operand: u32) !usize {
         const index = self.code.items.len;
         try self.code.append(allocator, .{ .op = op, .operand = operand });
+        try self.lines.append(allocator, self.current_line);
         return index;
+    }
+
+    /// The source line the instruction at `ip` was compiled from, or `null`
+    /// if none is recorded (an out-of-range `ip`, or a hand-built `Chunk`
+    /// that never set `current_line`). `Vm.run` calls this with the index of
+    /// the instruction that just failed to turn an uncaught runtime error
+    /// into a "line N" diagnostic.
+    pub fn lineAt(self: *const Chunk, ip: usize) ?u32 {
+        if (ip >= self.lines.items.len) return null;
+        const line = self.lines.items[ip];
+        return if (line == 0) null else line;
     }
 
     /// Returns the new constant's pool index, for use as a PUSH_CONST operand.

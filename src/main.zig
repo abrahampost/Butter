@@ -187,12 +187,24 @@ pub fn main(init: std.process.Init) !void {
         stderr_writer.flush() catch {};
         if (vm.diagnostic) |diag| {
             if (diag.path.len > 0) {
-                std.debug.print("runtime error: {s} '{s}': {s}\n", .{ diag.operation, diag.path, diag.cause });
+                if (vm.line) |line| {
+                    std.debug.print("runtime error at line {d}: {s} '{s}': {s}\n", .{ line, diag.operation, diag.path, diag.cause });
+                } else {
+                    std.debug.print("runtime error: {s} '{s}': {s}\n", .{ diag.operation, diag.path, diag.cause });
+                }
             } else {
-                std.debug.print("runtime error: {s}: {s}\n", .{ diag.operation, diag.cause });
+                if (vm.line) |line| {
+                    std.debug.print("runtime error at line {d}: {s}: {s}\n", .{ line, diag.operation, diag.cause });
+                } else {
+                    std.debug.print("runtime error: {s}: {s}\n", .{ diag.operation, diag.cause });
+                }
             }
         } else {
-            std.debug.print("runtime error: {s}\n", .{@errorName(err)});
+            if (vm.line) |line| {
+                std.debug.print("runtime error at line {d}: {s}\n", .{ line, @errorName(err) });
+            } else {
+                std.debug.print("runtime error: {s}\n", .{@errorName(err)});
+            }
         }
         std.process.exit(1);
     };

@@ -392,6 +392,14 @@ pub const Vm = struct {
     /// Detail for the last file error raised, since a Zig error value can't
     /// carry a payload. Set only on the errors documented to have one.
     diagnostic: ?Diagnostic = null,
+    /// The source line the last UNCAUGHT runtime error happened on, if the
+    /// failing instruction's chunk had line info recorded (`Chunk.lineAt`).
+    /// Set in `run`'s own catch, right before an error that no `try` block
+    /// intercepts propagates out of it — never for one a handler catches,
+    /// since that error doesn't reach the embedder at all. `null` after a
+    /// successful run, and after a hand-built `Chunk` (most unit tests)
+    /// whose instructions were never stamped with a real line.
+    line: ?u32 = null,
     /// Set by EXIT just before it returns from `run` (a normal, non-error
     /// return — `exit(0)` is not a failure). `null` after a run that ended
     /// via HALT (falling off the end) instead, which the embedder should
@@ -1168,7 +1176,15 @@ pub const Vm = struct {
         var exec: Exec = .{ .program = program, .chunk = &program.main };
         while (true) {
             const flow = self.step(&exec, host) catch |err| flow: {
-                if (!catchable(err) or exec.handler_count == 0) return err;
+                if (!catchable(err) or exec.handler_count == 0) {
+                    // `exec.ip` was already advanced past the failing
+                    // instruction at the top of `step`, before it did
+                    // anything fallible — so `ip - 1` names it. (`ip` can't
+                    // be 0 here: `step` always increments it before its
+                    // first `try`.)
+                    self.line = exec.chunk.lineAt(exec.ip - 1);
+                    return err;
+                }
                 try self.unwindToHandler(&exec, err);
                 break :flow .running;
             };

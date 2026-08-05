@@ -1146,6 +1146,7 @@ pub const Compiler = struct {
 
     fn compileStmt(self: *Compiler, stmt: *const ast.Stmt) CompileError!void {
         self.current_line = stmt.line;
+        self.chunk.current_line = @intCast(stmt.line);
         switch (stmt.kind) {
             .var_decl => |d| try self.compileVarDecl(d),
             .block => |stmts| try self.compileBlock(stmts),
