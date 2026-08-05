@@ -111,16 +111,19 @@ exercising embedded newlines and tabs end to end.
 ### 9. Error recovery (try/catch or Result-style handling) — DONE
 `try <block> catch IDENTIFIER <block>` (GRAMMAR.bnf design note 3u) traps a
 runtime error raised anywhere inside its body — at any depth, including
-several call frames deep — and binds a fresh `map` describing it, with four
-always-present keys: `error` (the `RuntimeError` tag name, the stable thing
-to branch on), `message`, `operation`, and `path`. The alternatives weighed
-and rejected, and why, are in `DESIGN-error-recovery.md`, the design spike
-this task asked for.
+several call frames deep — and binds a fresh instance of the built-in
+`Error` struct describing it, with four always-present fields: `error` (the
+`RuntimeError` tag name, the stable thing to branch on), `message`,
+`operation`, and `path`. Originally a `map` (design note 3t at the time);
+switched to a struct once structs existed (design note 3z), so a typo'd
+field name is `SemanticError.UnknownField` at compile time instead of a
+runtime `KeyNotFound`. The alternatives weighed and rejected, and why, are
+in `DESIGN-error-recovery.md`, the design spike this task asked for.
 
 19 of the 23 `RuntimeError` variants are catchable; `StackOverflow`,
 `StackUnderflow`, `CallStackOverflow` and `HandlerStackOverflow` are not
 (VM-integrity failures — running a handler needs the stack room that just
-ran out), nor is `error.OutOfMemory` (building the error map allocates).
+ran out), nor is `error.OutOfMemory` (building the error struct allocates).
 Two new opcodes, `PUSH_HANDLER`/`POP_HANDLER` (ISA.bnf section 14), over a
 64-entry handler table beside the call frames; `RET` drops the departing
 frame's handlers, which covers every way out of a frame by construction.

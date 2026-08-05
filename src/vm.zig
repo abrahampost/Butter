@@ -1212,7 +1212,7 @@ pub const Vm = struct {
             // catch block needs the very room these report having run out
             // of. `error.OutOfMemory` and any host I/O failure fall in the
             // same bucket via the `else` below — the first because building
-            // the error map allocates, so a handler for it could not run.
+            // the error struct allocates, so a handler for it could not run.
             error.StackOverflow,
             error.StackUnderflow,
             error.CallStackOverflow,
@@ -1224,9 +1224,9 @@ pub const Vm = struct {
     }
 
     /// Abandons whatever the innermost `try` block was doing and resumes at
-    /// its catch block, with the error map (see `errorValue`) pushed where
-    /// the catch block expects its binding. The caller has already checked
-    /// that a handler exists and that `err` is catchable.
+    /// its catch block, with the error struct (see `errorValue`) pushed
+    /// where the catch block expects its binding. The caller has already
+    /// checked that a handler exists and that `err` is catchable.
     ///
     /// Note what is NOT undone: files opened inside the guarded block stay
     /// open (GRAMMAR.bnf design note 3u — a stream can outlive the block
@@ -1255,14 +1255,22 @@ pub const Vm = struct {
         // operation/path detail comes from. If this fails (only OOM can),
         // the error propagates out of `run` with the stack already rewound —
         // harmless, since the errdefer there sweeps whatever is left.
-        const info = try self.errorValue(err);
+        const info = try self.errorValue(err, ex.program);
         self.diagnostic = null;
         try self.push(info);
     }
 
-    /// The `map` a catch block binds: four keys, always all present, so a
-    /// program can read any of them without guarding with `has()` first
-    /// (GRAMMAR.bnf design note 3u).
+    /// `self.types`/`Program.struct_types` index the built-in `Error` type
+    /// (compiler.zig's `Compiler.compileModules` pass 0) always occupies —
+    /// registered first, before any user struct/enum, specifically so this
+    /// stays valid without a runtime name lookup.
+    const error_type_index: u32 = 0;
+
+    /// The struct a catch block binds: four fields, always all present, so
+    /// a program can read any of them with an ordinary `e.field` — no
+    /// runtime lookup, no `RuntimeError.KeyNotFound` the way a bad map key
+    /// would be (GRAMMAR.bnf design note 3u). Field order matches
+    /// `error_type_index`'s registration in compiler.zig exactly.
     ///
     ///   error     - the `RuntimeError` tag name, the stable thing to
     ///               branch on ("KeyNotFound").
@@ -1272,12 +1280,25 @@ pub const Vm = struct {
     ///   operation - what was being attempted ("open"), or "" for the
     ///               errors that carry no `Diagnostic`.
     ///   path      - the file involved, or "" likewise.
-    fn errorValue(self: *Vm, err: anyerror) !Value {
-        const obj = try Object.create(self.allocator, .{ .map = .empty });
+    fn errorValue(self: *Vm, err: anyerror, program: *const chunk_mod.Program) !Value {
+        const st = program.struct_types[error_type_index];
+        const fields = try self.allocator.alloc(Value, st.field_names.len);
+        errdefer self.allocator.free(fields);
+        // Every slot starts as the refcount-free `null_value` so a partial
+        // failure below (only OOM can) leaves `fields` safe to decref via
+        // `result`'s own errdefer — exactly like MAKE_STRUCT never needs to,
+        // since its field values are already fully built on the stack
+        // before it allocates `fields` at all.
+        @memset(fields, .null_value);
+        const obj = try Object.create(self.allocator, .{ .record = .{
+            .type_name = st.type_name,
+            .field_names = st.field_names,
+            .fields = fields,
+        } });
         const result = Value{ .object = obj };
         errdefer result.decref(self.allocator);
 
-        try self.mapSetText(obj, "error", @errorName(err));
+        fields[0] = try Value.newString(self.allocator, @errorName(err));
 
         if (self.diagnostic) |d| {
             const message = if (d.path.len > 0)
@@ -1285,29 +1306,21 @@ pub const Vm = struct {
             else
                 try std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ d.operation, d.cause });
             defer self.allocator.free(message);
-            try self.mapSetText(obj, "message", message);
-            try self.mapSetText(obj, "operation", d.operation);
-            try self.mapSetText(obj, "path", d.path);
+            fields[1] = try Value.newString(self.allocator, message);
+            fields[2] = try Value.newString(self.allocator, d.operation);
+            fields[3] = try Value.newString(self.allocator, d.path);
         } else {
-            try self.mapSetText(obj, "message", @errorName(err));
-            try self.mapSetText(obj, "operation", "");
-            try self.mapSetText(obj, "path", "");
+            fields[1] = try Value.newString(self.allocator, @errorName(err));
+            fields[2] = try Value.newString(self.allocator, "");
+            fields[3] = try Value.newString(self.allocator, "");
         }
         return result;
-    }
-
-    /// Sets `key` to a fresh string copy of `text`. `mapSet` takes over the
-    /// value on success, so the errdefer only covers it failing first.
-    fn mapSetText(self: *Vm, obj: *Object, key: []const u8, text: []const u8) !void {
-        const v = try Value.newString(self.allocator, text);
-        errdefer v.decref(self.allocator);
-        try obj.mapSet(self.allocator, key, v);
     }
 
     /// Sets `key` to a string OBJECT that ADOPTS `owned` — already an
     /// `self.allocator`-owned buffer with nothing else referencing it (as
     /// `std.process.run`'s captured stdout/stderr are, `execProcess`'s only
-    /// caller) — rather than duplicating it the way `mapSetText` does.
+    /// caller) — rather than duplicating it the way `Value.newString` does.
     /// Frees `owned` itself if `Object.create` fails before anything can
     /// take ownership of it; past that point the usual errdefer-on-`mapSet`
     /// failure covers it (`Object.destroy` frees a string payload).
@@ -2078,10 +2091,37 @@ pub const Vm = struct {
     }
 };
 
+/// The `Error` struct type's shape (design note 3u), for hand-assembled
+/// test programs that skip the compiler entirely — the compiler registers
+/// this itself, as `struct_types[0]`, via `Compiler.compileModules`'s pass
+/// 0; a raw `Chunk`/`Program` built directly by a vm.zig test has to supply
+/// the same table by hand so `Vm.errorValue` (also hardcoded to index 0)
+/// has something to index when a test's handler actually catches. Static
+/// (never allocator-owned) — safe only where nothing ever calls
+/// `Program.deinit` on the `Program` it's attached to (`runSource`/
+/// `expectRuntimeError`, neither of which does); a test that builds its own
+/// `Program` and does call `deinit` needs an allocator-owned copy instead
+/// (see the "several frames deep" unwinding test).
+const test_error_struct_types = [_]chunk_mod.StructType{
+    .{ .type_name = "Error", .field_names = &.{ "error", "message", "operation", "path" } },
+};
+
+/// An allocator-owned equivalent of `test_error_struct_types`, for the rare
+/// test that builds its own `Program` (functions of its own, so `Function`
+/// entries need `toOwnedSlice` regardless) AND calls `Program.deinit` on it
+/// — which unconditionally frees `struct_types`/`field_names` too, so a
+/// static table there would be a free of unowned memory.
+fn testErrorStructTypesOwned(allocator: std.mem.Allocator) ![]chunk_mod.StructType {
+    const field_names = try allocator.dupe([]const u8, &.{ "error", "message", "operation", "path" });
+    const types = try allocator.alloc(chunk_mod.StructType, 1);
+    types[0] = .{ .type_name = "Error", .field_names = field_names };
+    return types;
+}
+
 fn runSource(chunk: *const Chunk, buf: []u8) !usize {
     var vm = Vm.init(std.testing.allocator);
     var writer = std.Io.Writer.fixed(buf);
-    const program = chunk_mod.Program{ .main = chunk.*, .functions = &.{} };
+    const program = chunk_mod.Program{ .main = chunk.*, .functions = &.{}, .struct_types = &test_error_struct_types };
     try vm.run(&program, .{ .out = &writer });
     return writer.end;
 }
@@ -2090,7 +2130,7 @@ fn expectRuntimeError(chunk: *const Chunk, expected: RuntimeError) !void {
     var vm = Vm.init(std.testing.allocator);
     var buf: [16]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
-    const program = chunk_mod.Program{ .main = chunk.*, .functions = &.{} };
+    const program = chunk_mod.Program{ .main = chunk.*, .functions = &.{}, .struct_types = &test_error_struct_types };
     try std.testing.expectError(expected, vm.run(&program, .{ .out = &writer }));
 }
 
@@ -4794,7 +4834,7 @@ test "a non-buffer operand is released, not leaked, when read rejects it" {
 //
 //     PUSH_HANDLER catch_target / <guarded> / POP_HANDLER / JUMP end
 //   catch_target:
-//     <catch block, with the error map already pushed as its first local>
+//     <catch block, with the error struct already pushed as its first local>
 //   end:
 
 /// Emits PUSH_HANDLER with a placeholder target, returning its index for
@@ -4814,14 +4854,26 @@ fn closeGuard(chunk: *Chunk, allocator: std.mem.Allocator, push_at: usize) !usiz
     return jump_at;
 }
 
-/// Emits `print <map at `slot`>[key]` — how these tests read the error map
-/// a handler bound, without a DUP opcode to work with: LOAD_LOCAL makes the
-/// extra reference INDEX_GET consumes, leaving the map itself in place.
-fn emitPrintKey(chunk: *Chunk, allocator: std.mem.Allocator, slot: u32, key: []const u8) !void {
+/// The built-in `Error` struct's field order (`Vm.errorValue`,
+/// `test_error_struct_types`) as a name -> FIELD_GET operand map, so these
+/// hand-assembled test chunks can name a field the same way `emitPrintField`'s
+/// callers always have.
+fn errorField(name: []const u8) u32 {
+    if (std.mem.eql(u8, name, "error")) return 0;
+    if (std.mem.eql(u8, name, "message")) return 1;
+    if (std.mem.eql(u8, name, "operation")) return 2;
+    if (std.mem.eql(u8, name, "path")) return 3;
+    unreachable;
+}
+
+/// Emits `print <struct at `slot`>.field` — how these tests read the error
+/// struct a handler bound. Unlike the old map-typed binding's INDEX_GET,
+/// FIELD_GET takes its field as a compile-time operand rather than a
+/// pushed key value; LOAD_LOCAL still makes the extra reference FIELD_GET
+/// consumes, leaving the struct itself in place.
+fn emitPrintField(chunk: *Chunk, allocator: std.mem.Allocator, slot: u32, field: []const u8) !void {
     _ = try chunk.emitWithOperand(allocator, .load_local, slot);
-    const k = try chunk.addConstant(allocator, try Value.newString(allocator, key));
-    _ = try chunk.emitWithOperand(allocator, .push_const, k);
-    _ = try chunk.emit(allocator, .index_get);
+    _ = try chunk.emitWithOperand(allocator, .field_get, errorField(field));
     _ = try chunk.emit(allocator, .print);
 }
 
@@ -4843,7 +4895,7 @@ test "a handler catches a runtime error and resumes at its catch block" {
     try emitDivByZero(&chunk, allocator);
     _ = try chunk.emit(allocator, .print); // never reached
     const jump = try closeGuard(&chunk, allocator, push);
-    try emitPrintKey(&chunk, allocator, 0, "error");
+    try emitPrintField(&chunk, allocator, 0, "error");
     chunk.patchOperand(jump, @intCast(chunk.code.items.len));
     _ = try chunk.emit(allocator, .halt);
 
@@ -4852,7 +4904,7 @@ test "a handler catches a runtime error and resumes at its catch block" {
     try std.testing.expectEqualStrings("DivisionByZero\n", buf[0..len]);
 }
 
-test "the error map describes an error that carries no diagnostic" {
+test "the error struct describes an error that carries no diagnostic" {
     const allocator = std.testing.allocator;
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
@@ -4860,10 +4912,10 @@ test "the error map describes an error that carries no diagnostic" {
     const push = try openGuard(&chunk, allocator);
     try emitDivByZero(&chunk, allocator);
     const jump = try closeGuard(&chunk, allocator, push);
-    try emitPrintKey(&chunk, allocator, 0, "error");
-    try emitPrintKey(&chunk, allocator, 0, "message");
-    try emitPrintKey(&chunk, allocator, 0, "operation");
-    try emitPrintKey(&chunk, allocator, 0, "path");
+    try emitPrintField(&chunk, allocator, 0, "error");
+    try emitPrintField(&chunk, allocator, 0, "message");
+    try emitPrintField(&chunk, allocator, 0, "operation");
+    try emitPrintField(&chunk, allocator, 0, "path");
     chunk.patchOperand(jump, @intCast(chunk.code.items.len));
     _ = try chunk.emit(allocator, .halt);
 
@@ -4874,7 +4926,7 @@ test "the error map describes an error that carries no diagnostic" {
     try std.testing.expectEqualStrings("DivisionByZero\nDivisionByZero\n\n\n", buf[0..len]);
 }
 
-test "the error map carries the operation and path of a file failure" {
+test "the error struct carries the operation and path of a file failure" {
     const allocator = std.testing.allocator;
     var chunk: Chunk = .{};
     defer chunk.deinit(allocator);
@@ -4886,10 +4938,10 @@ test "the error map carries the operation and path of a file failure" {
     _ = try chunk.emitWithOperand(allocator, .push_const, path);
     _ = try chunk.emitWithOperand(allocator, .open, @intFromEnum(value_mod.OpenMode.read));
     const jump = try closeGuard(&chunk, allocator, push);
-    try emitPrintKey(&chunk, allocator, 0, "error");
-    try emitPrintKey(&chunk, allocator, 0, "message");
-    try emitPrintKey(&chunk, allocator, 0, "operation");
-    try emitPrintKey(&chunk, allocator, 0, "path");
+    try emitPrintField(&chunk, allocator, 0, "error");
+    try emitPrintField(&chunk, allocator, 0, "message");
+    try emitPrintField(&chunk, allocator, 0, "operation");
+    try emitPrintField(&chunk, allocator, 0, "path");
     chunk.patchOperand(jump, @intCast(chunk.code.items.len));
     _ = try chunk.emit(allocator, .halt);
 
@@ -4980,7 +5032,7 @@ test "everything the abandoned region pushed is released, not leaked" {
     _ = try chunk.emitWithOperand(allocator, .push_const, b);
     try emitDivByZero(&chunk, allocator);
     const jump = try closeGuard(&chunk, allocator, push);
-    try emitPrintKey(&chunk, allocator, 0, "error");
+    try emitPrintField(&chunk, allocator, 0, "error");
     chunk.patchOperand(jump, @intCast(chunk.code.items.len));
     _ = try chunk.emit(allocator, .halt);
 
@@ -5007,14 +5059,18 @@ test "an error several frames deep unwinds to the handler's own frame" {
     _ = try main_chunk.emitWithOperand(allocator, .call, 1);
     _ = try main_chunk.emit(allocator, .pop);
     const jump = try closeGuard(&main_chunk, allocator, push);
-    try emitPrintKey(&main_chunk, allocator, 0, "error");
+    try emitPrintField(&main_chunk, allocator, 0, "error");
     main_chunk.patchOperand(jump, @intCast(main_chunk.code.items.len));
     _ = try main_chunk.emit(allocator, .halt);
 
     var functions: std.ArrayList(chunk_mod.Function) = .empty;
     try functions.append(allocator, .{ .name = "inner", .arity = 0, .chunk = inner_chunk });
     try functions.append(allocator, .{ .name = "outer", .arity = 0, .chunk = outer_chunk });
-    var program = chunk_mod.Program{ .main = main_chunk, .functions = try functions.toOwnedSlice(allocator) };
+    var program = chunk_mod.Program{
+        .main = main_chunk,
+        .functions = try functions.toOwnedSlice(allocator),
+        .struct_types = try testErrorStructTypesOwned(allocator),
+    };
     defer program.deinit(allocator);
 
     var vm = Vm.init(allocator);
@@ -5032,7 +5088,7 @@ test "returning out of a guarded block takes its handler with it" {
     //
     // The marker print is what gives this test teeth. A stale handler is
     // NOT observable through the error alone: main's failure would resume
-    // in f's dead catch block, whose RET hands the error map back to main
+    // in f's dead catch block, whose RET hands the error struct back to main
     // as if the original call had returned it, and main then reaches the
     // very same division a second time — reporting DivisionByZero either
     // way. Only the catch block having run at all distinguishes them.
@@ -5196,7 +5252,7 @@ test "every RuntimeError variant has the catchability ISA.bnf section 14 documen
     for (catchable_variants) |err| try std.testing.expect(Vm.catchable(err));
     for (uncatchable_variants) |err| try std.testing.expect(!Vm.catchable(err));
 
-    // Not a RuntimeError at all: building the error map allocates, so a
+    // Not a RuntimeError at all: building the error struct allocates, so a
     // handler for this could not run (ISA.bnf section 14).
     try std.testing.expect(!Vm.catchable(error.OutOfMemory));
 }

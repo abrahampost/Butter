@@ -212,9 +212,24 @@ const TypeDecl = struct {
     module: usize,
     exported: bool,
     kind: TypeKind,
+    /// True only for the compiler-synthesized `Error` type (design note 3u)
+    /// registered by `compileModules` before any user module is processed —
+    /// never set by the struct/enum-declaration pre-pass. Unlike a user
+    /// type, it belongs to no module at all, so `typeVisible` grants it
+    /// unconditionally rather than checking `module`/`exported`/imports the
+    /// normal way; nothing else treats this type differently; it goes
+    /// through the same `struct_decl`/field-index machinery as any other.
+    builtin: bool = false,
 };
 
 const CollectionKind = enum { map, list };
+
+/// `self.types`/`Program.struct_types` index the built-in `Error` struct
+/// type (design note 3u) always occupies — `compileModules` registers it
+/// first, before any user struct/enum, specifically so this stays valid.
+/// vm.zig's `errorValue` hardcodes the same index when building a caught
+/// error's runtime record.
+const error_type_index: u32 = 0;
 
 /// A local/parameter's width in stack slots: 1 for a plain scalar OR a
 /// generic array reference (both are exactly one `Value`), `n` for a
@@ -417,6 +432,29 @@ pub const Compiler = struct {
     /// dependency's functions get compiled exactly once here rather than
     /// once per importer.
     pub fn compileModules(self: *Compiler, entry: usize, modules: []const ModuleUnit) CompileError!chunk_mod.Program {
+        // Pass 0: register the built-in `Error` struct type (design note 3u)
+        // — the type `try`/`catch`'s binding is typed as — before any user
+        // struct/enum name, so it always lands at `self.types.items[0]` /
+        // `Program.struct_types[0]`, the fixed index vm.zig's `errorValue`
+        // hardcodes. `builtin = true` is what makes it visible from every
+        // module unconditionally (`typeVisible`), unlike a real declared
+        // type, which only reaches modules that import it. Field order/
+        // names/count must exactly match vm.zig's `errorValue`.
+        const error_fields = try self.allocator.dupe(FieldInfo, &[_]FieldInfo{
+            .{ .name = "error", .type = DeclaredType.builtin(.string) },
+            .{ .name = "message", .type = DeclaredType.builtin(.string) },
+            .{ .name = "operation", .type = DeclaredType.builtin(.string) },
+            .{ .name = "path", .type = DeclaredType.builtin(.string) },
+        });
+        try self.types.append(self.allocator, .{
+            .name = "Error",
+            .module = entry,
+            .exported = true,
+            .builtin = true,
+            .kind = .{ .struct_decl = .{ .fields = error_fields } },
+        });
+        std.debug.assert(self.types.items.len - 1 == @as(usize, error_type_index));
+
         // Pass 0a: collect every struct/enum type's NAME across all modules
         // (GRAMMAR.bnf design notes 3z/3aa) before resolving any of them —
         // this is what lets a struct's field (stage 0b, below), or a
@@ -679,6 +717,7 @@ pub const Compiler = struct {
     /// belongs to that same module (regardless of `exported`), or if it's
     /// `exported` by one of that module's *direct* imports.
     fn typeVisible(self: *const Compiler, decl: TypeDecl) bool {
+        if (decl.builtin) return true;
         if (decl.module == self.current_module) return true;
         if (!decl.exported) return false;
         for (self.visible_imports) |m| {
@@ -1272,16 +1311,19 @@ pub const Compiler = struct {
 
         // The handler's scope, opened by hand rather than via `compileBlock`
         // so the binding can be declared inside it before its statements
-        // are compiled. Typed `map` (design note 3t), so reading a key out
-        // of it is an ordinary — and, like any map element, dynamically
-        // typed — bracket read.
+        // are compiled. Typed as the built-in `Error` struct (design notes
+        // 3t/3u/3z, `Compiler.compileModules`'s pass 0), always registered
+        // at type index 0 — so reading a field out of it (`e.message`) is
+        // an ordinary, compile-time-resolved struct field read, and a
+        // typo'd field name is `SemanticError.UnknownField`, not a runtime
+        // surprise the way a bad map key would be.
         self.scope_depth += 1;
         try self.locals.append(self.allocator, .{
             .name = t.error_var,
             .depth = self.scope_depth,
             .slot = self.next_slot,
-            .collection = .map,
-            .value_type = .map,
+            .value_type = .named,
+            .named_ref = .{ .index = error_type_index, .is_enum = false },
         });
         self.next_slot += 1;
         for (t.handler) |*s| try self.compileStmt(s);
@@ -4089,8 +4131,8 @@ test "exec(...)'s ProcessSpawnFailed is catchable, naming 'exec' as the operatio
         \\try {
         \\    exec("this-program-definitely-does-not-exist-anywhere-42", [])
         \\} catch e {
-        \\    print e["error"]
-        \\    print e["operation"]
+        \\    print e.error
+        \\    print e.operation
         \\}
     , tmp.dir, &out_buf, &err_buf);
     try std.testing.expectEqualStrings("ProcessSpawnFailed\nexec\n", result.out);
@@ -4823,7 +4865,7 @@ test "a try block that completes normally leaves no armed handler behind" {
     try std.testing.expectEqualStrings("ok\n", writer.buffered());
 }
 
-test "the caught error binds a map with all four keys always present" {
+test "the caught error binds a struct with all four fields always present" {
     const allocator = std.testing.allocator;
     var buf: [256]u8 = undefined;
     const output = try runProgram(allocator,
@@ -4831,14 +4873,14 @@ test "the caught error binds a map with all four keys always present" {
         \\try {
         \\    print m["nope"]
         \\} catch e {
-        \\    print e["error"]
-        \\    print e["message"]
-        \\    print "[" + e["operation"] + "]"
-        \\    print "[" + e["path"] + "]"
+        \\    print e.error
+        \\    print e.message
+        \\    print "[" + e.operation + "]"
+        \\    print "[" + e.path + "]"
         \\}
     , &buf);
     // KeyNotFound carries no Diagnostic, so the last two are empty — but
-    // still present, so reading them needs no `has()` guard.
+    // still present, so reading them needs no guard.
     try std.testing.expectEqualStrings("KeyNotFound\nKeyNotFound\n[]\n[]\n", output);
 }
 
@@ -4849,9 +4891,9 @@ test "a diagnostic-carrying error fills in operation" {
         \\try {
         \\    print int("not a number")
         \\} catch e {
-        \\    print e["error"]
-        \\    print e["message"]
-        \\    print e["operation"]
+        \\    print e.error
+        \\    print e.message
+        \\    print e.operation
         \\}
     , &buf);
     // `path` stays empty here — PARSE_INT's Diagnostic names the operation
@@ -4909,7 +4951,7 @@ test "the sandbox gate (no Host.fs) is itself catchable" {
         \\    int f := open("anything.txt", read)
         \\    print "opened"
         \\} catch e {
-        \\    print e["error"]
+        \\    print e.error
         \\}
     , &buf);
     try std.testing.expectEqualStrings("FilesUnavailable\n", output);
@@ -4928,7 +4970,7 @@ test "an error raised several call frames deep unwinds to the handler" {
         \\try {
         \\    print deep(5)
         \\} catch e {
-        \\    print e["error"]
+        \\    print e.error
         \\}
         \\print "after"
     , &buf);
@@ -4973,7 +5015,7 @@ test "returning out of a try block does not strand its handler" {
         \\try {
         \\    print 1 / 0
         \\} catch e {
-        \\    print e["error"]
+        \\    print e.error
         \\}
     , &buf);
     try std.testing.expectEqualStrings("1\nDivisionByZero\n", output);
@@ -4987,7 +5029,7 @@ test "try/catch nests, and the innermost enclosing try wins" {
         \\    try {
         \\        print [1, 2][9]
         \\    } catch inner {
-        \\        print "inner " + inner["error"]
+        \\        print "inner " + inner.error
         \\    }
         \\    print "resumed"
         \\} catch outer {
@@ -5008,7 +5050,7 @@ test "an error inside a catch block escapes to the enclosing try, not its own" {
         \\        print {"z": 1}["q"]
         \\    }
         \\} catch outer {
-        \\    print "outer " + outer["error"]
+        \\    print "outer " + outer.error
         \\}
     , &buf);
     try std.testing.expectEqualStrings("outer KeyNotFound\n", output);
@@ -5089,13 +5131,13 @@ test "the error binding is not in scope after the catch block" {
         \\try {
         \\    print 1
         \\} catch e {
-        \\    print e["error"]
+        \\    print e.error
         \\}
-        \\print e["error"]
+        \\print e.error
     , SemanticError.UndefinedVariable);
 }
 
-test "the error binding is statically typed map" {
+test "the error binding is statically typed as the built-in Error struct" {
     const allocator = std.testing.allocator;
     try expectCompileError(allocator,
         \\try {
@@ -5106,18 +5148,35 @@ test "the error binding is statically typed map" {
     , SemanticError.TypeMismatch);
 }
 
-test "the error binding may be used as a map anywhere one is accepted" {
+// The whole point of switching the binding from a map to a struct (design
+// note 3z): a typo'd field name is now caught HERE, at compile time,
+// instead of surfacing as a `RuntimeError.KeyNotFound` the way a bad map
+// key read always would.
+test "a typo'd field name on the error binding is a compile error" {
     const allocator = std.testing.allocator;
-    var buf: [128]u8 = undefined;
-    const output = try runProgram(allocator,
+    try expectCompileError(allocator,
+        \\try {
+        \\    print 1 / 0
+        \\} catch e {
+        \\    print e.mesage
+        \\}
+    , SemanticError.UnknownField);
+}
+
+// The flip side of no longer being a map: `has`/`keys`, which never
+// static-type-check their argument, now fail at RUNTIME instead of
+// compiling away to a lookup.
+test "the error binding is no longer accepted where a map is expected" {
+    const allocator = std.testing.allocator;
+    var out_buf: [16]u8 = undefined;
+    var err_buf: [16]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgramWithIo(allocator,
         \\try {
         \\    print 1 / 0
         \\} catch e {
         \\    print has(e, "error")
-        \\    print len(keys(e))
         \\}
-    , &buf);
-    try std.testing.expectEqualStrings("true\n4\n", output);
+    , "", &out_buf, &err_buf));
 }
 
 test "the error binding shadows an outer local of the same name, which survives intact" {
@@ -5128,7 +5187,7 @@ test "the error binding shadows an outer local of the same name, which survives 
         \\try {
         \\    print 1 / 0
         \\} catch e {
-        \\    print e["error"]
+        \\    print e.error
         \\}
         \\print e
     , &buf);

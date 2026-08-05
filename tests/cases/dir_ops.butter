@@ -43,11 +43,11 @@ print remove("c.txt")
 try {
     listDir("no-such-dir")
 } catch e {
-    print e["error"]
+    print e.error
 }
 
 try {
     rename("b.txt", "no-such-dir/renamed.txt")
 } catch e {
-    print e["error"]
+    print e.error
 }

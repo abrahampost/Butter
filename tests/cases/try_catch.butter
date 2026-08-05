@@ -21,11 +21,11 @@
 # Prints the variant name if it's the one that was expected, and something
 # unmissable otherwise — so the .expected file is just the list of names,
 # and any drift reads as an error rather than as a reordering.
-func show(string want, map e) -> int {
-    if e["error"] == want {
+func show(string want, Error e) -> int {
+    if e.error == want {
         print want
     } else {
-        print "MISMATCH: wanted " + want + ", got " + e["error"]
+        print "MISMATCH: wanted " + want + ", got " + e.error
     }
     return 0
 }
@@ -106,7 +106,7 @@ try {
     show("FileOpenFailed", e)
     # The only two variants that carry a Diagnostic all the way through:
     # every other error above leaves both of these empty.
-    print "  " + e["operation"] + " " + e["path"]
+    print "  " + e.operation + " " + e.path
 }
 
 int seed := open("data.txt", write)

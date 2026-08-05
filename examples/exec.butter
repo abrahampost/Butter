@@ -29,5 +29,5 @@ print "exit_code: " + stringify(result["exit_code"])
 try {
     exec("this-program-does-not-exist-anywhere", [])
 } catch e {
-    print "spawning a missing program: " + e["error"]
+    print "spawning a missing program: " + e.error
 }

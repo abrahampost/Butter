@@ -31,7 +31,7 @@ if flip == 0 {
 try {
     print random(5, 5)
 } catch e {
-    print "random(5, 5):     " + e["error"]
+    print "random(5, 5):     " + e.error
 }
 
 # A trivial timing measurement: how long a small loop took, in seconds.

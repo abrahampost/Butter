@@ -35,8 +35,8 @@ try {
     # "operation" and "path" are what make a file error actionable — they
     # name what was being attempted and to what. Both are always present
     # (empty for an error that carries no such detail), so neither needs a
-    # has() guard first.
-    write(stderr, "cannot read " + e["path"] + ": " + e["message"] + "\n")
+    # guard first.
+    write(stderr, "cannot read " + e.path + ": " + e.message + "\n")
     exit 1
 }
 
@@ -48,7 +48,7 @@ map doc := {}
 try {
     doc := json(buf, n)
 } catch e {
-    write(stderr, path + " is not valid JSON (" + e["error"] + ")\n")
+    write(stderr, path + " is not valid JSON (" + e.error + ")\n")
     exit 1
 }
 
@@ -59,10 +59,10 @@ try {
     print "name:   " + doc["name"]
     print "absent: " + doc["nope"]
 } catch e {
-    if e["error"] == "KeyNotFound" {
+    if e.error == "KeyNotFound" {
         print "(that key is missing, which this tool treats as fine)"
     } else {
-        write(stderr, "unexpected: " + e["message"] + "\n")
+        write(stderr, "unexpected: " + e.message + "\n")
         exit 1
     }
 }

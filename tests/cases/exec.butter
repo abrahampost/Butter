@@ -23,9 +23,9 @@ print result["exit_code"]
 try {
     exec("this-program-definitely-does-not-exist-anywhere-42", [])
 } catch e {
-    if e["error"] == "ProcessSpawnFailed" {
+    if e.error == "ProcessSpawnFailed" {
         print "spawn failed as expected"
     } else {
-        print "MISMATCH: " + e["error"]
+        print "MISMATCH: " + e.error
     }
 }

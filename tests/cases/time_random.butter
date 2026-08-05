@@ -8,7 +8,7 @@
 try {
     print now()
 } catch e {
-    print "now(): " + e["error"]
+    print "now(): " + e.error
 }
 
 # random() -- a float in [0, 1).
@@ -37,5 +37,5 @@ print m >= lo and m < hi
 try {
     print random(7, 7)
 } catch e {
-    print "random(7, 7): " + e["error"]
+    print "random(7, 7): " + e.error
 }

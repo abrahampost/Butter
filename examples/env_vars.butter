@@ -23,7 +23,7 @@ if hasenv("BUTTER_WIDTH") {
     try {
         width := int(getenv("BUTTER_WIDTH"))
     } catch e {
-        print "BUTTER_WIDTH isn't a number, keeping the default (" + e["error"] + ")"
+        print "BUTTER_WIDTH isn't a number, keeping the default (" + e.error + ")"
     }
 }
 print "width:    " + stringify(width)

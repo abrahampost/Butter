@@ -49,5 +49,5 @@ print "removed again: " + stringify(remove(renamed))
 try {
     listDir("examples/no-such-directory")
 } catch e {
-    print "listDir on a missing directory: " + e["error"]
+    print "listDir on a missing directory: " + e.error
 }

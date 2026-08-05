@@ -552,9 +552,10 @@
        POP_HANDLER
        JUMP  end_target
      catch_target:
-       <catch body>                 (* the error map is ALREADY on the stack,
-                                       pushed by the VM while unwinding, and
-                                       IS the binding's local slot *)
+       <catch body>                 (* the error struct is ALREADY on the
+                                       stack, pushed by the VM while
+                                       unwinding, and IS the binding's local
+                                       slot *)
        POP                          (* discard the binding, via the normal
                                        end-of-scope pop *)
      end_target:
@@ -563,10 +564,11 @@
    statement the compiler's next free slot is some N; the try body's own
    locals occupy N upward and are popped at its end, so the catch block is
    compiled with the next free slot back at N and declares the binding
-   there. At run time a statement boundary always has sp == bp + N (locals
-   below, no live temporaries), so the sp PUSH_HANDLER recorded is exactly
-   the binding's address — unwinding restores that sp and then pushes the
-   error map, landing it precisely in slot N. The end-of-scope POP then
+   there, statically typed as the built-in `Error` struct (section 19). At
+   run time a statement boundary always has sp == bp + N (locals below, no
+   live temporaries), so the sp PUSH_HANDLER recorded is exactly the
+   binding's address — unwinding restores that sp and then pushes the error
+   struct, landing it precisely in slot N. The end-of-scope POP then
    discards it with no special case.
 
    'and' (short-circuits a false left operand without evaluating right):
@@ -1124,7 +1126,8 @@
 
 (* --------------------------------------------------------------------------
    14. ERROR HANDLING (PUSH_HANDLER, POP_HANDLER — section 3; one new runtime
-       table, no new value kind)
+       table; no new value kind — the binding is an ordinary RECORD, section
+       19)
    -------------------------------------------------------------------------- *)
 
    What `try <block> catch IDENTIFIER <block>` (GRAMMAR.bnf design note 3u)
@@ -1153,8 +1156,8 @@
         ip = H.ip;
      4. clears `Vm.diagnostic`, so a later detail-free uncaught error can't
         report stale detail from an earlier caught one;
-     5. builds the error map and pushes it — landing it at exactly the slot
-        the compiler allocated for the binding (section 4);
+     5. builds the error struct and pushes it — landing it at exactly the
+        slot the compiler allocated for the binding (section 4);
      6. continues the loop.
 
    Note what is NOT restored: the open-file table. A stream can legitimately
@@ -1162,12 +1165,20 @@
    from one that can't (GRAMMAR.bnf design note 3u). Every still-open file is
    flushed and closed at HALT/EXIT as always.
 
-   THE ERROR MAP is an ordinary heap map (section 11) with four string-keyed
-   entries, always all present: "error" (the RuntimeError tag name, via
-   `@errorName`), "message" (rendered exactly the way the CLI renders an
-   uncaught error, so a caught-and-reported one reads identically), and
-   "operation"/"path" from `Vm.diagnostic`, `""` when there is none. No new
-   value kind is involved — it is the same map a `{...}` literal builds.
+   THE ERROR STRUCT is an ordinary heap RECORD (section 19), an instance of
+   the built-in `Error` type (GRAMMAR.bnf design note 3z), with four fields,
+   always all present, in this fixed order: "error" (the RuntimeError tag
+   name, via `@errorName`), "message" (rendered exactly the way the CLI
+   renders an uncaught error, so a caught-and-reported one reads
+   identically), and "operation"/"path" from `Vm.diagnostic`, `""` when
+   there is none. No new value kind is involved — `Vm.errorValue` builds it
+   directly (not through MAKE_STRUCT, which only ever runs for a `{...}`
+   struct literal in compiled source), but the resulting `Object` is
+   indistinguishable from one MAKE_STRUCT would have built, so ordinary
+   FIELD_GET reads it. `Vm.errorValue`'s field order and
+   `Compiler.compileModules`'s registration of the `Error` type (pass 0)
+   must stay in exact sync — the former hardcodes the field indices the
+   latter's declaration order fixes.
 
    CATCHABLE vs NOT. Twenty-seven RuntimeError variants are catchable:
    TypeMismatch, DivisionByZero, Overflow, IndexOutOfBounds, ByteOutOfRange,
@@ -1184,7 +1195,7 @@
    conditions, and running a catch block requires the very stack room that
    has just been exhausted. Neither is `error.OutOfMemory` — it is not a
    RuntimeError at all (it comes from the Zig allocator), and building the
-   error map itself allocates, so a handler for it could not run. The
+   error struct itself allocates, so a handler for it could not run. The
    catchable set is enumerated explicitly in vm.zig rather than tested by
    exclusion, so adding a RuntimeError forces a decision about it.
 
@@ -1497,9 +1508,9 @@
         keys, always all present: `"stdout"`/`"stderr"` — ADOPTING
         `std.process.run`'s own returned buffers directly as each string
         Object's owned bytes (`Vm.mapSetOwnedString`) rather than duplicating
-        them the way `Vm.mapSetText` (section 14's error map) does, since
-        nothing else holds a reference to them — and `"exit_code"` (a plain
-        scalar `int`, nothing to incref).
+        them the way `Value.newString` does, since nothing else holds a
+        reference to them — and `"exit_code"` (a plain scalar `int`, nothing
+        to incref).
 
    THE CHILD'S ENVIRONMENT IS NOT `Host.env` (section 15). `Host.env` only
    governs what THIS Butter program's OWN `getenv`/`hasenv` calls see; EXEC
@@ -1681,7 +1692,10 @@
    read, since MAKE_STRUCT's operand, by construction, only ever names a
    struct's own type_index — this keeps a type_index resolved anywhere in
    the compiler valid here unchanged, with no separate struct-only
-   renumbering pass needed.
+   renumbering pass needed. Index 0 is always the built-in `Error` type
+   (section 14, GRAMMAR.bnf design note 3u) — `Compiler.compileModules`
+   registers it before any user struct/enum specifically to fix that index,
+   which `Vm.errorValue` hardcodes rather than looking up by name.
 
    MAKE_STRUCT/FIELD_GET/FIELD_SET are documented in full in section 3,
    above. The key structural fact those three entries lean on: NEITHER
