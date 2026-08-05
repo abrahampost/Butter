@@ -2,7 +2,7 @@
 
 TextMate-grammar-based syntax highlighting for `.butter` files. No language
 server, no build step — just a language declaration and a grammar, derived
-from [`GRAMMAR.bnf`](../../GRAMMAR.bnf)'s lexical rules.
+from [`GRAMMAR.bnf`](../../docs/GRAMMAR.bnf)'s lexical rules.
 
 ## Try it locally
 
