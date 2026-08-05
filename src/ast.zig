@@ -298,6 +298,16 @@ pub const Expr = union(enum) {
     /// arbitrary expressions, checked to be `int` at compile time where
     /// possible (mirroring the for-loop's own bounds) and always at runtime.
     random_range: RandomRange,
+    /// `ord(s)` (GRAMMAR.bnf design note 3ab) — the numeric byte value
+    /// (0..255) of `s`, which must be a single-byte string: the "characters
+    /// are length-1 strings" convention the Strings design notes already
+    /// establish for `s[i]`, made usable for actual byte-level work (case
+    /// conversion, character-class predicates) without introducing a
+    /// separate `char` type. `RuntimeError.InvalidCharLength` (ISA.bnf
+    /// section 21) if `s`'s byte length isn't exactly 1 — checked, not
+    /// silently truncated to the first byte, matching this VM's usual
+    /// "checked, not trusted" stance.
+    char_ord: *Expr,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -799,6 +809,11 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
         },
         .env_has => |e| {
             try writer.writeAll("(hasenv ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .char_ord => |e| {
+            try writer.writeAll("(ord ");
             try printExpr(writer, e);
             try writer.writeAll(")");
         },

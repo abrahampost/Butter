@@ -947,6 +947,7 @@ pub const Compiler = struct {
             .time_now => StaticType{ .scalar = .float },
             .random_float => StaticType{ .scalar = .float },
             .random_range => StaticType{ .scalar = .int },
+            .char_ord => StaticType{ .scalar = .int },
         };
     }
 
@@ -1500,6 +1501,10 @@ pub const Compiler = struct {
             .env_has => |e| {
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .has_env);
+            },
+            .char_ord => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .ord);
             },
             .path_exists => |e| {
                 try self.compileExpr(e);
@@ -4546,6 +4551,63 @@ test "a program run with no environment sees every variable as unset" {
         \\print len(getenv("EDITOR"))
     , &buf);
     try std.testing.expectEqualStrings("false\n0\n", output);
+}
+
+// ---- Character conversion (GRAMMAR.bnf design note 3ab) ------------------
+
+test "ord(...) returns a single-character string's byte value" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\print ord("A")
+        \\print ord("a")
+        \\print ord("0")
+    , &buf);
+    try std.testing.expectEqualStrings("65\n97\n48\n", output);
+}
+
+test "ord(...)'s static type lets it initialize an int local" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int code := ord("A")
+        \\print code
+    , &buf);
+    try std.testing.expectEqualStrings("65\n", output);
+}
+
+test "ord(...)'s static type is checked against the declared type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "string s := ord(\"A\")\n", SemanticError.TypeMismatch);
+}
+
+test "ord(...) on a multi-character or empty string is a runtime InvalidCharLength" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.InvalidCharLength, runProgram(allocator,
+        \\print ord("ab")
+    , &buf));
+    try std.testing.expectError(vm_mod.RuntimeError.InvalidCharLength, runProgram(allocator,
+        \\print ord("")
+    , &buf));
+}
+
+test "ord(...) on a non-string value is a runtime TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\print ord(65)
+    , &buf));
+}
+
+test "ord(...)'s argument may be any expression, not just a literal" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\string s := "Z"
+        \\print ord(s[0..1])
+    , &buf);
+    try std.testing.expectEqualStrings("90\n", output);
 }
 
 // ---- Time and randomness (GRAMMAR.bnf design note 3y) --------------------

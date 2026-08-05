@@ -742,6 +742,7 @@ pub const Parser = struct {
     ///         | <exists-expr> | <list-dir-expr> | <remove-expr> | <rename-expr>
     ///         | <exec-expr>
     ///         | <now-expr> | <random-expr>
+    ///         | <ord-expr>
     ///         | 'stdin' | 'stdout' | 'stderr' | 'args' | IDENTIFIER
     fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
@@ -811,6 +812,7 @@ pub const Parser = struct {
             .kw_exec => return self.execExpr(),
             .kw_now => return self.nowExpr(),
             .kw_random => return self.randomExpr(),
+            .kw_ord => return self.ordExpr(),
             .kw_stdin => {
                 _ = self.advance();
                 return self.createExpr(.{ .stream_literal = .stdin });
@@ -1180,6 +1182,19 @@ pub const Parser = struct {
         const name = try self.expression();
         _ = try self.expect(.rparen, "expected ')' after the variable name");
         return self.createExpr(.{ .env_has = name });
+    }
+
+    /// <ord-expr> ::= 'ord' '(' <expression> ')'
+    ///
+    /// Like `getenv`/`hasenv` above, `ord` is a keyword in expression
+    /// position only — it isn't also a <type> keyword, so a bare
+    /// `ord("x")` is a legal (if pointless) <expr-stmt> too.
+    fn ordExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'ord'
+        _ = try self.expect(.lparen, "expected '(' after 'ord'");
+        const value = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the value to convert");
+        return self.createExpr(.{ .char_ord = value });
     }
 
     /// <exists-expr> ::= 'exists' '(' <expression> ')'
@@ -1774,6 +1789,23 @@ test "parses getenv(...)/hasenv(...) as expressions" {
     try expectExprSexpr("hasenv(\"HOME\")", "(hasenv \"HOME\")");
     try expectExprSexpr("getenv(name)", "(getenv name)");
     try expectExprSexpr("getenv(\"BUTTER_\" + suffix)", "(getenv (+ \"BUTTER_\" suffix))");
+}
+
+test "parses ord(...) as an expression" {
+    try expectExprSexpr("ord(\"A\")", "(ord \"A\")");
+    try expectExprSexpr("ord(s)", "(ord s)");
+}
+
+test "ord(x) CAN stand alone as a top-level statement, unlike int(x)" {
+    // Same reasoning as getenv(x) above: 'ord' isn't also a <type>
+    // keyword, so nothing dispatches on it before expression parsing
+    // begins.
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "ord(\"A\")\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.program.len);
+    try std.testing.expectEqualStrings("A", result.program[0].kind.expr_stmt.char_ord.literal.string);
 }
 
 test "getenv(x) CAN stand alone as a top-level statement, unlike int(x)" {

@@ -45,6 +45,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'exec'
                | 'now' | 'random'
                | 'struct' | 'enum'
+               | 'ord'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -235,6 +236,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <now-expr>
                       | <random-expr>
                       | <struct-literal>
+                      | <ord-expr>
                       | 'stdin' | 'stdout' | 'stderr'
                       | 'args'
                       | IDENTIFIER
@@ -327,6 +329,10 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <now-expr>           ::= 'now' '(' ')'
 <random-expr>        ::= 'random' '(' ')'
                        | 'random' '(' <expression> ',' <expression> ')'
+
+(* Character conversion (design note 3ab). Not a <type> keyword, so a bare
+   `ord(...)` use is a legal <expr-stmt> too, same as getenv/exists/exec. *)
+<ord-expr>           ::= 'ord' '(' <expression> ')'
 
 
 (* --------------------------------------------------------------------------
@@ -533,6 +539,34 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      handed to `float(...)` is `RuntimeError.TypeMismatch`, not a
      widening conversion — only the float-to-int direction is a cast
      today; a symmetric `int`-to-`float` widening cast is not implemented. *)
+
+(* --- Character conversion: ord(x) (design note 3ab) ---
+   - There is no separate `char` type (the Strings design notes above
+     already settled this: `s[i]` deliberately returns a length-1 `string`,
+     not a dedicated character type, precisely so it compares directly
+     against an ordinary string literal). "Character" stays a
+     documentation-level convention — a length-1 `string` — not a language
+     type; `ord` is what makes that convention usable for actual byte-level
+     work (case conversion, character-class predicates like `isDigit`)
+     without introducing one.
+   - `ord(s)` evaluates to the numeric byte value (0..255) of `s`, which
+     must be exactly one byte long. `s` must be `string`-shaped
+     (`RuntimeError.TypeMismatch` otherwise); a `string` whose byte length
+     isn't exactly 1 — empty, or more than one byte — is
+     `RuntimeError.InvalidCharLength`, checked rather than silently reading
+     just the first byte (or the first byte of a multi-byte UTF-8
+     character), matching the "checked, not trusted" stance
+     `int(x)`/`float(x)` above already take with `NumberParseFailed`.
+   - BYTE-VALUED, NOT CODEPOINT-VALUED — consistent with the rest of the
+     language treating text as raw bytes (the Strings design notes' `s[i]`,
+     `read`/`write`'s `int` buffers): a single UTF-8 continuation byte is
+     still exactly one byte, so it's still a valid `ord` operand (yielding
+     that raw byte, 0..255), even though it's never a valid codepoint on
+     its own.
+   - Deliberately the narrow half of an `ord`/`chr` pair: only the
+     character-to-byte direction is provided in this pass, matching
+     `int(x)`'s own "only float-to-int, not the reverse" asymmetry above —
+     a `chr`-style byte-to-character builtin is not implemented here. *)
 
 (* --- Program arguments ---
    - `args` is a bare keyword, like `stdin`/`stdout`/`stderr`, but unlike
@@ -935,14 +969,15 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      carries no diagnostic detail — most of them. `error` is the stable one
      to branch on (`if e.error == "KeyNotFound"`); `message`'s exact wording
      is not a compatibility promise.
-   - NOT EVERY ERROR IS CATCHABLE. The 27 that are, are the ones a program
+   - NOT EVERY ERROR IS CATCHABLE. The 28 that are, are the ones a program
      could plausibly do something about — `TypeMismatch`, `DivisionByZero`,
      `Overflow`, `IndexOutOfBounds`, `ByteOutOfRange`, `KeyNotFound`,
      `JsonParseFailed`, `NumberParseFailed`, `InvalidExitCode`,
      `ListDirFailed`, `RemoveFailed`, `RenameFailed` (design note 3w),
      `ProcessesUnavailable`, `ProcessSpawnFailed`, `ProcessTerminatedAbnormally`
      (design note 3x), `ClockUnavailable`, `InvalidRange` (design note 3y),
-     and the ten stream/file ones. `StackOverflow`, `StackUnderflow`, `CallStackOverflow`
+     `InvalidCharLength` (design note 3ab), and the ten stream/file ones.
+     `StackOverflow`, `StackUnderflow`, `CallStackOverflow`
      and `HandlerStackOverflow` are NOT: they are VM-integrity failures, not
      program conditions, and running a handler needs the very stack room
      that has just run out. Neither is an out-of-memory failure, since

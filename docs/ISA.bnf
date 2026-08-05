@@ -1819,4 +1819,48 @@
    change in either direction — nothing on the JSON side can produce a
    RECORD or an ENUM_TAG, so `json(...)` can never hand either kind back to
    a program.
+
+
+(* --------------------------------------------------------------------------
+   21. CHARACTER CONVERSION (ORD — one new opcode, no new value kind;
+       GRAMMAR.bnf design note 3ab)
+   -------------------------------------------------------------------------- *)
+
+   ORD                    ( v -- int )        pops v (must be string-shaped;
+                                               `RuntimeError.TypeMismatch`
+                                               otherwise); if its byte length
+                                               isn't exactly 1,
+                                               `RuntimeError.
+                                               InvalidCharLength` (with a
+                                               `Vm.diagnostic`, operation
+                                               "ord"); otherwise pushes its
+                                               one byte's value (0..255) as
+                                               an INT. What `ord(x)`
+                                               (GRAMMAR.bnf design note 3ab)
+                                               compiles to.
+
+   No operand: like PARSE_INT/PARSE_FLOAT (section 13), the string to
+   convert is an ordinary popped `Value`, not a compile-time constant.
+   Touches no heap state and needs no refcount bookkeeping beyond the
+   ordinary decref of its own (string) operand — the result is a plain
+   INT, exactly like PARSE_INT's string branch.
+
+   NO SEPARATE `char` VALUE KIND. This deliberately extends the existing
+   "a character is a length-1 string" convention (section 11's Strings
+   addendum: `s[i]` already returns a fresh length-1 STRING, not a
+   dedicated character type) rather than introducing one — ORD is simply
+   the byte-level escape hatch that convention was missing, for code that
+   needs the numeric value (case conversion, character-class predicates)
+   rather than something to print or compare against a string literal.
+
+   BYTE-VALUED, NOT CODEPOINT-VALUED, matching every other byte-oriented
+   operation this VM already has (`s[i]`, `s[a..b]`, `read`/`write`'s `int`
+   buffers): a lone UTF-8 continuation byte of a multi-byte character is
+   still exactly one byte, so it's still a valid ORD operand — the result
+   is that raw byte, not a decoded codepoint.
+
+   ONLY THE CHARACTER-TO-BYTE DIRECTION IS PROVIDED HERE — no CHR/byte-to-
+   character counterpart opcode exists in this pass, the same "one
+   direction only" scope PARSE_INT's own float-to-int (not int-to-float)
+   cast already takes (section 13).
    ========================================================================== *)

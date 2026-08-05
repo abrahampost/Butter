@@ -93,6 +93,12 @@ try {
 }
 
 try {
+    print ord("ab")
+} catch e {
+    show("InvalidCharLength", e)
+}
+
+try {
     exit 999
 } catch e {
     show("InvalidExitCode", e)
@@ -202,6 +208,6 @@ try {
     show("TooManyOpenFiles", e)
 }
 
-# The program survived all twenty: without try/catch, any one of them
+# The program survived all twenty-one: without try/catch, any one of them
 # would have killed it on the spot.
 print "all handled"

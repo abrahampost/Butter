@@ -134,6 +134,15 @@ pub const RuntimeError = error{
     /// `InvalidExitCode` does for a value that's the right TYPE but the
     /// wrong one.
     InvalidRange,
+
+    // Character conversion (ISA.bnf section 21, GRAMMAR.bnf design note
+    // 3ab).
+    /// `ord(s)`'s operand was a string, but not exactly one byte long, so
+    /// there's no single byte value to report. A non-string operand is
+    /// `TypeMismatch` instead, same as everywhere else; this is only ever
+    /// the right-type-wrong-shape case, the same split `InvalidExitCode`/
+    /// `InvalidRange` already make.
+    InvalidCharLength,
 };
 
 const stack_max = 1024;
@@ -1206,6 +1215,7 @@ pub const Vm = struct {
             error.ProcessTerminatedAbnormally,
             error.ClockUnavailable,
             error.InvalidRange,
+            error.InvalidCharLength,
             => true,
 
             // VM-integrity failures. Not a program condition, and running a
@@ -1726,6 +1736,16 @@ pub const Vm = struct {
                 const bytes = v.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 const result = std.fmt.parseFloat(f64, bytes) catch return self.failFile(RuntimeError.NumberParseFailed, "float", "", "malformed float literal");
                 try self.push(.{ .float = result });
+            },
+
+            // ---- Character conversion (ISA.bnf section 21) ----
+
+            .ord => {
+                const v = try self.pop();
+                defer v.decref(self.allocator);
+                const bytes = v.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                if (bytes.len != 1) return self.failFile(RuntimeError.InvalidCharLength, "ord", "", "ord requires a single-character (one-byte) string");
+                try self.push(.{ .int = bytes[0] });
             },
 
             // ---- Environment variables (ISA.bnf section 15) ----
@@ -4553,6 +4573,82 @@ test "parse_int on NaN or infinity is Overflow" {
     try expectParseIntFloatOverflow(-std.math.inf(f64));
 }
 
+// ---- Character conversion (ISA.bnf section 21) ---------------------------
+
+fn expectOrd(s: []const u8, expected: i64) !void {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const c = try chunk.addConstant(allocator, try Value.newString(allocator, s));
+    _ = try chunk.emitWithOperand(allocator, .push_const, c);
+    _ = try chunk.emit(allocator, .ord);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    var expected_buf: [32]u8 = undefined;
+    const expected_str = try std.fmt.bufPrint(&expected_buf, "{d}\n", .{expected});
+    try std.testing.expectEqualStrings(expected_str, buf[0..len]);
+}
+
+test "ord returns a single-character string's byte value" {
+    try expectOrd("A", 65);
+    try expectOrd("a", 97);
+    try expectOrd("0", 48);
+    try expectOrd(" ", 32);
+}
+
+test "ord on a single arbitrary byte 0..255 round-trips, even non-ASCII" {
+    // Butter strings are byte-indexed, not codepoint-indexed (GRAMMAR.bnf's
+    // Strings design notes) — `ord` follows the same convention: a lone
+    // UTF-8 continuation byte is still exactly one BYTE, so it's still a
+    // valid `ord` operand, even though it's never a valid codepoint by
+    // itself.
+    try expectOrd(&[_]u8{0xFF}, 255);
+    try expectOrd(&[_]u8{0}, 0);
+}
+
+test "ord on a multi-character string is InvalidCharLength" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "ab"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .ord);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.InvalidCharLength);
+}
+
+test "ord on an empty string is InvalidCharLength" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, ""));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .ord);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.InvalidCharLength);
+}
+
+test "ord on a non-string value is TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const n = try chunk.addConstant(allocator, .{ .int = 65 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, n);
+    _ = try chunk.emit(allocator, .ord);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
 // ---- Environment variables (ISA.bnf section 15) --------------------------
 
 /// Runs a one-instruction GET_ENV/HAS_ENV program looking up `name` against
@@ -5236,6 +5332,7 @@ test "every RuntimeError variant has the catchability ISA.bnf section 14 documen
         RuntimeError.ProcessTerminatedAbnormally,
         RuntimeError.ClockUnavailable,
         RuntimeError.InvalidRange,
+        RuntimeError.InvalidCharLength,
     };
     const uncatchable_variants = [_]RuntimeError{
         RuntimeError.StackOverflow,

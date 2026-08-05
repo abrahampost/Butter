@@ -6,6 +6,7 @@ ByteOutOfRange
 KeyNotFound
 JsonParseFailed
 NumberParseFailed
+InvalidCharLength
 InvalidExitCode
 FileOpenFailed
   open no_such_file.txt

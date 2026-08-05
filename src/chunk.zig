@@ -124,6 +124,11 @@ pub const OpCode = enum(u8) {
     parse_int,
     parse_float,
 
+    // Character conversion (ISA.bnf section 21, GRAMMAR.bnf design note
+    // 3ab). No operand: like PARSE_INT/PARSE_FLOAT, the string to convert
+    // is an ordinary popped `Value`, not a compile-time constant.
+    ord,
+
     // Environment variables (ISA.bnf section 15, GRAMMAR.bnf design note
     // 3v). No operand, for the same reason PUSH_ARGS has none: the
     // environment lives on the Host passed to `Vm.run`, not in the chunk.
@@ -577,6 +582,20 @@ test "disassemble renders parse_int and parse_float" {
     try chunk.disassemble(&writer);
 
     try std.testing.expectEqualStrings("0000 parse_int\n0001 parse_float\n", writer.buffered());
+}
+
+test "disassemble renders ord" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .ord);
+
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 ord\n", writer.buffered());
 }
 
 test "disassemble renders get_env and has_env" {

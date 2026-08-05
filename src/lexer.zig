@@ -61,6 +61,7 @@ pub const TokenType = enum {
     kw_random,
     kw_struct,
     kw_enum,
+    kw_ord,
 
     // Operators and punctuation
     plus,
@@ -145,6 +146,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "random", .kw_random },
     .{ "struct", .kw_struct },
     .{ "enum", .kw_enum },
+    .{ "ord", .kw_ord },
 });
 
 pub const Token = struct {
@@ -607,6 +609,10 @@ test "'getenv' and 'hasenv' are recognized as keywords" {
     try expectTokenTypes("getenv hasenv getenvx hasenvx env", &.{
         .kw_getenv, .kw_hasenv, .identifier, .identifier, .identifier, .eof,
     });
+}
+
+test "'ord' is recognized as a keyword" {
+    try expectTokenTypes("ord ordx coord", &.{ .kw_ord, .identifier, .identifier, .eof });
 }
 
 test "'exists'/'listDir'/'remove'/'rename' are recognized as keywords" {
