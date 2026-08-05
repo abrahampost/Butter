@@ -1,9 +1,9 @@
 import "collections.std.butter"
 
-map a := {}
+Set a := setNew()
 setAdd(a, "x")
 setAdd(a, "y")
-map b := setNew()
+Set b := setNew()
 setAdd(b, "y")
 setAdd(b, "z")
 
@@ -14,7 +14,7 @@ print setSize(setDifference(a, b))
 print setEquals(a, a)
 print setEquals(a, b)
 
-map st := stackNew()
+Stack st := stackNew()
 stackPush(st, "one")
 stackPush(st, "two")
 stackPush(st, "three")
@@ -22,7 +22,7 @@ print stackPop(st)
 print stackPop(st)
 print stackSize(st)
 
-map q := queueNew()
+Queue q := queueNew()
 queueEnqueue(q, "one")
 queueEnqueue(q, "two")
 queueEnqueue(q, "three")

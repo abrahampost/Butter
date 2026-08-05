@@ -523,7 +523,7 @@ test "the bundled collections stdlib imports by name with no matching file on di
     defer loader.deinit();
 
     const entry = try loader.loadEntry(
-        "import \"collections.std.butter\"\nmap s := setNew()\nprint setAdd(s, \"a\")\n",
+        "import \"collections.std.butter\"\nSet s := setNew()\nprint setAdd(s, \"a\")\n",
         "main.butter",
         ".",
     );
@@ -542,10 +542,10 @@ test "the bundled collections stdlib's Set/Stack/Queue run correctly end to end"
     const entry = try loader.loadEntry(
         \\import "collections.std.butter"
         \\
-        \\map a := setNew()
+        \\Set a := setNew()
         \\setAdd(a, "x")
         \\setAdd(a, "y")
-        \\map b := setNew()
+        \\Set b := setNew()
         \\setAdd(b, "y")
         \\setAdd(b, "z")
         \\print setAdd(a, "x")
@@ -558,14 +558,14 @@ test "the bundled collections stdlib's Set/Stack/Queue run correctly end to end"
         \\print setRemove(a, "x")
         \\print setSize(a)
         \\
-        \\map st := stackNew()
+        \\Stack st := stackNew()
         \\stackPush(st, "one")
         \\stackPush(st, "two")
         \\print stackPeek(st)
         \\print stackPop(st)
         \\print stackSize(st)
         \\
-        \\map q := queueNew()
+        \\Queue q := queueNew()
         \\queueEnqueue(q, "one")
         \\queueEnqueue(q, "two")
         \\print queuePeek(q)

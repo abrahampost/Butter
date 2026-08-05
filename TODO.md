@@ -293,7 +293,7 @@ callback.
 - Write a design note before implementation; this touches ast.zig,
   parser.zig, compiler.zig, and vm.zig's value representation.
 
-### 14. Structs / records / enums
+### 14. Structs / records / enums - DONE
 Objects today are maps with string keys by convention (see Set/Stack/
 Queue in `collections.std.butter`) — workable, but no shape validation
 and stringly-typed field access.
