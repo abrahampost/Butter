@@ -1,0 +1,36 @@
+{
+  "name": "butter-language",
+  "displayName": "Butter Language",
+  "description": "Syntax highlighting for the Butter programming language (.butter)",
+  "repository": {},
+  "version": "0.0.1",
+  "publisher": "zbutter",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "butter",
+        "aliases": [
+          "Butter",
+          "butter"
+        ],
+        "extensions": [
+          ".butter"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "butter",
+        "scopeName": "source.butter",
+        "path": "./syntaxes/butter.tmLanguage.json"
+      }
+    ]
+  }
+}
