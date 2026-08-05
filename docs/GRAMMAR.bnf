@@ -122,9 +122,15 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 (* A bare IDENTIFIER names a user-declared struct or enum type (design
    notes 3z, 3aa) — resolved by the compiler, never validated by this
-   grammar or the parser. *)
+   grammar or the parser. <func-type> names a function VALUE's type (design
+   note 3ad) — deliberately NOT <function-decl>'s own shape (no name, no
+   '->'): every type inside it is restricted to a plain scalar (this same
+   <type> production minus IDENTIFIER and <func-type> itself — no nesting,
+   no struct/enum). *)
 <type>              ::= 'int' | 'float' | 'bool' | 'string' | 'map' | 'list'
-                      | IDENTIFIER
+                      | IDENTIFIER | <func-type>
+
+<func-type>         ::= 'func' '(' [ <type> { ',' <type> } ] ')' <type>
 
 <block>             ::= '{' { NEWLINE } { <declaration> { NEWLINE } } '}'
 
@@ -353,7 +359,42 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    - A call's argument COUNT must match the callee's parameter count
      exactly, and (design note 3t) each argument's type must be usable
      where the matching parameter's declared type is expected; a return
-     value is checked against the declared return type the same way. *)
+     value is checked against the declared return type the same way.
+   - A top-level function CAN be passed around as a value (design note
+     3ad) — this doesn't reverse "no nesting, no closures" above; it's a
+     new way to reference one of these same already-flat declarations,
+     never a way to create a new one. *)
+
+(* --- Function values (design note 3ad) ---
+   - A `func(paramTypes) returnType` type (see <func-type> above) names any
+     top-level function with that exact structural signature — never an
+     anonymous function literal, and never a closure: there is no syntax to
+     define a new function anywhere but the top level (the "Functions" note
+     above still holds unchanged). A bare reference to a declared function's
+     own name (not followed by '(') is a value of this type.
+   - Every type inside a <func-type> — each parameter and the return type —
+     is restricted to a plain scalar: int/float/bool/string/map/list. Never
+     a struct/enum name and never a nested <func-type>, so that two
+     signatures compare purely structurally, with no name resolution.
+   - A function is usable as a value only if it ALSO has no array-typed
+     parameter and no array return type (an array-shaped signature has no
+     way to appear in a <func-type> in the first place). Referencing an
+     ineligible function bare, with no declared func-type context to check
+     it against, is a compile error; passing/assigning one where a
+     specific func-type IS expected surfaces as the same "declared type
+     doesn't match" error any other type mismatch would.
+   - A function-typed parameter or local variable must always be
+     initialized (an argument, at a call; an explicit initializer, for a
+     local) — there is no default "zero" function value the way every
+     other type has one.
+   - Not supported this pass: a struct field or a function's own return
+     type may not be function-typed. Only a parameter or a local variable
+     can be.
+   - Calling through a func-typed local/parameter (ISA.bnf section 6's
+     CALL_VALUE) checks each argument against the DECLARED signature, not
+     any one concrete function's own parameter list — the value could hold
+     any function matching that signature, decided only at run time by
+     whichever assignment/argument last populated it. *)
 
 (* --- Arrays ---
    - Fixed size only, no nesting: an array's size is a compile-time INT

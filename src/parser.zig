@@ -167,15 +167,28 @@ pub const Parser = struct {
     fn topLevelDeclaration(self: *Parser) Error!ast.Stmt {
         if (self.check(.kw_import)) return self.importDeclaration();
         if (self.match(.kw_export)) {
-            if (self.check(.kw_func)) return self.functionDeclaration(true);
+            if (self.isFunctionDeclStart()) return self.functionDeclaration(true);
             if (self.check(.kw_struct)) return self.structDeclaration(true);
             if (self.check(.kw_enum)) return self.enumDeclaration(true);
             return self.fail("expected 'func', 'struct', or 'enum' after 'export'");
         }
-        if (self.check(.kw_func)) return self.functionDeclaration(false);
+        if (self.isFunctionDeclStart()) return self.functionDeclaration(false);
         if (self.check(.kw_struct)) return self.structDeclaration(false);
         if (self.check(.kw_enum)) return self.enumDeclaration(false);
         return self.declaration();
+    }
+
+    /// `func` immediately followed by an IDENTIFIER is always a function
+    /// DECLARATION (`func NAME(...) -> T { ... }`); `func` followed
+    /// directly by `(` is instead a function-VALUE TYPE (GRAMMAR.bnf design
+    /// note 3ad) leading an ordinary top-level var-declaration, e.g.
+    /// `func(int) bool matcher := isEven` — `declaration`'s own `.kw_func`
+    /// dispatch (below) handles that case via `varDeclaration`/`parseType`.
+    /// This one-token lookahead is exactly what keeps the two `func`-led
+    /// productions from colliding at the top level (a var-declaration
+    /// doesn't get its own leading keyword the way struct/enum/import do).
+    fn isFunctionDeclStart(self: *Parser) bool {
+        return self.check(.kw_func) and self.peekAt(1).type == .identifier;
     }
 
     /// <import-decl> ::= 'import' STRING <end>
@@ -196,7 +209,7 @@ pub const Parser = struct {
 
     fn declaration(self: *Parser) Error!ast.Stmt {
         return switch (self.peek().type) {
-            .kw_int, .kw_float, .kw_bool, .kw_string, .kw_map, .kw_list => self.varDeclaration(),
+            .kw_int, .kw_float, .kw_bool, .kw_string, .kw_map, .kw_list, .kw_func => self.varDeclaration(),
             // A struct/enum-typed var-declaration (GRAMMAR.bnf design notes
             // 3z/3aa) has no keyword of its own to dispatch on — its
             // `<type>` is a bare IDENTIFIER (`parseType`'s `.named` case).
@@ -226,15 +239,20 @@ pub const Parser = struct {
     const ParsedType = struct {
         type: ast.ValueType,
         named_type: ?[]const u8 = null,
+        /// Set only when `type == .func` — see `ast.ValueType.func`'s doc
+        /// comment.
+        func_sig: ?*const ast.FuncSig = null,
     };
 
-    /// <type> ::= 'int' | 'float' | 'bool' | 'string' | 'map' | 'list' | IDENTIFIER
+    /// <type> ::= 'int' | 'float' | 'bool' | 'string' | 'map' | 'list'
+    ///          | IDENTIFIER | <func-type>
     ///
     /// A bare IDENTIFIER (GRAMMAR.bnf design notes 3z/3aa) names a
     /// user-declared struct/enum type — never validated here (the parser
     /// resolves no names); compiler.zig rejects an identifier that doesn't
     /// name any declared struct/enum type (`SemanticError.UndefinedType`).
     fn parseType(self: *Parser) Error!ParsedType {
+        if (self.check(.kw_func)) return self.parseFuncType();
         const tok = self.peek();
         const parsed: ParsedType = switch (tok.type) {
             .kw_int => .{ .type = .int },
@@ -248,6 +266,41 @@ pub const Parser = struct {
         };
         _ = self.advance();
         return parsed;
+    }
+
+    /// <func-type> ::= 'func' '(' [ <type> { ',' <type> } ] ')' <type>
+    ///
+    /// A function-VALUE's type (GRAMMAR.bnf design note 3ad) — deliberately
+    /// NOT the same shape as `functionDeclaration`'s own header (no name, no
+    /// '->'): there is nothing to name and no block to follow, just a bare
+    /// structural signature, e.g. `func(int, int) bool`. Every parameter/
+    /// return type inside is restricted to a plain scalar
+    /// (int/float/bool/string/map/list) — neither a struct/enum name nor a
+    /// nested function type is allowed here, so that two signatures can
+    /// always be compared structurally with no name resolution
+    /// (compiler.zig's `funcSigEqual`/`funcSigMatchesInfo`).
+    fn parseFuncType(self: *Parser) Error!ParsedType {
+        _ = self.advance(); // 'func'
+        _ = try self.expect(.lparen, "expected '(' after 'func'");
+        var param_types: std.ArrayList(ast.ValueType) = .empty;
+        if (!self.check(.rparen)) {
+            while (true) {
+                const pt = try self.parseType();
+                if (pt.type == .func or pt.type == .named) return self.fail("a function type's parameters must be a plain scalar type (int, float, bool, string, map, or list)");
+                try param_types.append(self.allocator(), pt.type);
+                if (!self.match(.comma)) break;
+            }
+        }
+        _ = try self.expect(.rparen, "expected ')' after function-type parameter list");
+        const ret = try self.parseType();
+        if (ret.type == .func or ret.type == .named) return self.fail("a function type's return type must be a plain scalar type (int, float, bool, string, map, or list)");
+
+        const sig = try self.allocator().create(ast.FuncSig);
+        sig.* = .{
+            .param_types = try param_types.toOwnedSlice(self.allocator()),
+            .return_type = ret.type,
+        };
+        return .{ .type = .func, .func_sig = sig };
     }
 
     /// <function-decl> ::= 'func' IDENTIFIER '(' [ <param-list> ] ')'
@@ -276,20 +329,23 @@ pub const Parser = struct {
         if (!self.check(.rparen)) {
             while (true) {
                 const param_type = try self.parseType();
-                // map/list/a named (struct/enum) type never take the array
-                // suffix — they're always exactly one value, never a run of
-                // raw slots (GRAMMAR.bnf design notes 3m, 3z, 3aa) — so this
-                // is simply never attempted for them, the same way it's
-                // never attempted for a param name.
-                const param_array_size = if (param_type.type == .map or param_type.type == .list or param_type.type == .named) null else try self.parseArraySpec();
+                // map/list/a named (struct/enum) type/a function type never
+                // take the array suffix — they're always exactly one value,
+                // never a run of raw slots (GRAMMAR.bnf design notes 3m, 3z,
+                // 3aa, 3ad) — so this is simply never attempted for them,
+                // the same way it's never attempted for a param name.
+                const param_array_size = if (param_type.type == .map or param_type.type == .list or param_type.type == .named or param_type.type == .func) null else try self.parseArraySpec();
                 const param_name = try self.expect(.identifier, "expected a parameter name");
-                try params.append(self.allocator(), .{ .type = param_type.type, .named_type = param_type.named_type, .name = param_name.lexeme, .array_size = param_array_size });
+                try params.append(self.allocator(), .{ .type = param_type.type, .named_type = param_type.named_type, .func_sig = param_type.func_sig, .name = param_name.lexeme, .array_size = param_array_size });
                 if (!self.match(.comma)) break;
             }
         }
         _ = try self.expect(.rparen, "expected ')' after parameters");
         _ = try self.expect(.arrow, "expected '->' before return type");
         const return_type = try self.parseType();
+        // Not supported this pass (GRAMMAR.bnf design note 3ad) — a
+        // function value's own return type stays a plain scalar/map/list.
+        if (return_type.type == .func) return self.fail("a function cannot return a function type (not supported yet)");
         const return_array_size = if (return_type.type == .map or return_type.type == .list or return_type.type == .named) null else try self.parseArraySpec();
 
         const body_stmt = try self.block();
@@ -336,14 +392,16 @@ pub const Parser = struct {
         // suffix (GRAMMAR.bnf design notes 3m, 3z, 3aa) — writing `map[3] m`
         // simply never gets this far as an array declaration; the next
         // token (still `[`) fails the IDENTIFIER expectation below instead.
-        const array_len = if (value_type.type == .map or value_type.type == .list or value_type.type == .named) null else try self.parseOptionalArraySize();
+        // A function type (GRAMMAR.bnf design note 3ad) never takes the
+        // array-size suffix either — same "always exactly one value" story.
+        const array_len = if (value_type.type == .map or value_type.type == .list or value_type.type == .named or value_type.type == .func) null else try self.parseOptionalArraySize();
         const name_tok = try self.expect(.identifier, "expected a variable name");
 
         var initializer: ?*ast.Expr = null;
         if (self.match(.colon_equal)) initializer = try self.expression();
 
         try self.consumeEnd();
-        return ast.Stmt{ .kind = .{ .var_decl = .{ .type = value_type.type, .named_type = value_type.named_type, .array_len = array_len, .name = name_tok.lexeme, .initializer = initializer } }, .line = line };
+        return ast.Stmt{ .kind = .{ .var_decl = .{ .type = value_type.type, .named_type = value_type.named_type, .func_sig = value_type.func_sig, .array_len = array_len, .name = name_tok.lexeme, .initializer = initializer } }, .line = line };
     }
 
     /// <struct-decl> ::= 'struct' IDENTIFIER '{' { NEWLINE } [ <field-list> ] '}'
@@ -367,6 +425,8 @@ pub const Parser = struct {
         if (!self.check(.rbrace)) {
             while (true) {
                 const field_type = try self.parseType();
+                // Not supported this pass (GRAMMAR.bnf design note 3ad).
+                if (field_type.type == .func) return self.fail("a struct field cannot be function-typed (not supported yet)");
                 const field_name = try self.expect(.identifier, "expected a field name");
                 try fields.append(self.allocator(), .{ .type = field_type.type, .named_type = field_type.named_type, .name = field_name.lexeme });
                 const had_newline = self.check(.newline);
@@ -2407,6 +2467,51 @@ test "a struct field may be another named (struct/enum) type" {
     const s = result.program[0].kind.struct_decl;
     try std.testing.expectEqual(ast.ValueType.named, s.fields[0].type);
     try std.testing.expectEqualStrings("Point", s.fields[0].named_type.?);
+}
+
+test "parses a function-type parameter, with its signature captured" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator,
+        \\func apply(func(int, int) bool cmp, int a, int b) -> bool {
+        \\    return cmp(a, b)
+        \\}
+    );
+    defer result.parser.deinit();
+
+    const f = result.program[0].kind.function_decl;
+    try std.testing.expectEqual(ast.ValueType.func, f.params[0].type);
+    const sig = f.params[0].func_sig.?;
+    try std.testing.expectEqual(@as(usize, 2), sig.param_types.len);
+    try std.testing.expectEqual(ast.ValueType.int, sig.param_types[0]);
+    try std.testing.expectEqual(ast.ValueType.int, sig.param_types[1]);
+    try std.testing.expectEqual(ast.ValueType.bool, sig.return_type);
+}
+
+test "a top-level func-typed variable declaration is distinguished from a function declaration" {
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "func(int) bool matcher := isEven\n");
+    defer result.parser.deinit();
+
+    const d = result.program[0].kind.var_decl;
+    try std.testing.expectEqual(ast.ValueType.func, d.type);
+    try std.testing.expectEqualStrings("matcher", d.name);
+    try std.testing.expectEqual(@as(usize, 1), d.func_sig.?.param_types.len);
+}
+
+test "a function type's parameters can't be struct/enum-typed" {
+    try expectParseError("func(Point) bool wrong\n");
+}
+
+test "a function type's return type can't itself be function-typed" {
+    try expectParseError("func() func(int) bool wrong\n");
+}
+
+test "a function cannot return a function type" {
+    try expectParseError("func f() -> func(int) bool { return isEven }\n");
+}
+
+test "a struct field cannot be function-typed" {
+    try expectParseError("struct S { func(int) bool f }\n");
 }
 
 test "'export' works on a struct declaration" {

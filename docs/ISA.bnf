@@ -42,7 +42,7 @@
    2. VALUE REPRESENTATION
    -------------------------------------------------------------------------- *)
 
-<value>    ::= INT | FLOAT | BOOL | ARRAY_REF | STREAM | NULL | ENUM_TAG | OBJECT
+<value>    ::= INT | FLOAT | BOOL | ARRAY_REF | STREAM | NULL | ENUM_TAG | FUNCTION_REF | OBJECT
 
 (* INT and FLOAT are i64/f64.
 
@@ -88,6 +88,21 @@
    produced by PUSH_CONST — an enum variant reference (`EnumName.Variant`)
    is a compile-time constant exactly like an INT or STRING literal, so
    there is no dedicated opcode for constructing one.
+
+   FUNCTION_REF (GRAMMAR.bnf design note 3ad) is `value.FunctionRef`:
+   `{ index: u32, name: []const u8 }` — same non-heap, no-refcount scalar
+   shape as ENUM_TAG, for the same reason (as cheap to copy as an INT).
+   `index` is the SAME `Program.functions` index CALL's own operand names a
+   callee by (section 6); `name` is carried alongside purely so this value
+   can print/describe itself, never looked up through it. Equality compares
+   `index` only. Only ever produced by PUSH_CONST — a bare reference to a
+   top-level function's own name is a compile-time constant exactly like an
+   ENUM_TAG or an INT/STRING literal, so there is no dedicated opcode for
+   constructing one; CALL_VALUE is what CONSUMES one instead (section 6).
+   PRINT rendering is `<func name>` (`Value.printAt`'s `.function` arm);
+   `json.zig`'s `stringify` reports `error.Unstringifiable` for one, the
+   same bucket a STREAM/ARRAY_REF/ENUM_TAG falls into (section 12) — JSON
+   has no native shape for a function reference either.
 
    A compiled program is one main Chunk (top-level code, run as an implicit
    frame 0 — section 6) plus one Chunk per declared function, each with its
@@ -247,6 +262,25 @@
                                                exactly where arg1 already
                                                sits. CallStackOverflow if the
                                                frame stack is already full.
+   CALL_VALUE             ( arg1 ... argN fn -- result )
+                                               a named-function-value
+                                               callback (GRAMMAR.bnf design
+                                               note 3ad) — identical to CALL
+                                               in every way except where the
+                                               callee's index comes from:
+                                               pops `fn` (a `Value.function`,
+                                               TypeMismatch if it isn't one)
+                                               and uses ITS `index` in place
+                                               of CALL's compile-time
+                                               #func_index operand, then
+                                               proceeds exactly as CALL does
+                                               (functions[index]'s own arity/
+                                               return_width, read at run time
+                                               either way, are unchanged by
+                                               which opcode got here). No
+                                               operand of its own. `fn` is
+                                               popped and discarded — not a
+                                               heap value, needs no decref.
    RET                     ( v -- v )          pops the current frame
                                                (decreffing every argument and
                                                local it owned — section 6),
@@ -695,6 +729,17 @@
    gets a frame pushed for itself (nothing ever CALLs into it), which is why
    `return` is restricted to inside a function body — there is no frame at
    the top level for RET to pop.
+
+   FUNCTION VALUES (GRAMMAR.bnf design note 3ad) reuse this exact same
+   function table and calling convention — a `Value.function` is nothing
+   but one more `functions[]` index, carried as a runtime VALUE instead of
+   a compile-time CALL operand. CALL_VALUE performs the identical four
+   steps above, differing only in step 3's setup: it first pops that index
+   off the stack (from on top of the already-pushed arguments), then reads
+   `functions[index]`'s own arity/return_width exactly as CALL already
+   does. Nothing else about frame setup, RET, or recursion changes — a
+   function called through a value is, at the VM level, indistinguishable
+   from one called by a fixed operand.
 
    GENERIC ARRAY ARGUMENTS. A generic (`int[]`) parameter costs exactly 1
    slot, holding one ARRAY_REF. Passing a FIXED-size local emits

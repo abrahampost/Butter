@@ -220,6 +220,17 @@ pub const EnumTag = struct {
     variant_name: []const u8,
 };
 
+/// A reference to a top-level, named function (GRAMMAR.bnf design note
+/// 3ad) — a plain scalar `Value`, exactly like `EnumTag`: no heap, no
+/// refcount, copying it is as free as copying an `int`. `index` is the same
+/// `Program.functions` index CALL's own operand already uses to name a
+/// callee; `name` is carried alongside purely for `print`/`typeName`, never
+/// looked up through it — same rationale as `EnumTag.type_name`.
+pub const FunctionRef = struct {
+    index: u32,
+    name: []const u8,
+};
+
 pub const Value = union(enum) {
     int: i64,
     float: f64,
@@ -232,6 +243,9 @@ pub const Value = union(enum) {
     null_value,
     /// A named enum variant (GRAMMAR.bnf design note 3aa) — see `EnumTag`.
     enum_value: EnumTag,
+    /// A reference to a top-level named function (GRAMMAR.bnf design note
+    /// 3ad) — see `FunctionRef`.
+    function: FunctionRef,
     object: *Object,
 
     /// Allocates a new heap string value: dupes `bytes` into an
@@ -258,6 +272,7 @@ pub const Value = union(enum) {
             // is (e.g. "Color"), carried directly in the tag (see
             // `EnumTag`'s doc comment) rather than looked up anywhere.
             .enum_value => |e| e.type_name,
+            .function => "function",
             .object => |o| switch (o.payload) {
                 .string => "string",
                 .list => "list",
@@ -352,6 +367,10 @@ pub const Value = union(enum) {
             // deliberately never type-checked, and enums get no special
             // carve-out from that rule).
             .enum_value => |ae| b == .enum_value and ae.type_index == b.enum_value.type_index and ae.variant == b.enum_value.variant,
+            // Same function only — identified by its `Program.functions`
+            // index, same as two enum values compare by type_index+variant
+            // rather than by name.
+            .function => |af| b == .function and af.index == b.function.index,
             .object => |ao| switch (ao.payload) {
                 .string => unreachable, // asStringBytes above already handled this
                 .list, .map, .record => b == .object and ao == b.object,
@@ -393,6 +412,7 @@ pub const Value = union(enum) {
             // separate "as a list/map element" rendering to distinguish
             // (GRAMMAR.bnf design note 3aa).
             .enum_value => |e| try writer.writeAll(e.variant_name),
+            .function => |f| try writer.print("<func {s}>", .{f.name}),
             .object => |o| switch (o.payload) {
                 .string => |v| if (quoted) try writer.print("\"{s}\"", .{v}) else try writer.writeAll(v),
                 .list => |list| {
@@ -675,4 +695,17 @@ test "enum_value eql compares by type_index+variant; typeName/print use the carr
 
     try std.testing.expectEqualStrings("Color", red.typeName());
     try expectPrint(red, "Red");
+}
+
+test "function eql compares by index only; typeName/print use the carried name" {
+    const square: Value = .{ .function = .{ .index = 0, .name = "square" } };
+    const square_again: Value = .{ .function = .{ .index = 0, .name = "square" } };
+    const double: Value = .{ .function = .{ .index = 1, .name = "double" } };
+
+    try std.testing.expect(Value.eql(square, square_again));
+    try std.testing.expect(!Value.eql(square, double));
+    try std.testing.expect(!Value.eql(square, .{ .int = 0 }));
+
+    try std.testing.expectEqualStrings("function", square.typeName());
+    try expectPrint(square, "<func square>");
 }

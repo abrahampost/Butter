@@ -51,6 +51,28 @@ pub const ValueType = enum {
     /// anything — that happens once, in compiler.zig, against the set of
     /// struct/enum types registered across the whole compiled program.
     named,
+    /// A reference to a top-level, named function (GRAMMAR.bnf design note
+    /// 3ad) — `func(paramTypes) returnType` in source. Unlike `named`, the
+    /// signature travels as a sibling `?*const FuncSig` (`Param.func_sig`/
+    /// `Stmt.VarDecl.func_sig`) rather than a bare name: a function type has
+    /// no declared name of its own to look up, only a structural shape.
+    /// Never legal as a struct field's or a function's own return type in
+    /// this pass (rejected by the parser) — only as a parameter or local
+    /// variable's type.
+    func,
+};
+
+/// The structural signature a `func(paramTypes) returnType` type names
+/// (GRAMMAR.bnf design note 3ad). Deliberately restricted to plain scalars
+/// (`int`/`float`/`bool`/`string`/`map`/`list`) in both `param_types` and
+/// `return_type` — never `.named` (struct/enum) and never nested `.func` —
+/// so that two signatures (or a signature and a concrete function's own
+/// params/return) can be compared purely structurally, with no name
+/// resolution, the same way `BinaryOp`/`ValueType` themselves already
+/// compare with plain `==`.
+pub const FuncSig = struct {
+    param_types: []const ValueType,
+    return_type: ValueType,
 };
 
 pub const UnaryOp = enum {
@@ -104,6 +126,8 @@ pub const Param = struct {
     type: ValueType,
     /// Set only when `type == .named` — see `ValueType.named`'s doc comment.
     named_type: ?[]const u8 = null,
+    /// Set only when `type == .func` — see `ValueType.func`'s doc comment.
+    func_sig: ?*const FuncSig = null,
     name: []const u8,
     /// null for a plain scalar parameter; see `ArraySpec` otherwise.
     array_size: ?ArraySpec = null,
@@ -531,6 +555,8 @@ pub const StmtKind = union(enum) {
         type: ValueType,
         /// Set only when `type == .named` — see `ValueType.named`'s doc comment.
         named_type: ?[]const u8 = null,
+        /// Set only when `type == .func` — see `ValueType.func`'s doc comment.
+        func_sig: ?*const FuncSig = null,
         name: []const u8,
         /// null for a plain scalar declaration; `Some(n)` means this
         /// declares a fixed-size array of `n` elements of `type` instead
@@ -917,6 +943,11 @@ fn valueTypeName(t: ValueType, named_type: ?[]const u8) []const u8 {
         .map => "map",
         .list => "list",
         .named => named_type.?,
+        // A placeholder, not the full signature — rendering
+        // `func(int,int)bool` in full would need `func_sig` threaded
+        // through every one of this function's call sites for a debug-only
+        // printer; not worth it (GRAMMAR.bnf design note 3ad).
+        .func => "func",
     };
 }
 

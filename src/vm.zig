@@ -1978,6 +1978,24 @@ pub const Vm = struct {
                 ex.ip = 0;
                 ex.return_width = func.return_width;
             },
+            // Identical to CALL except the callee's function-table index
+            // comes from a popped `Value.function` (a named-function-value
+            // callback — GRAMMAR.bnf design note 3ad) rather than a
+            // compile-time operand; `func.arity`/`func.return_width` are
+            // already read from `ex.program.functions[]` at runtime for an
+            // ordinary CALL too, so frame setup is otherwise unchanged. The
+            // popped value is a non-heap scalar, so no decref is needed.
+            .call_value => {
+                if (ex.frame_count >= frames_max) return RuntimeError.CallStackOverflow;
+                const fn_value = try self.pop();
+                const func = &ex.program.functions[fn_value.function.index];
+                ex.frames[ex.frame_count] = .{ .chunk = ex.chunk, .ip = ex.ip, .bp = ex.bp, .return_width = ex.return_width };
+                ex.frame_count += 1;
+                ex.bp = self.sp - func.arity;
+                ex.chunk = &func.chunk;
+                ex.ip = 0;
+                ex.return_width = func.return_width;
+            },
             .ret => {
                 // Everything the departing frame owns OTHER than the
                 // return value itself — its locals, its arguments, any

@@ -63,6 +63,14 @@ pub const OpCode = enum(u8) {
     pop_handler,
 
     call,
+    // Calls through a `Value.function` popped off the stack rather than a
+    // compile-time function-table index (GRAMMAR.bnf design note 3ad) — a
+    // named-function-value callback, never a closure. No operand: unlike
+    // CALL, the callee's function-table index is only known at runtime,
+    // sitting on top of the already-pushed arguments. Otherwise identical
+    // to CALL (same frame setup, same arity/return_width sourced from
+    // `Program.functions[index]`, ISA.bnf section 6).
+    call_value,
     ret,
 
     print,
@@ -417,6 +425,21 @@ test "disassemble renders call and ret" {
     try chunk.disassemble(&writer);
 
     try std.testing.expectEqualStrings("0000 call #3\n0001 ret\n", writer.buffered());
+}
+
+test "disassemble renders call_value with no operand" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emitWithOperand(allocator, .load_local, 0);
+    _ = try chunk.emit(allocator, .call_value);
+
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 load_local slot=0\n0001 call_value\n", writer.buffered());
 }
 
 test "packIndexOperand/unpackIndexOperand round-trip slot and length" {

@@ -337,6 +337,10 @@ test "try_catch: one caught case per catchable RuntimeError a program can raise"
     try expectCaseOutputWithFs("try_catch");
 }
 
+test "callback: a named function passed as a value, through both a parameter and a local, then called dynamically" {
+    try expectCaseOutput("callback");
+}
+
 test "args: the bare 'args' keyword sees the host's argv, in order" {
     try expectCaseOutputWithArgs("args", &.{ "alpha", "beta", "gamma" });
 }

@@ -88,6 +88,16 @@ pub const SemanticError = error{
     /// A struct/enum type exists but isn't exported by a module this file
     /// imports — the struct/enum counterpart to `FunctionNotVisible`.
     TypeNotVisible,
+    /// A bare function-name expression (GRAMMAR.bnf design note 3ad) names
+    /// a function that has an array-typed parameter, a struct/enum-typed
+    /// parameter or return type, or an array return type — none of which a
+    /// function VALUE can describe (`func(...)...`'s own signature is
+    /// scalar-only).
+    InvalidFunctionValue,
+    /// A function-typed (`func(...)...`) local/parameter has no initializer
+    /// — unlike every other type, there is no default "zero" function
+    /// value to fall back to (design note 3ad).
+    MissingFunctionInitializer,
 };
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
@@ -150,6 +160,12 @@ const Local = struct {
     /// `ast.ValueType.named`'s doc comment for why this travels as a
     /// sibling field rather than being folded into `value_type` itself.
     named_ref: ?NamedTypeRef = null,
+    /// Set only when `value_type == .func` (GRAMMAR.bnf design note 3ad) —
+    /// the declared signature any function value stored here must match.
+    /// Borrowed straight from the declaring `ast.Param`/`ast.Stmt.VarDecl`
+    /// (needs no resolution the way `named_ref` does, since a signature's
+    /// own param/return types are always plain scalars).
+    func_sig: ?*const ast.FuncSig = null,
 };
 
 /// Which registered type (in `Compiler.types`) a `.named` `ast.ValueType`
@@ -171,9 +187,11 @@ const NamedTypeRef = struct {
 const DeclaredType = struct {
     type: ast.ValueType,
     named_ref: ?NamedTypeRef = null,
+    /// Set only when `type == .func` — see `Local.func_sig`'s doc comment.
+    func_sig: ?*const ast.FuncSig = null,
 
     fn builtin(t: ast.ValueType) DeclaredType {
-        std.debug.assert(t != .named);
+        std.debug.assert(t != .named and t != .func);
         return .{ .type = t };
     }
 };
@@ -247,7 +265,7 @@ fn collectionKind(value_type: ast.ValueType) ?CollectionKind {
     return switch (value_type) {
         .map => .map,
         .list => .list,
-        .int, .float, .bool, .string, .named => null,
+        .int, .float, .bool, .string, .named, .func => null,
     };
 }
 
@@ -654,6 +672,7 @@ pub const Compiler = struct {
                 .is_string = p.type == .string,
                 .value_type = p.type,
                 .named_ref = info.param_named_refs[i],
+                .func_sig = p.func_sig,
             });
             self.next_slot += arraySpecWidth(p.array_size);
         }
@@ -784,19 +803,30 @@ pub const Compiler = struct {
         /// design note 3aa). Same exact-match-only treatment as
         /// `struct_type`.
         enum_type: u32,
+        /// A bare reference to one SPECIFIC top-level function (GRAMMAR.bnf
+        /// design note 3ad) — e.g. `myCompare` used directly as an
+        /// expression, not through a func-typed local/parameter. Carries
+        /// that function's own full `FunctionInfo` so `typeCompatible` can
+        /// check its actual signature structurally against a declared
+        /// `func(...)...` type.
+        func_value: FunctionInfo,
+        /// The type of a func-typed local/parameter (GRAMMAR.bnf design
+        /// note 3ad) — any function matching this signature could be
+        /// stored there, not one specific function.
+        func_sig: *const ast.FuncSig,
     };
 
     fn isNumericType(t: StaticType) bool {
         return switch (t) {
             .scalar => |v| v == .int or v == .float,
-            .stream, .null_type, .struct_type, .enum_type => false,
+            .stream, .null_type, .struct_type, .enum_type, .func_value, .func_sig => false,
         };
     }
 
     fn isScalarType(t: StaticType, v: ast.ValueType) bool {
         return switch (t) {
             .scalar => |s| s == v,
-            .stream, .null_type, .struct_type, .enum_type => false,
+            .stream, .null_type, .struct_type, .enum_type, .func_value, .func_sig => false,
         };
     }
 
@@ -805,8 +835,48 @@ pub const Compiler = struct {
     /// the two are the same information, just addressed from opposite
     /// ends (a declared position vs. an expression's inferred type).
     fn declaredToStatic(dt: DeclaredType) StaticType {
+        if (dt.type == .func) return StaticType{ .func_sig = dt.func_sig.? };
         if (dt.named_ref) |ref| return if (ref.is_enum) StaticType{ .enum_type = ref.index } else StaticType{ .struct_type = ref.index };
         return StaticType{ .scalar = dt.type };
+    }
+
+    /// Whether a function with `info`'s own signature can be used as a
+    /// function VALUE at all — every parameter and the return type must be
+    /// a plain scalar (int/float/bool/string/map/list), never an array, a
+    /// struct/enum, or (recursively) another function type (GRAMMAR.bnf
+    /// design note 3ad). Structural, so this doubles as the base check
+    /// `funcSigMatchesInfo` builds on: a function that fails this can never
+    /// match any declared `FuncSig` either.
+    fn functionIsValueEligible(info: FunctionInfo) bool {
+        for (info.params) |p| {
+            if (p.array_size != null or p.type == .named or p.type == .func) return false;
+        }
+        return info.return_array_size == null and info.return_type != .named and info.return_type != .func;
+    }
+
+    /// Whether two function-value TYPES (both structural, scalar-only
+    /// signatures — GRAMMAR.bnf design note 3ad) describe the same shape.
+    fn funcSigEqual(a: ast.FuncSig, b: ast.FuncSig) bool {
+        if (a.param_types.len != b.param_types.len) return false;
+        for (a.param_types, b.param_types) |x, y| {
+            if (x != y) return false;
+        }
+        return a.return_type == b.return_type;
+    }
+
+    /// Whether a concrete function's own signature (`info`) matches a
+    /// declared function-value type (`sig`) — used wherever a bare
+    /// function-name expression (`StaticType.func_value`) is checked
+    /// against an expected `func(...)...` position. Requires
+    /// `functionIsValueEligible(info)` implicitly: an array/struct/enum
+    /// param or return type can never equal any plain-scalar `sig` entry.
+    fn funcSigMatchesInfo(sig: *const ast.FuncSig, info: FunctionInfo) bool {
+        if (!functionIsValueEligible(info)) return false;
+        if (info.params.len != sig.param_types.len) return false;
+        for (info.params, sig.param_types) |p, t| {
+            if (p.type != t) return false;
+        }
+        return info.return_type == sig.return_type;
     }
 
     /// Whether a value of static type `actual` may be used where `expected`
@@ -823,17 +893,25 @@ pub const Compiler = struct {
     /// dynamically regardless of what a local was declared as, so this
     /// changes nothing observable.
     fn typeCompatible(expected: DeclaredType, actual: StaticType) bool {
+        if (expected.type == .func) {
+            const esig = expected.func_sig.?;
+            return switch (actual) {
+                .func_value => |info| funcSigMatchesInfo(esig, info),
+                .func_sig => |asig| funcSigEqual(esig.*, asig.*),
+                .scalar, .stream, .null_type, .struct_type, .enum_type => false,
+            };
+        }
         if (expected.named_ref) |eref| {
             return switch (actual) {
                 .struct_type => |i| !eref.is_enum and i == eref.index,
                 .enum_type => |i| eref.is_enum and i == eref.index,
-                .scalar, .stream, .null_type => false,
+                .scalar, .stream, .null_type, .func_value, .func_sig => false,
             };
         }
         return switch (actual) {
             .scalar => |v| v == expected.type or (expected.type == .float and v == .int),
             .stream => expected.type == .int,
-            .null_type, .struct_type, .enum_type => false,
+            .null_type, .struct_type, .enum_type, .func_value, .func_sig => false,
         };
     }
 
@@ -876,13 +954,24 @@ pub const Compiler = struct {
                 .null_value => StaticType.null_type,
             },
             .variable => |name| blk: {
-                const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
-                if (local.array != null) return self.fail(SemanticError.ArrayUsedAsScalar, name, "an array must be indexed, not used as a plain value");
-                if (local.value_type == .named) {
-                    const ref = local.named_ref.?;
-                    break :blk if (ref.is_enum) StaticType{ .enum_type = ref.index } else StaticType{ .struct_type = ref.index };
+                if (self.resolveLocal(name)) |local| {
+                    if (local.array != null) return self.fail(SemanticError.ArrayUsedAsScalar, name, "an array must be indexed, not used as a plain value");
+                    if (local.value_type == .func) break :blk StaticType{ .func_sig = local.func_sig.? };
+                    if (local.value_type == .named) {
+                        const ref = local.named_ref.?;
+                        break :blk if (ref.is_enum) StaticType{ .enum_type = ref.index } else StaticType{ .struct_type = ref.index };
+                    }
+                    break :blk StaticType{ .scalar = local.value_type };
                 }
-                break :blk StaticType{ .scalar = local.value_type };
+                // Not a local — does this name a top-level function instead
+                // (GRAMMAR.bnf design note 3ad)? Whether it's actually
+                // eligible to be used as a value (no array/struct/enum
+                // param or return type) is checked when this expression is
+                // actually compiled (`compileVariable`), same as `.call`'s
+                // own "real error raised when this call is actually
+                // compiled" stance below.
+                if (self.findFunction(name)) |info| break :blk StaticType{ .func_value = info };
+                return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
             },
             .unary => |u| blk: {
                 const rt = try self.inferType(u.right) orelse break :blk null;
@@ -901,6 +990,12 @@ pub const Compiler = struct {
             .grouping => |inner| try self.inferType(inner),
             .assign => |a| try self.inferType(a.value),
             .call => |c| blk: {
+                // A dynamic call through a func-typed local/parameter
+                // (GRAMMAR.bnf design note 3ad) — its result is always a
+                // plain scalar/map/list, per the signature restriction.
+                if (self.resolveLocal(c.name)) |local| {
+                    if (local.value_type == .func) break :blk StaticType{ .scalar = local.func_sig.?.return_type };
+                }
                 const info = self.findFunction(c.name) orelse break :blk null; // real error raised when this call is actually compiled
                 if (info.return_array_size != null) break :blk null; // likewise ArrayUsedAsScalar, raised there
                 if (info.return_type == .named) {
@@ -1111,7 +1206,11 @@ pub const Compiler = struct {
             .float => .{ .float = 0.0 },
             .bool => .{ .boolean = false },
             .string => try Value.newString(self.allocator, ""),
-            .map, .list, .named => unreachable,
+            // `.func` never reaches here either: a function-typed local
+            // always requires an initializer (`compileVarDecl`) and a
+            // function-typed return type is rejected at parse time — there
+            // is no meaningful "zero" function value to fall back to.
+            .map, .list, .named, .func => unreachable,
         };
     }
 
@@ -1216,18 +1315,22 @@ pub const Compiler = struct {
             self.next_slot += len;
         } else {
             // The plain-scalar branch — this is also where a struct/enum-
-            // typed local (`d.type == .named`) lands, since neither
-            // `collectionKind` nor `d.array_len` ever apply to one
-            // (GRAMMAR.bnf design notes 3z/3aa).
+            // typed local (`d.type == .named`) or a function-typed local
+            // (`d.type == .func`, GRAMMAR.bnf design note 3ad) lands, since
+            // neither `collectionKind` nor `d.array_len` ever apply to
+            // either.
+            if (d.type == .func and d.initializer == null) {
+                return self.fail(SemanticError.MissingFunctionInitializer, d.name, "a function-typed variable must be initialized; there is no default function value");
+            }
             const named_ref: ?NamedTypeRef = if (d.type == .named) (try self.resolveDeclaredType(d.type, d.named_type)).named_ref else null;
-            const dt: DeclaredType = .{ .type = d.type, .named_ref = named_ref };
+            const dt: DeclaredType = .{ .type = d.type, .named_ref = named_ref, .func_sig = d.func_sig };
             if (d.initializer) |init_expr| {
                 try self.checkExpectedType(init_expr, dt, d.name, "initializer's type does not match the declared type");
                 try self.compileExpr(init_expr);
             } else {
                 try self.compileDefaultValue(dt);
             }
-            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .is_string = d.type == .string, .value_type = d.type, .named_ref = named_ref });
+            try self.locals.append(self.allocator, .{ .name = d.name, .depth = self.scope_depth, .slot = slot, .is_string = d.type == .string, .value_type = d.type, .named_ref = named_ref, .func_sig = d.func_sig });
             self.next_slot += 1;
         }
     }
@@ -1399,7 +1502,7 @@ pub const Compiler = struct {
     fn compileExpr(self: *Compiler, expr: *const ast.Expr) CompileError!void {
         switch (expr.*) {
             .literal => |lit| try self.compileLiteral(lit),
-            .variable => |name| _ = try self.emitLocalOp(name, .load_local),
+            .variable => |name| try self.compileVariable(name),
             .unary => |u| {
                 _ = try self.inferType(expr);
                 try self.compileExpr(u.right);
@@ -1416,7 +1519,7 @@ pub const Compiler = struct {
             .assign => |a| {
                 if (self.resolveLocal(a.name)) |local| {
                     if (local.array == null) {
-                        try self.checkExpectedType(a.value, .{ .type = local.value_type, .named_ref = local.named_ref }, a.name, "assigned value's type does not match the variable's declared type");
+                        try self.checkExpectedType(a.value, .{ .type = local.value_type, .named_ref = local.named_ref, .func_sig = local.func_sig }, a.name, "assigned value's type does not match the variable's declared type");
                     }
                 }
                 try self.compileExpr(a.value);
@@ -1574,6 +1677,16 @@ pub const Compiler = struct {
     /// array var-decl initializers, array call arguments, and array
     /// returns alike.
     fn compileCallCommon(self: *Compiler, c: ast.Expr.Call) CompileError!FunctionInfo {
+        // A dynamic call through a func-typed local/parameter (GRAMMAR.bnf
+        // design note 3ad) takes priority over a same-named top-level
+        // function — the same shadowing precedent an ordinary local already
+        // gets over anything else in an outer scope. Every OTHER
+        // local/function name collision is unaffected: a non-func-typed
+        // local sharing a function's name still doesn't change which one a
+        // call resolves to, exactly as before this feature existed.
+        if (self.resolveLocal(c.name)) |local| {
+            if (local.value_type == .func) return self.compileDynamicCall(c, local);
+        }
         const info = self.findFunction(c.name) orelse return self.fail(SemanticError.UndefinedFunction, c.name, "undefined function");
         if (!self.functionVisible(info)) return self.fail(SemanticError.FunctionNotVisible, c.name, "function exists but isn't exported by a module this file imports");
         if (c.args.len != info.params.len) return self.fail(SemanticError.ArityMismatch, c.name, "wrong number of arguments");
@@ -1584,13 +1697,51 @@ pub const Compiler = struct {
                     .generic => try self.compileGenericArrayArgument(arg),
                 }
             } else {
-                const dt: DeclaredType = .{ .type = param.type, .named_ref = info.param_named_refs[i] };
+                const dt: DeclaredType = .{ .type = param.type, .named_ref = info.param_named_refs[i], .func_sig = param.func_sig };
                 try self.checkExpectedType(arg, dt, c.name, "argument's type does not match the parameter's declared type");
                 try self.compileExpr(arg);
             }
         }
         _ = try self.chunk.emitWithOperand(self.allocator, .call, info.index);
         return info;
+    }
+
+    /// Calls through a func-typed local/parameter's own runtime value
+    /// (GRAMMAR.bnf design note 3ad) rather than a compile-time function
+    /// index: compiles each argument against the LOCAL's declared
+    /// `FuncSig` (not any one concrete function's params — the value could
+    /// hold any function matching that signature), then pushes the callee
+    /// value itself on top of the already-pushed arguments and emits
+    /// CALL_VALUE (ISA.bnf section 6). Returns a synthetic `FunctionInfo`
+    /// carrying just enough (`return_type`, `return_array_size == null`)
+    /// for every existing `compileCallCommon` caller
+    /// (`compileArrayValue`/`compileGenericArrayArgument`/
+    /// `compileGenericArrayReturn`/`compileVarDecl`'s array branch) to keep
+    /// working unchanged — `return_array_size` staying `null` is exactly
+    /// what correctly forbids a dynamic call from feeding an array context,
+    /// since a function value's signature can never describe an array
+    /// return.
+    fn compileDynamicCall(self: *Compiler, c: ast.Expr.Call, local: Local) CompileError!FunctionInfo {
+        const sig = local.func_sig.?;
+        if (c.args.len != sig.param_types.len) return self.fail(SemanticError.ArityMismatch, c.name, "wrong number of arguments");
+        for (c.args, sig.param_types) |arg, t| {
+            try self.checkExpectedType(arg, DeclaredType.builtin(t), c.name, "argument's type does not match the parameter's declared type");
+            try self.compileExpr(arg);
+        }
+        _ = try self.chunk.emitWithOperand(self.allocator, .load_local, local.slot);
+        _ = try self.chunk.emit(self.allocator, .call_value);
+        return FunctionInfo{
+            .name = c.name,
+            .params = &.{},
+            .param_named_refs = &.{},
+            .return_array_size = null,
+            .return_type = sig.return_type,
+            .return_named_ref = null,
+            .arity = @intCast(sig.param_types.len),
+            .index = 0,
+            .module = self.current_module,
+            .exported = false,
+        };
     }
 
     /// A fixed-size array-valued expression — used for a fixed-size
@@ -1771,6 +1922,29 @@ pub const Compiler = struct {
         const local = self.resolveLocal(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
         if (local.array != null) return self.fail(SemanticError.ArrayUsedAsScalar, name, "an array must be indexed, not used as a plain value");
         return self.chunk.emitWithOperand(self.allocator, op, local.slot);
+    }
+
+    /// Compiles a bare `.variable` READ (`compileExpr`'s counterpart to
+    /// `emitLocalOp`, which also covers `.assign`'s store side): a local
+    /// loads as always, but a name that resolves to no local instead falls
+    /// back to a top-level FUNCTION (GRAMMAR.bnf design note 3ad) — pushed
+    /// as a compile-time `Value.function` constant, exactly like an enum
+    /// variant (`compileEnumVariant`). This is the one place
+    /// `SemanticError.InvalidFunctionValue` is raised: the only path a bare
+    /// function-name expression is guaranteed to go through regardless of
+    /// context (a bare `print someFunc` or `someFunc;` expression statement
+    /// never runs through `checkExpectedType`/`inferType` at all).
+    fn compileVariable(self: *Compiler, name: []const u8) CompileError!void {
+        if (self.resolveLocal(name)) |local| {
+            if (local.array != null) return self.fail(SemanticError.ArrayUsedAsScalar, name, "an array must be indexed, not used as a plain value");
+            _ = try self.chunk.emitWithOperand(self.allocator, .load_local, local.slot);
+            return;
+        }
+        const info = self.findFunction(name) orelse return self.fail(SemanticError.UndefinedVariable, name, "undefined variable");
+        if (!self.functionVisible(info)) return self.fail(SemanticError.FunctionNotVisible, name, "function exists but isn't exported by a module this file imports");
+        if (!functionIsValueEligible(info)) return self.fail(SemanticError.InvalidFunctionValue, name, "this function can't be used as a value: array, struct/enum, or function-typed parameters/return aren't supported for function values");
+        const idx = try self.chunk.addConstant(self.allocator, .{ .function = .{ .index = info.index, .name = info.name } });
+        _ = try self.chunk.emitWithOperand(self.allocator, .push_const, idx);
     }
 
     /// `<base>[i]` reads. For a FIXED-size array local: LOAD_INDEX with the
@@ -5405,4 +5579,87 @@ test "a try block's locals do not permanently consume slots" {
         \\print after
     , &buf);
     try std.testing.expectEqualStrings("3\n99\n", output);
+}
+
+// ---- Function values (GRAMMAR.bnf design note 3ad) ------------------------
+
+test "a named function passed as a callback argument compiles, type-checks, and calls dynamically" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func isEven(int n) -> bool {
+        \\    return n % 2 == 0
+        \\}
+        \\func apply(int n, func(int) bool pred) -> bool {
+        \\    return pred(n)
+        \\}
+        \\print apply(4, isEven)
+        \\print apply(5, isEven)
+    , &buf);
+    try std.testing.expectEqualStrings("true\nfalse\n", output);
+}
+
+test "a func-typed local can be initialized from a bare function name and called dynamically" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func square(int n) -> int {
+        \\    return n * n
+        \\}
+        \\func(int) int f := square
+        \\print f(5)
+    , &buf);
+    try std.testing.expectEqualStrings("25\n", output);
+}
+
+test "passing a function whose signature doesn't match the declared func type is a TypeMismatch" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\func addOne(int n) -> int {
+        \\    return n + 1
+        \\}
+        \\func apply(int n, func(int) bool pred) -> bool {
+        \\    return pred(n)
+        \\}
+        \\print apply(4, addOne)
+    , SemanticError.TypeMismatch);
+}
+
+test "assigning a function with an array parameter to a declared func type is a TypeMismatch (structurally ineligible)" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\func sum(int[] xs) -> int {
+        \\    return 0
+        \\}
+        \\func(int) int f := sum
+    , SemanticError.TypeMismatch);
+}
+
+test "a bare reference to a function with an array parameter, with no expected func type to check against, is InvalidFunctionValue" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator,
+        \\func sum(int[] xs) -> int {
+        \\    return 0
+        \\}
+        \\print sum
+    , SemanticError.InvalidFunctionValue);
+}
+
+test "a function-typed local without an initializer is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "func(int) int f\n", SemanticError.MissingFunctionInitializer);
+}
+
+test "a function value prints as <func name> and compares equal only to itself" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func square(int n) -> int {
+        \\    return n * n
+        \\}
+        \\func(int) int f := square
+        \\print f
+        \\print f == square
+    , &buf);
+    try std.testing.expectEqualStrings("<func square>\ntrue\n", output);
 }

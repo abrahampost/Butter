@@ -75,6 +75,10 @@ fn write(v: Value, writer: *std.Io.Writer) (std.Io.Writer.Error || error{Unstrin
         // with an ordinary string value) — same "no representation, don't
         // invent one" stance (GRAMMAR.bnf design note 3aa).
         .enum_value => return error.Unstringifiable,
+        // Same "no representation, don't invent one" stance as a stream,
+        // array reference, or enum variant — JSON has no shape for a
+        // function reference either (GRAMMAR.bnf design note 3ad).
+        .function => return error.Unstringifiable,
         .object => |o| switch (o.payload) {
             .string => |s| try std.json.Stringify.encodeJsonString(s, .{}, writer),
             .list => |list| {
