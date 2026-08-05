@@ -120,3 +120,25 @@ timer resolution and OS scheduling noise don't dominate, short enough
 that the suite stays usable), and add one `test { ... }` block to
 performance_test.zig calling
 `expectCasePerformance("<name>", <threshold-in-ms>)`.
+
+# Fuzz testing
+
+[fuzz_test.zig](fuzz_test.zig) feeds arbitrary bytes through the same
+`Lexer.tokenizeAll` → `Parser.parseProgram` pipeline the compiler uses,
+asserting the pair never panics or crashes — a lex/parse error is a fine,
+expected outcome for garbage input; only a crash counts as a finding.
+
+Run just the smoke test (one pass over an empty input — this is what
+`zig build test` also runs as part of the default suite):
+
+```bash
+zig build test-fuzz
+```
+
+Run the real thing — Zig 0.16's coverage-guided fuzzer, generating and
+mutating inputs continuously until stopped, with a live web UI:
+
+```bash
+zig build test-fuzz --fuzz
+```
+

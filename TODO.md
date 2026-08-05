@@ -350,34 +350,51 @@ reproducible), and [examples/time_random.butter](examples/time_random.butter).
 
 ## P4 — build-system and infrastructure polish
 
-### 16. Add CI
-No `.github/workflows` exists. Nothing currently runs `zig build test` on
-push/PR.
-- Add a GitHub Actions workflow that installs the pinned Zig version
-  (0.16.0, per [build.zig.zon](build.zig.zon)) and runs `zig build test`
-  on push and PR against `master`.
+### 16. Add CI — DONE
+[.github/workflows/ci.yml](.github/workflows/ci.yml) installs the pinned
+Zig version (0.16.0, per [build.zig.zon](build.zig.zon), via the
+`mlugg/setup-zig` action) and runs `zig build fmt-check` then
+`zig build test` on push and PR against `master`.
 
-### 17. Add a `zig fmt` check
-No formatting check is wired into `build.zig` or CI.
-- Add a build step (or CI step) that runs `zig fmt --check` over `src/`
-  and `tests/` and fails the build on unformatted files.
+### 17. Add a `zig fmt` check — DONE
+`build.zig` now exposes a `fmt-check` step (`b.addFmt` with `.check =
+true` over `src/`, `tests/`, and `build.zig` itself) — run locally with
+`zig build fmt-check`. Wired into
+[.github/workflows/ci.yml](.github/workflows/ci.yml) as its own step
+ahead of `zig build test`, so a PR with unformatted code fails CI before
+the test suite even runs.
 
-### 18. Add a release/distribution step
-`build.zig` already exposes `standardOptimizeOption`/
-`standardTargetOptions`, so `-Doptimize=ReleaseFast -Dtarget=...` works
-ad hoc, but there's no packaged `release` build step and no cross-
-compiled artifact publishing.
-- Add a `release` step to `build.zig` (or a CI workflow) that builds
-  stripped `ReleaseFast` binaries for common target triples and attaches
-  them to GitHub Releases.
+### 18. Add a release/distribution step — DONE
+`build.zig` now has a `release` step that, for each of five target
+triples (`x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`,
+`aarch64-macos`, `x86_64-windows-gnu`), builds its own `root.zig`-rooted
+module and `butter` executable pinned to that target and
+`-Doptimize=ReleaseFast` with `.strip = true`, installed to
+`zig-out/release/<triple>/`. Each target gets a fresh module rather than
+reusing the host-target one `build()` already builds — a module's
+target is fixed at creation, and importing a host-target module into a
+foreign-target executable doesn't work. Run locally with `zig build
+release`.
 
-### 19. Add a fuzz target
-Zig 0.16 has native fuzzing support (`zig build test --fuzz`). The
-hand-rolled recursive-descent lexer/parser in `src/lexer.zig` and
-`src/parser.zig` is exactly the kind of code that benefits from it.
-- Add a fuzz test target that feeds arbitrary byte input through the
-  lexer → parser pipeline and asserts it never panics/crashes (parse
-  errors are fine, panics are not).
+[.github/workflows/release.yml](.github/workflows/release.yml) runs this
+step on every `v*` tag push, packages each triple's binary (`.zip` for
+the Windows build, `.tar.gz` for the rest) into `dist/`, and attaches
+them to an auto-created GitHub Release for that tag via `gh release
+create ... --generate-notes`.
+
+### 19. Add a fuzz target — DONE
+[tests/fuzz_test.zig](tests/fuzz_test.zig) feeds arbitrary bytes (a byte
+distribution modeled on `std.zig.tokenizer`'s own fuzz target — mostly
+printable ASCII, biased toward the lexically-significant characters, with
+some fully arbitrary bytes mixed in) through `Lexer.tokenizeAll` and
+`Parser.parseProgram`, asserting the pair never panics or crashes; a lex
+or parse error is an ordinary, expected outcome for garbage input and
+isn't a failure. Wired into `build.zig` as its own `test-fuzz` step and
+folded into `zig build test` as a cheap regression check — under plain
+`zig build test`/`test-fuzz`, `std.testing.fuzz` only runs the target
+once against an empty input as a smoke test. Actual coverage-guided
+fuzzing needs `zig build test-fuzz --fuzz`, which starts Zig 0.16's
+built-in fuzzer and its web UI.
 
 ### 20. (Informational, low priority) `.zig-cache` size
 Local `.zig-cache` was observed at ~1.5GB against a 6MB `zig-out`. It's

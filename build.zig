@@ -66,7 +66,67 @@ pub fn build(b: *std.Build) void {
     const performance_test_step = b.step("test-performance", "Run the timed .butter program performance benchmarks (add -Doptimize=ReleaseFast for representative numbers)");
     performance_test_step.dependOn(&run_performance_tests.step);
 
-    const test_step = b.step("test", "Run the full test suite (unit + integration)");
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "butter", .module = mod },
+            },
+        }),
+    });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+
+    const fuzz_test_step = b.step("test-fuzz", "Run the lexer/parser fuzz target (add --fuzz to actually fuzz instead of just smoke-testing)");
+    fuzz_test_step.dependOn(&run_fuzz_tests.step);
+
+    const test_step = b.step("test", "Run the full test suite (unit + integration + fuzz smoke test)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_fuzz_tests.step);
+
+    const fmt_check = b.addFmt(.{
+        .paths = &.{ "src", "tests", "build.zig" },
+        .check = true,
+    });
+    const fmt_check_step = b.step("fmt-check", "Check formatting of src/, tests/, and build.zig (zig fmt --check)");
+    fmt_check_step.dependOn(&fmt_check.step);
+
+    const release_targets = [_]struct { query: std.Target.Query, name: []const u8 }{
+        .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu }, .name = "x86_64-linux-gnu" },
+        .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu }, .name = "aarch64-linux-gnu" },
+        .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .name = "x86_64-macos" },
+        .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .name = "aarch64-macos" },
+        .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }, .name = "x86_64-windows-gnu" },
+    };
+
+    const release_step = b.step("release", "Build stripped ReleaseFast binaries for common target triples into zig-out/release/<triple>/");
+    for (release_targets) |release_target| {
+        const release_target_resolved = b.resolveTargetQuery(release_target.query);
+
+        const release_mod = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = release_target_resolved,
+            .optimize = .ReleaseFast,
+        });
+
+        const release_exe = b.addExecutable(.{
+            .name = "butter",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = release_target_resolved,
+                .optimize = .ReleaseFast,
+                .strip = true,
+                .imports = &.{
+                    .{ .name = "butter", .module = release_mod },
+                },
+            }),
+        });
+
+        const install_release_exe = b.addInstallArtifact(release_exe, .{
+            .dest_dir = .{ .override = .{ .custom = b.pathJoin(&.{ "release", release_target.name }) } },
+        });
+        release_step.dependOn(&install_release_exe.step);
+    }
 }

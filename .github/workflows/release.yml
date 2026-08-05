@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - run: zig build release
+
+      - name: Package binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for dir in zig-out/release/*/; do
+            triple="$(basename "$dir")"
+            if [ -f "$dir/butter.exe" ]; then
+              (cd "$dir" && zip -j "$OLDPWD/dist/butter-${triple}.zip" butter.exe)
+            else
+              tar -C "$dir" -czf "dist/butter-${triple}.tar.gz" butter
+            fi
+          done
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --title "${{ github.ref_name }}" --generate-notes
