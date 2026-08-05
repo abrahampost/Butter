@@ -35,6 +35,9 @@ pub fn build(b: *std.Build) void {
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    const unit_test_step = b.step("test-unit", "Run the lexer/parser/compiler/VM unit tests embedded in src/*.zig");
+    unit_test_step.dependOn(&run_mod_tests.step);
+
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/integration_test.zig"),
