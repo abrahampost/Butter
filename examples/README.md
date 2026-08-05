@@ -10,6 +10,7 @@
 | [imports.butter](imports.butter) | **Runs today** | Cross-file `import`/`export` — a diamond dependency (both `imports.butter` and [stats.butter](stats.butter) import [numeric.butter](numeric.butter)) that gets compiled exactly once (ISA.bnf section 8). |
 | [stdlib_math.butter](stdlib_math.butter) | **Runs today** | `import "math.std.butter"` — the bundled standard library (src/stdlib.zig), resolved by name and embedded in the `butter` binary rather than read from a file on disk (ISA.bnf section 8). |
 | [stdlib_collections.butter](stdlib_collections.butter) | **Runs today** | `import "collections.std.butter"` — `Set`, `Stack`, and `Queue`, each a struct wrapping a `map` (src/std/collections.std.butter): set union/intersection/difference/equality, LIFO push/pop/peek, and FIFO enqueue/dequeue/peek. |
+| [stdlib_string.butter](stdlib_string.butter) | **Runs today** | `import "string.std.butter"` — trim/case conversion/reverse, search (`contains`/`startsWith`/`endsWith`/`indexOf`), `split`/`join`/`replace`, `padStart`/`padEnd`/`repeat`, and character classification (`isDigit`/`isAlpha`/`isSpace`), all pure Butter (src/std/string.std.butter) built on the core language's byte-indexed strings plus the `ord`/`join` builtins. |
 | [io.butter](io.butter) | **Runs today** | `read`/`write` against `stdin`, `stdout`, and `stderr` — `write` as `print` without the newline, a short-read copy loop over a byte buffer, and a generic `int[]` buffer serving every size (GRAMMAR.bnf design note 3k, ISA.bnf section 9). Needs input piped in. |
 | [files.butter](files.butter) | **Runs today** | `open`/`read`/`write`/`close` against a real file — `write`/`append`/`read` modes, and a stream that's now a genuine runtime value rather than only ever one of `stdin`/`stdout`/`stderr` (GRAMMAR.bnf design note 3l, ISA.bnf section 10). Creates/overwrites `examples/greeting.txt`. |
 | [json.butter](json.butter) | **Runs today** | `map`/`list` as first-class heap values, bracket-indexing that chains through nested values, `has`/`keys`, `json(...)` parsing a byte buffer read from a real file into a map/list tree, and `stringify(...)` rendering a value back into (properly escaped) JSON text and writing it out again (GRAMMAR.bnf design notes 3m/3n/3o, ISA.bnf sections 11/12/13). Reads [data.json](data.json); creates/overwrites `dump.json`. |
@@ -30,6 +31,7 @@ zig build run -- examples/array_functions.butter
 zig build run -- examples/imports.butter
 zig build run -- examples/stdlib_math.butter
 zig build run -- examples/stdlib_collections.butter
+zig build run -- examples/stdlib_string.butter
 zig build run -- examples/files.butter
 zig build run -- examples/json.butter
 # or, reading from standard input instead of a file:

@@ -742,7 +742,7 @@ pub const Parser = struct {
     ///         | <exists-expr> | <list-dir-expr> | <remove-expr> | <rename-expr>
     ///         | <exec-expr>
     ///         | <now-expr> | <random-expr>
-    ///         | <ord-expr>
+    ///         | <ord-expr> | <join-expr>
     ///         | 'stdin' | 'stdout' | 'stderr' | 'args' | IDENTIFIER
     fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
@@ -813,6 +813,7 @@ pub const Parser = struct {
             .kw_now => return self.nowExpr(),
             .kw_random => return self.randomExpr(),
             .kw_ord => return self.ordExpr(),
+            .kw_join => return self.joinExpr(),
             .kw_stdin => {
                 _ = self.advance();
                 return self.createExpr(.{ .stream_literal = .stdin });
@@ -1195,6 +1196,21 @@ pub const Parser = struct {
         const value = try self.expression();
         _ = try self.expect(.rparen, "expected ')' after the value to convert");
         return self.createExpr(.{ .char_ord = value });
+    }
+
+    /// <join-expr> ::= 'join' '(' <expression> ',' <expression> ')'
+    ///
+    /// Like `has`/`delete` above, `join` is a keyword in expression
+    /// position only — it isn't also a <type> keyword, so a bare
+    /// `join(xs, ",")` is a legal (if pointless) <expr-stmt> too.
+    fn joinExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'join'
+        _ = try self.expect(.lparen, "expected '(' after 'join'");
+        const list = try self.expression();
+        _ = try self.expect(.comma, "expected ',' after the list");
+        const sep = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the separator");
+        return self.createExpr(.{ .list_join = .{ .list = list, .sep = sep } });
     }
 
     /// <exists-expr> ::= 'exists' '(' <expression> ')'
@@ -1806,6 +1822,23 @@ test "ord(x) CAN stand alone as a top-level statement, unlike int(x)" {
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
     try std.testing.expectEqualStrings("A", result.program[0].kind.expr_stmt.char_ord.literal.string);
+}
+
+test "parses join(...) as an expression" {
+    try expectExprSexpr("join(xs, \",\")", "(join xs \",\")");
+    try expectExprSexpr("join(xs, sep)", "(join xs sep)");
+}
+
+test "join(xs, sep) CAN stand alone as a top-level statement, unlike int(x)" {
+    // Same reasoning as ord(x) above: 'join' isn't also a <type> keyword,
+    // so nothing dispatches on it before expression parsing begins.
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "join(xs, \",\")\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.program.len);
+    try std.testing.expectEqualStrings("xs", result.program[0].kind.expr_stmt.list_join.list.variable);
+    try std.testing.expectEqualStrings(",", result.program[0].kind.expr_stmt.list_join.sep.literal.string);
 }
 
 test "getenv(x) CAN stand alone as a top-level statement, unlike int(x)" {

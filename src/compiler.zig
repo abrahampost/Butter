@@ -948,6 +948,7 @@ pub const Compiler = struct {
             .random_float => StaticType{ .scalar = .float },
             .random_range => StaticType{ .scalar = .int },
             .char_ord => StaticType{ .scalar = .int },
+            .list_join => StaticType{ .scalar = .string },
         };
     }
 
@@ -1505,6 +1506,11 @@ pub const Compiler = struct {
             .char_ord => |e| {
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .ord);
+            },
+            .list_join => |j| {
+                try self.compileExpr(j.list);
+                try self.compileExpr(j.sep);
+                _ = try self.chunk.emit(self.allocator, .join);
             },
             .path_exists => |e| {
                 try self.compileExpr(e);
@@ -4608,6 +4614,108 @@ test "ord(...)'s argument may be any expression, not just a literal" {
         \\print ord(s[0..1])
     , &buf);
     try std.testing.expectEqualStrings("90\n", output);
+}
+
+// ---- String join (GRAMMAR.bnf design note 3ac) ---------------------------
+
+test "join(...) concatenates a list of strings with a separator between each" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\list parts := ["a", "b", "c"]
+        \\print join(parts, ", ")
+    , &buf);
+    try std.testing.expectEqualStrings("a, b, c\n", output);
+}
+
+test "join(...) on a single-element list needs no separator" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\list parts := ["only"]
+        \\print join(parts, ", ")
+    , &buf);
+    try std.testing.expectEqualStrings("only\n", output);
+}
+
+test "join(...) on an empty list is the empty string" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\list parts := []
+        \\print join(parts, ", ")
+    , &buf);
+    try std.testing.expectEqualStrings("\n", output);
+}
+
+test "join(...)'s static type lets it initialize a string local" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\list parts := ["x", "y"]
+        \\string s := join(parts, "-")
+        \\print s
+    , &buf);
+    try std.testing.expectEqualStrings("x-y\n", output);
+}
+
+test "join(...)'s static type is checked against the declared type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "list parts := []\nint n := join(parts, \",\")\n", SemanticError.TypeMismatch);
+}
+
+test "join(...) on a non-list first argument is a runtime TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\print join("not a list", ",")
+    , &buf));
+}
+
+test "join(...) on a non-string separator is a runtime TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\list parts := ["a", "b"]
+        \\print join(parts, 1)
+    , &buf));
+}
+
+test "join(...) on a list containing a non-string element is a runtime TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\list parts := ["a", 1]
+        \\print join(parts, ",")
+    , &buf));
+}
+
+test "join(...) leaves the source list untouched — it's read, not consumed" {
+    // join only borrows the list (an ordinary LOAD_LOCAL incref, the same
+    // way MAP_KEYS/LIST_PUSH do); the caller's own variable must still
+    // hold every original element afterward.
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\list parts := ["a", "b"]
+        \\print join(parts, "-")
+        \\push(parts, "c")
+        \\print join(parts, "-")
+    , &buf);
+    try std.testing.expectEqualStrings("a-b\na-b-c\n", output);
+}
+
+test "join(...)'s arguments may be arbitrary expressions, not just literals" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\func makeParts() -> list {
+        \\    list p := ["1", "2", "3"]
+        \\    return p
+        \\}
+        \\print join(makeParts(), "" + "-")
+    , &buf);
+    try std.testing.expectEqualStrings("1-2-3\n", output);
 }
 
 // ---- Time and randomness (GRAMMAR.bnf design note 3y) --------------------

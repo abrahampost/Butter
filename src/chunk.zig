@@ -129,6 +129,12 @@ pub const OpCode = enum(u8) {
     // is an ordinary popped `Value`, not a compile-time constant.
     ord,
 
+    // String join (ISA.bnf section 22, GRAMMAR.bnf design note 3ac). No
+    // operand: both the list and the separator are ordinary popped
+    // `Value`s, not compile-time constants — same shape as MAP_HAS/
+    // MAP_DELETE's two-operand pop.
+    join,
+
     // Environment variables (ISA.bnf section 15, GRAMMAR.bnf design note
     // 3v). No operand, for the same reason PUSH_ARGS has none: the
     // environment lives on the Host passed to `Vm.run`, not in the chunk.
@@ -596,6 +602,20 @@ test "disassemble renders ord" {
     try chunk.disassemble(&writer);
 
     try std.testing.expectEqualStrings("0000 ord\n", writer.buffered());
+}
+
+test "disassemble renders join" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .join);
+
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 join\n", writer.buffered());
 }
 
 test "disassemble renders get_env and has_env" {

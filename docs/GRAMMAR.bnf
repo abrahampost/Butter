@@ -45,7 +45,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'exec'
                | 'now' | 'random'
                | 'struct' | 'enum'
-               | 'ord'
+               | 'ord' | 'join'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -237,6 +237,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <random-expr>
                       | <struct-literal>
                       | <ord-expr>
+                      | <join-expr>
                       | 'stdin' | 'stdout' | 'stderr'
                       | 'args'
                       | IDENTIFIER
@@ -333,6 +334,10 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 (* Character conversion (design note 3ab). Not a <type> keyword, so a bare
    `ord(...)` use is a legal <expr-stmt> too, same as getenv/exists/exec. *)
 <ord-expr>           ::= 'ord' '(' <expression> ')'
+
+(* String join (design note 3ac). Not a <type> keyword, so a bare
+   `join(...)` use is a legal <expr-stmt> too, same as ord/getenv/exists. *)
+<join-expr>          ::= 'join' '(' <expression> ',' <expression> ')'
 
 
 (* --------------------------------------------------------------------------
@@ -567,6 +572,36 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      character-to-byte direction is provided in this pass, matching
      `int(x)`'s own "only float-to-int, not the reverse" asymmetry above —
      a `chr`-style byte-to-character builtin is not implemented here. *)
+
+(* --- String join: join(list, sep) (design note 3ac) ---
+   - `join(list, sep)` evaluates to a fresh `string`: every element of
+     `list` (each must be `string`-shaped — `RuntimeError.TypeMismatch`
+     otherwise) concatenated in order, with `sep` (also `string`-shaped)
+     inserted between each consecutive pair — none before the first
+     element, none after the last. `list` must itself be a `list`
+     (`RuntimeError.TypeMismatch` if it isn't); an empty `list` evaluates to
+     `""` without ever reading `sep`.
+   - THE MOTIVATING CASE: building a string a piece at a time. Strings are
+     immutable (the Strings design notes above: no `s[i] := v`), so `+`
+     always allocates a fresh copy of both operands — repeatedly
+     concatenating inside a loop is O(n^2) in the total bytes copied. This
+     is `join`'s entire reason to exist: accumulate pieces into a `list`
+     with `push` (already O(1) amortized), then call `join` once — one
+     size-then-copy pass over the whole list, ISA.bnf section 22.
+   - DELIBERATELY NOT A NEW MUTABLE VALUE KIND. A dedicated "StringBuilder"
+     type was considered and rejected: `list` is already a mutable,
+     growable accumulator, so the only genuinely missing piece was an
+     efficient many-to-one string-flattening step — one new special form,
+     not a new heap object kind, new opcodes for append/build, or new
+     syntax. `list` stays the one accumulator this language has; `join` is
+     simply how a `list` of `string`s becomes one `string`.
+   - `list`'s elements are read, not consumed: `join` does not empty, free,
+     or otherwise mutate `list` — the caller's own list is exactly as it
+     was before the call, still `push`-able afterward. Nothing about `list`
+     or its elements is aliased into the result either — the returned
+     string owns freshly copied bytes, independent of `list`'s own storage,
+     the same independence `MAP_KEYS` already gives its returned list
+     versus the map it read from. *)
 
 (* --- Program arguments ---
    - `args` is a bare keyword, like `stdin`/`stdout`/`stderr`, but unlike

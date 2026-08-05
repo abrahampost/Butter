@@ -62,6 +62,7 @@ pub const TokenType = enum {
     kw_struct,
     kw_enum,
     kw_ord,
+    kw_join,
 
     // Operators and punctuation
     plus,
@@ -147,6 +148,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "struct", .kw_struct },
     .{ "enum", .kw_enum },
     .{ "ord", .kw_ord },
+    .{ "join", .kw_join },
 });
 
 pub const Token = struct {
@@ -613,6 +615,10 @@ test "'getenv' and 'hasenv' are recognized as keywords" {
 
 test "'ord' is recognized as a keyword" {
     try expectTokenTypes("ord ordx coord", &.{ .kw_ord, .identifier, .identifier, .eof });
+}
+
+test "'join' is recognized as a keyword" {
+    try expectTokenTypes("join joinx rejoin", &.{ .kw_join, .identifier, .identifier, .eof });
 }
 
 test "'exists'/'listDir'/'remove'/'rename' are recognized as keywords" {

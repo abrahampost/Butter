@@ -1863,4 +1863,74 @@
    character counterpart opcode exists in this pass, the same "one
    direction only" scope PARSE_INT's own float-to-int (not int-to-float)
    cast already takes (section 13).
+
+
+(* --------------------------------------------------------------------------
+   22. STRING JOIN (JOIN — one new opcode, no new value kind;
+       GRAMMAR.bnf design note 3ac)
+   -------------------------------------------------------------------------- *)
+
+   JOIN                   ( list sep -- string )
+                                               pops sep (must be
+                                               string-shaped;
+                                               `RuntimeError.TypeMismatch`
+                                               otherwise), then list (must
+                                               be a list Object; TypeMismatch
+                                               otherwise). Two passes over
+                                               list's elements: the first
+                                               validates every element is
+                                               string-shaped (TypeMismatch
+                                               on the first one that isn't)
+                                               and sums the exact output
+                                               length (every element's byte
+                                               length, plus sep's length
+                                               once per gap between
+                                               elements — none before the
+                                               first, none after the last);
+                                               the second allocates a buffer
+                                               of exactly that size once and
+                                               copies each element's bytes
+                                               into it, with a copy of sep
+                                               between consecutive ones.
+                                               Pushes the result as a fresh
+                                               STRING. An empty list pushes
+                                               `""` without ever reading
+                                               sep. What `join(list, sep)`
+                                               (GRAMMAR.bnf design note 3ac)
+                                               compiles to.
+
+   No operand: like MAP_HAS/MAP_DELETE (section 11), both operands are
+   ordinary popped `Value`s, not compile-time constants.
+
+   ONE ALLOCATION, NOT N. This is JOIN's entire reason to exist over
+   compiling `join(...)` as sugar for a loop of ADD (section 3): ADD always
+   allocates a fresh copy of BOTH operands (section 3's own entry), so
+   repeatedly concatenating inside a loop copies the accumulated prefix
+   over and over — O(n^2) total bytes copied building a result of length n.
+   JOIN's two-pass shape (measure, then copy once into an exactly-sized
+   buffer) is O(n) instead, the same "size then copy once" shape WRITE's
+   value form already uses (section 9) and ADD's own single string-pair
+   case does NOT need, since it only ever combines two operands, never a
+   whole list of them.
+
+   list IS READ, NOT CONSUMED. JOIN never appends to, empties, or
+   otherwise mutates list — every element is read via the same
+   `asStringBytes`-style access MAP_KEYS/JSON_STRINGIFY already use on
+   values they don't own outright, never moved or duplicated into the
+   result. JOIN decrefs its own (borrowed, stack-temporary) reference to
+   list when done with it — the exact same balance LOAD_LOCAL's own incref
+   already set up — leaving whatever the caller's own local variable holds
+   completely unaffected: still the same list, still every original
+   element, still `push`-able afterward.
+
+   THIS IS THE "StringBuilder" FEATURE, WITHOUT A NEW VALUE KIND. list
+   (section 11) is already a mutable, O(1)-amortized-push accumulator;
+   JOIN is the one missing piece — an efficient many-strings-to-one
+   flattening step — layered on top of it. A dedicated growable-byte-buffer
+   heap object (a new `Object.payload` variant, a family of append/build
+   opcodes, and — for it to be usable as a variable's declared type — new
+   syntax) was considered and rejected as disproportionate to the actual
+   gap: nothing about JOIN requires list itself to become any more
+   mutable than it already is, or introduces a value kind this language
+   doesn't already have.
    ========================================================================== *)

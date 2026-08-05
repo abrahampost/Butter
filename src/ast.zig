@@ -308,6 +308,14 @@ pub const Expr = union(enum) {
     /// silently truncated to the first byte, matching this VM's usual
     /// "checked, not trusted" stance.
     char_ord: *Expr,
+    /// `join(list, sep)` (GRAMMAR.bnf design note 3ac) — every element of
+    /// `list` (each must be `string`-shaped), concatenated with `sep`
+    /// between consecutive elements, as one fresh string. The single-pass
+    /// counterpart to building a string via repeated `+` in a loop — a
+    /// StringBuilder-shaped problem solved without a new mutable value
+    /// kind, by pairing this with the existing `list`/`push` (ISA.bnf
+    /// section 22).
+    list_join: Join,
 
     pub const Unary = struct {
         op: UnaryOp,
@@ -394,6 +402,11 @@ pub const Expr = union(enum) {
     pub const MapDelete = struct {
         map: *Expr,
         key: *Expr,
+    };
+
+    pub const Join = struct {
+        list: *Expr,
+        sep: *Expr,
     };
 
     pub const JsonParse = struct {
@@ -815,6 +828,13 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
         .char_ord => |e| {
             try writer.writeAll("(ord ");
             try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .list_join => |j| {
+            try writer.writeAll("(join ");
+            try printExpr(writer, j.list);
+            try writer.writeAll(" ");
+            try printExpr(writer, j.sep);
             try writer.writeAll(")");
         },
         .path_exists => |e| {

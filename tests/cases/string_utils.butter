@@ -1,0 +1,53 @@
+import "string.std.butter"
+
+func longestWord(list words) -> string {
+    string longest := ""
+    int i := 0
+    while i < len(words) {
+        if len(words[i]) > len(longest) {
+            longest := words[i]
+        }
+        i := i + 1
+    }
+    return longest
+}
+
+string sentence := "  the quick brown fox jumps over the lazy dog  "
+string trimmed := trim(sentence)
+list words := split(trimmed, " ")
+
+print trimmed
+print len(words)
+print longestWord(words)
+print toUpper(trimmed)
+print toLower(toUpper(trimmed))
+print reverse(trimmed)
+print join(words, "_")
+print startsWith(trimmed, "the")
+print endsWith(trimmed, "dog")
+print contains(trimmed, "fox")
+print indexOf(trimmed, "brown")
+print count(trimmed, "the")
+print replace(trimmed, "the", "THE")
+print padStart(stringify(len(words)), 4, "0")
+print padEnd(stringify(len(words)), 4, "0")
+print repeat("-", 5)
+
+int digits := 0
+int letters := 0
+int spaces := 0
+int i := 0
+while i < len(trimmed) {
+    string c := trimmed[i..(i + 1)]
+    if isDigit(c) {
+        digits := digits + 1
+    } else if isAlpha(c) {
+        letters := letters + 1
+    } else if isSpace(c) {
+        spaces := spaces + 1
+    }
+    i := i + 1
+}
+print digits
+print letters
+print spaces

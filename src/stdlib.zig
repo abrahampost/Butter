@@ -15,6 +15,7 @@ const Entry = struct { name: []const u8, source: []const u8 };
 const entries = [_]Entry{
     .{ .name = "math.std.butter", .source = @embedFile("std/math.std.butter") },
     .{ .name = "collections.std.butter", .source = @embedFile("std/collections.std.butter") },
+    .{ .name = "string.std.butter", .source = @embedFile("std/string.std.butter") },
 };
 
 /// Returns the embedded source for `name` if it names a bundled standard

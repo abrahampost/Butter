@@ -18,6 +18,7 @@ which test one stage (lexer, parser, compiler, VM) in isolation.
 | [collatz.butter](cases/collatz.butter) | Collatz step counts for 1 through 20. |
 | [array_stats.butter](cases/array_stats.butter) | Sum, float average, min, and max of an array. |
 | [quadratic_formula.butter](cases/quadratic_formula.butter) | Quadratic roots via the bundled `math.std.butter`'s `sqrt`/`pow`. |
+| [string_utils.butter](cases/string_utils.butter) | Word stats (count, longest, case conversion, join/split/trim/pad/classify) via the bundled `string.std.butter`. |
 | [string_indexing.butter](cases/string_indexing.butter) | Hand-rolled `key=value;...` parsing via `s[i]` (single-character compare) and `s[a..b]` (slicing), plus basic index/slice reads. |
 | [strings.butter](cases/strings.butter) | String concatenation (`+`) and lexicographic ordering (`<`/`<=`/`>`/`>=`), including a bubble sort by string value. |
 | [args.butter](cases/args.butter) | The bare `args` keyword — run with `expectCaseOutputWithArgs`, which passes a fixed argv instead of the default empty one. |

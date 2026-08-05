@@ -10,9 +10,10 @@
 //!
 //! Cases are standard textbook programs/problems (FizzBuzz, factorial,
 //! Fibonacci, sorting, a sieve, gcd/lcm, binary search, Collatz, array
-//! stats, and the quadratic formula via the bundled math stdlib) chosen to
-//! exercise recursion, loops, fixed/generic arrays, bool arrays, and
-//! imports together, the way a real program would.
+//! stats, the quadratic formula via the bundled math stdlib, and word stats
+//! via the bundled string stdlib) chosen to exercise recursion, loops,
+//! fixed/generic arrays, bool arrays, and imports together, the way a real
+//! program would.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -326,6 +327,10 @@ test "parse_numbers: int(...)/float(...) parse strings into numbers" {
 
 test "escapes: \\n/\\t/\\\\/\\\" decode inside string literals" {
     try expectCaseOutput("escapes");
+}
+
+test "string_utils: word stats via the bundled string stdlib's split/join/trim/case/pad/classify" {
+    try expectCaseOutput("string_utils");
 }
 
 test "try_catch: one caught case per catchable RuntimeError a program can raise" {

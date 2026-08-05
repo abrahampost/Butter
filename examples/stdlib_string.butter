@@ -1,0 +1,26 @@
+import "string.std.butter"
+
+string raw := "  Hello, Butter World!  "
+string trimmed := trim(raw)
+print trimmed
+print toUpper(trimmed)
+print toLower(trimmed)
+print reverse(trimmed)
+
+print contains(trimmed, "Butter")
+print startsWith(trimmed, "Hello")
+print endsWith(trimmed, "!")
+print indexOf(trimmed, "Butter")
+
+list words := split(trimmed, " ")
+print len(words)
+print join(words, "-")
+print replace(trimmed, "Butter", "Zig")
+
+print padStart("7", 4, "0")
+print padEnd("7", 4, "0")
+print repeat("ab", 3)
+
+print isDigit("5")
+print isAlpha("z")
+print isSpace(" ")

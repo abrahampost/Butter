@@ -1,0 +1,323 @@
+# String utilities built on top of the language's core string primitives
+# (byte-indexed `s[i]`/`s[a..b]`, `+`, `==`/`<comparison>`, `ord`) plus the
+# `join` builtin. Everything here is pure Butter — no VM changes beyond
+# `join` itself were needed (see `join`'s own design note, GRAMMAR.bnf
+# design note 3ac): a `list` is already a mutable, growable accumulator, so
+# any function here that needs to build a string a piece at a time (rather
+# than transform one that already exists) accumulates into a `list` with
+# `push` and flattens it with one `join` call at the end, instead of
+# concatenating with `+` in a loop (which would recopy the growing result
+# on every iteration).
+#
+# BYTE-ORIENTED, NOT CODEPOINT-ORIENTED, matching the core language: every
+# function here that walks a string one "character" at a time is really
+# walking it one BYTE at a time (`s[i]` is a length-1 string, one byte). A
+# multi-byte UTF-8 character is several such bytes, each handled
+# independently — fine for the ASCII-range operations below (case
+# conversion, whitespace/digit/letter classification), but not a genuine
+# Unicode-aware implementation of any of them.
+#
+# `toUpper`/`toLower` cover ASCII 'a'..'z'/'A'..'Z' only; every other byte
+# (including any non-ASCII one) passes through unchanged. There is no
+# `chr` (byte -> length-1 string) builtin yet (GRAMMAR.bnf design note
+# 3ab), so both are built from an explicit lookup table (`map`, populated
+# by 26 bracket-assignments) rather than arithmetic on `ord`'s result —
+# once `chr` exists this could shrink to a couple of arithmetic lines.
+#
+# Every lookup table here is rebuilt on each call: functions can't read a
+# top-level variable (GRAMMAR.bnf's Functions design note — "no nesting, no
+# closures... never a top-level or enclosing variable"), so there's no way
+# to build it once and share it across calls in this pass.
+
+# ---- Character classification --------------------------------------------
+# Each takes a single-character (one-byte) string, matching `ord`'s own
+# "exactly one byte" contract (GRAMMAR.bnf design note 3ab) — calling one
+# of the `ord`-based predicates below with a multi-byte or empty string
+# raises the same `RuntimeError.InvalidCharLength` `ord` itself would.
+
+# Checked via `ord` rather than string-literal comparison because carriage
+# return (byte 13) has no `\r` escape sequence in this language (GRAMMAR.bnf
+# design note 3s only defines `\n`/`\t`/`\\`/`\"`).
+export func isSpace(string c) -> bool {
+    int code := ord(c)
+    return code == 32 or code == 9 or code == 10 or code == 13
+}
+
+export func isDigit(string c) -> bool {
+    int code := ord(c)
+    return code >= 48 and code <= 57
+}
+
+export func isUpper(string c) -> bool {
+    int code := ord(c)
+    return code >= 65 and code <= 90
+}
+
+export func isLower(string c) -> bool {
+    int code := ord(c)
+    return code >= 97 and code <= 122
+}
+
+export func isAlpha(string c) -> bool {
+    return isUpper(c) or isLower(c)
+}
+
+export func isAlphaNumeric(string c) -> bool {
+    return isAlpha(c) or isDigit(c)
+}
+
+# ---- Searching -------------------------------------------------------------
+
+# The first index at which `sub` occurs in `s`, or -1 if it doesn't.
+# `sub == ""` matches at index 0, same as every other language's `indexOf`.
+export func indexOf(string s, string sub) -> int {
+    int subLen := len(sub)
+    int sLen := len(s)
+    if subLen == 0 {
+        return 0
+    }
+    if subLen > sLen {
+        return -1
+    }
+    for i in 0..(sLen - subLen + 1) {
+        if s[i..(i + subLen)] == sub {
+            return i
+        }
+    }
+    return -1
+}
+
+export func contains(string s, string sub) -> bool {
+    return indexOf(s, sub) >= 0
+}
+
+export func startsWith(string s, string prefix) -> bool {
+    if len(prefix) > len(s) {
+        return false
+    }
+    return s[0..len(prefix)] == prefix
+}
+
+export func endsWith(string s, string suffix) -> bool {
+    int sLen := len(s)
+    int sufLen := len(suffix)
+    if sufLen > sLen {
+        return false
+    }
+    return s[(sLen - sufLen)..sLen] == suffix
+}
+
+# Non-overlapping occurrences of `sub` in `s`. `sub == ""` is 0, not
+# infinite, unlike `indexOf`'s own "matches at 0" convention.
+export func count(string s, string sub) -> int {
+    if len(sub) == 0 {
+        return 0
+    }
+    return len(split(s, sub)) - 1
+}
+
+# ---- Trimming ---------------------------------------------------------------
+
+export func trimStart(string s) -> string {
+    int n := len(s)
+    int i := 0
+    while i < n and isSpace(s[i..(i + 1)]) {
+        i := i + 1
+    }
+    return s[i..n]
+}
+
+export func trimEnd(string s) -> string {
+    int i := len(s)
+    while i > 0 and isSpace(s[(i - 1)..i]) {
+        i := i - 1
+    }
+    return s[0..i]
+}
+
+export func trim(string s) -> string {
+    return trimEnd(trimStart(s))
+}
+
+# ---- Splitting and joining --------------------------------------------------
+
+# Splits `s` on every occurrence of `sep`, keeping empty pieces (so
+# `split("a,,b", ",")` is `["a", "", "b"]`, and `split(s, sep)` on an `s`
+# that never contains `sep` is `[s]`). `sep == ""` splits into individual
+# one-byte pieces instead (there's no "occurrence" of an empty separator to
+# search for) — `join`, this module's counterpart, reverses either case
+# exactly (`join(split(s, sep), sep) == s` for any non-empty `sep`).
+export func split(string s, string sep) -> list {
+    list result
+    int sepLen := len(sep)
+    int sLen := len(s)
+    if sepLen == 0 {
+        for i in 0..sLen {
+            push(result, s[i..(i + 1)])
+        }
+        return result
+    }
+    int start := 0
+    int i := 0
+    while i <= sLen - sepLen {
+        if s[i..(i + sepLen)] == sep {
+            push(result, s[start..i])
+            i := i + sepLen
+            start := i
+        } else {
+            i := i + 1
+        }
+    }
+    push(result, s[start..sLen])
+    return result
+}
+
+# Every occurrence of `target` in `s` replaced with `replacement`.
+# `target == ""` returns `s` unchanged (nothing meaningful to replace
+# "between every byte" the way some languages define it). Built on
+# `split`/`join` rather than a hand-rolled scan-and-copy loop — splitting
+# on `target` and rejoining with `replacement` between the pieces IS
+# replacement, and reuses `join`'s single-pass string building instead of
+# accumulating the result with `+` in a loop.
+export func replace(string s, string target, string replacement) -> string {
+    if len(target) == 0 {
+        return s
+    }
+    return join(split(s, target), replacement)
+}
+
+# `s` repeated `n` times (`n <= 0` is `""`). Accumulates into a `list` and
+# flattens once with `join`, rather than `+`-concatenating in the loop.
+export func repeat(string s, int n) -> string {
+    list parts
+    for i in 0..n {
+        push(parts, s)
+    }
+    return join(parts, "")
+}
+
+# ---- Padding -----------------------------------------------------------------
+# `pad` may be any length (not just one character) — `s` already at or
+# past `targetLen`, or an empty `pad`, both return `s` unchanged rather
+# than raising: there's no meaningful padding to add in either case.
+
+export func padStart(string s, int targetLen, string pad) -> string {
+    int needed := targetLen - len(s)
+    if needed <= 0 or len(pad) == 0 {
+        return s
+    }
+    int copies := needed / len(pad) + 1
+    string padding := repeat(pad, copies)[0..needed]
+    return padding + s
+}
+
+export func padEnd(string s, int targetLen, string pad) -> string {
+    int needed := targetLen - len(s)
+    if needed <= 0 or len(pad) == 0 {
+        return s
+    }
+    int copies := needed / len(pad) + 1
+    string padding := repeat(pad, copies)[0..needed]
+    return s + padding
+}
+
+# ---- Reversal ----------------------------------------------------------------
+
+# Byte-reversed, not codepoint-reversed (this module's own byte-oriented
+# convention, above) — reversing a string containing multi-byte UTF-8
+# characters scrambles them, the same caveat every byte-indexed operation
+# in the core language already carries.
+export func reverse(string s) -> string {
+    list chars
+    int n := len(s)
+    for i in 0..n {
+        push(chars, s[(n - 1 - i)..(n - i)])
+    }
+    return join(chars, "")
+}
+
+# ---- Case conversion ---------------------------------------------------------
+# ASCII-only (see this file's header comment): every byte outside
+# 'a'..'z'/'A'..'Z' passes through unchanged, non-ASCII bytes included.
+
+export func toUpper(string s) -> string {
+    map upperOf := {}
+    upperOf["a"] := "A"
+    upperOf["b"] := "B"
+    upperOf["c"] := "C"
+    upperOf["d"] := "D"
+    upperOf["e"] := "E"
+    upperOf["f"] := "F"
+    upperOf["g"] := "G"
+    upperOf["h"] := "H"
+    upperOf["i"] := "I"
+    upperOf["j"] := "J"
+    upperOf["k"] := "K"
+    upperOf["l"] := "L"
+    upperOf["m"] := "M"
+    upperOf["n"] := "N"
+    upperOf["o"] := "O"
+    upperOf["p"] := "P"
+    upperOf["q"] := "Q"
+    upperOf["r"] := "R"
+    upperOf["s"] := "S"
+    upperOf["t"] := "T"
+    upperOf["u"] := "U"
+    upperOf["v"] := "V"
+    upperOf["w"] := "W"
+    upperOf["x"] := "X"
+    upperOf["y"] := "Y"
+    upperOf["z"] := "Z"
+
+    list chars
+    for i in 0..len(s) {
+        string c := s[i..(i + 1)]
+        if has(upperOf, c) {
+            push(chars, upperOf[c])
+        } else {
+            push(chars, c)
+        }
+    }
+    return join(chars, "")
+}
+
+export func toLower(string s) -> string {
+    map lowerOf := {}
+    lowerOf["A"] := "a"
+    lowerOf["B"] := "b"
+    lowerOf["C"] := "c"
+    lowerOf["D"] := "d"
+    lowerOf["E"] := "e"
+    lowerOf["F"] := "f"
+    lowerOf["G"] := "g"
+    lowerOf["H"] := "h"
+    lowerOf["I"] := "i"
+    lowerOf["J"] := "j"
+    lowerOf["K"] := "k"
+    lowerOf["L"] := "l"
+    lowerOf["M"] := "m"
+    lowerOf["N"] := "n"
+    lowerOf["O"] := "o"
+    lowerOf["P"] := "p"
+    lowerOf["Q"] := "q"
+    lowerOf["R"] := "r"
+    lowerOf["S"] := "s"
+    lowerOf["T"] := "t"
+    lowerOf["U"] := "u"
+    lowerOf["V"] := "v"
+    lowerOf["W"] := "w"
+    lowerOf["X"] := "x"
+    lowerOf["Y"] := "y"
+    lowerOf["Z"] := "z"
+
+    list chars
+    for i in 0..len(s) {
+        string c := s[i..(i + 1)]
+        if has(lowerOf, c) {
+            push(chars, lowerOf[c])
+        } else {
+            push(chars, c)
+        }
+    }
+    return join(chars, "")
+}

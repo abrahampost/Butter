@@ -1748,6 +1748,49 @@ pub const Vm = struct {
                 try self.push(.{ .int = bytes[0] });
             },
 
+            // ---- String join (ISA.bnf section 22) ----
+
+            .join => {
+                const sep_val = try self.pop();
+                defer sep_val.decref(self.allocator);
+                const list_val = try self.pop();
+                defer list_val.decref(self.allocator);
+
+                const sep = sep_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                if (list_val != .object or list_val.object.payload != .list) return RuntimeError.TypeMismatch;
+                const items = list_val.object.payload.list.items;
+
+                // Two passes over the same list: the first only measures
+                // (and validates every element is string-shaped) so the
+                // second can copy into one already-correctly-sized
+                // allocation — no growing buffer, no O(n^2) re-copying the
+                // way building this same string via repeated `+` would.
+                var total_len: usize = 0;
+                for (items, 0..) |item, i| {
+                    const bytes = item.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                    total_len += bytes.len;
+                    if (i > 0) total_len += sep.len;
+                }
+
+                const out = try self.allocator.alloc(u8, total_len);
+                var offset: usize = 0;
+                for (items, 0..) |item, i| {
+                    if (i > 0) {
+                        @memcpy(out[offset..][0..sep.len], sep);
+                        offset += sep.len;
+                    }
+                    const bytes = item.asStringBytes().?;
+                    @memcpy(out[offset..][0..bytes.len], bytes);
+                    offset += bytes.len;
+                }
+
+                const obj = Object.create(self.allocator, .{ .string = out }) catch |err| {
+                    self.allocator.free(out);
+                    return err;
+                };
+                try self.push(.{ .object = obj });
+            },
+
             // ---- Environment variables (ISA.bnf section 15) ----
 
             .get_env => {
@@ -4644,6 +4687,97 @@ test "ord on a non-string value is TypeMismatch" {
     const n = try chunk.addConstant(allocator, .{ .int = 65 });
     _ = try chunk.emitWithOperand(allocator, .push_const, n);
     _ = try chunk.emit(allocator, .ord);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+// ---- String join (ISA.bnf section 22) -------------------------------------
+
+test "join concatenates a list of strings with a separator between each" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
+    const b = try chunk.addConstant(allocator, try Value.newString(allocator, "b"));
+    const c = try chunk.addConstant(allocator, try Value.newString(allocator, "c"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emitWithOperand(allocator, .push_const, b);
+    _ = try chunk.emitWithOperand(allocator, .push_const, c);
+    _ = try chunk.emitWithOperand(allocator, .make_list, 3);
+
+    const sep = try chunk.addConstant(allocator, try Value.newString(allocator, ", "));
+    _ = try chunk.emitWithOperand(allocator, .push_const, sep);
+    _ = try chunk.emit(allocator, .join);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("a, b, c\n", buf[0..len]);
+}
+
+test "join on an empty list is the empty string, and never reads the separator between anything" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emitWithOperand(allocator, .make_list, 0);
+    const sep = try chunk.addConstant(allocator, try Value.newString(allocator, ", "));
+    _ = try chunk.emitWithOperand(allocator, .push_const, sep);
+    _ = try chunk.emit(allocator, .join);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    try std.testing.expectEqualStrings("\n", buf[0..len]);
+}
+
+test "join on a non-list first operand is TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const not_a_list = try chunk.addConstant(allocator, try Value.newString(allocator, "nope"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, not_a_list);
+    const sep = try chunk.addConstant(allocator, try Value.newString(allocator, ","));
+    _ = try chunk.emitWithOperand(allocator, .push_const, sep);
+    _ = try chunk.emit(allocator, .join);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "join on a non-string separator is TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emitWithOperand(allocator, .make_list, 0);
+    const sep = try chunk.addConstant(allocator, .{ .int = 1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, sep);
+    _ = try chunk.emit(allocator, .join);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+test "join on a list containing a non-string element is TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "a"));
+    const n = try chunk.addConstant(allocator, .{ .int = 1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, a);
+    _ = try chunk.emitWithOperand(allocator, .push_const, n);
+    _ = try chunk.emitWithOperand(allocator, .make_list, 2);
+
+    const sep = try chunk.addConstant(allocator, try Value.newString(allocator, ","));
+    _ = try chunk.emitWithOperand(allocator, .push_const, sep);
+    _ = try chunk.emit(allocator, .join);
     _ = try chunk.emit(allocator, .halt);
 
     try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
