@@ -10,6 +10,7 @@ pub const value = @import("value.zig");
 pub const chunk = @import("chunk.zig");
 pub const vm = @import("vm.zig");
 pub const compiler = @import("compiler.zig");
+pub const optimizer = @import("optimizer.zig");
 pub const module = @import("module.zig");
 pub const stdlib = @import("stdlib.zig");
 pub const json = @import("json.zig");

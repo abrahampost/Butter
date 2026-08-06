@@ -129,6 +129,15 @@ pub fn main(init: std.process.Init) !void {
 
     const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry_module);
 
+    // Constant-fold and dead-code-eliminate every module's AST in place
+    // before compiling it — see optimizer.zig. Each unit's program is
+    // reassigned since a module whose top-level code provably never falls
+    // through past some point (e.g. an unconditional `exit`) can come back
+    // shorter than it went in.
+    for (modules.units) |*unit| {
+        unit.program = try butter.optimizer.optimizeProgram(loader.allocator(), unit.program);
+    }
+
     var compiler = butter.compiler.Compiler.init(gpa);
     var chunk = compiler.compileModules(modules.entry_index, modules.units) catch |err| switch (err) {
         error.OutOfMemory => return err,
