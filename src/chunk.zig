@@ -321,8 +321,28 @@ pub const Chunk = struct {
         return if (line == 0) null else line;
     }
 
-    /// Returns the new constant's pool index, for use as a PUSH_CONST operand.
+    /// Returns `value`'s pool index, for use as a PUSH_CONST operand — an
+    /// existing entry if `value` is already pooled (`constantEql`), or a
+    /// freshly appended one otherwise. Every `addConstant` call site builds
+    /// `value` fresh right before calling (never passes a value borrowed
+    /// from anywhere else), so interning is safe: a repeated string literal
+    /// (the same map key spelled out in every loop iteration's source, the
+    /// same `""` `Compiler.defaultValue` default for every uninitialized
+    /// `string` local) shares one pool slot and one heap allocation instead
+    /// of growing the pool — and, for a heap-object `value`, one PUSH_CONST
+    /// still incref's it on every push and `deinit` still releases it
+    /// exactly once, same as any other pool entry (this file's doc comment).
+    ///
+    /// Takes ownership of `value` either way: kept as the new pool entry on
+    /// a miss, or `decref`'d immediately on a hit (a no-op unless it's a
+    /// heap object — the caller's now-redundant fresh allocation).
     pub fn addConstant(self: *Chunk, allocator: std.mem.Allocator, value: Value) !u32 {
+        for (self.constants.items, 0..) |existing, i| {
+            if (constantEql(existing, value)) {
+                value.decref(allocator);
+                return @intCast(i);
+            }
+        }
         const index = self.constants.items.len;
         try self.constants.append(allocator, value);
         return @intCast(index);
@@ -330,6 +350,39 @@ pub const Chunk = struct {
 
     pub fn patchOperand(self: *Chunk, index: usize, operand: u32) void {
         self.code.items[index].operand = operand;
+    }
+
+    /// Whether `a` and `b` are the same constant-pool ENTRY — stricter than
+    /// `value.zig`'s own `Value.eql`, which is Butter's `==` operator and
+    /// deliberately crosses `int`/`float` (`1 == 1.0`). Pool entries must
+    /// never do that: a PUSH_CONST compiled for a declared-`int` expression
+    /// could otherwise get interned onto a pooled `float`, and every opcode
+    /// downstream that switches on a `Value`'s own tag (ADD's int-vs-float
+    /// path, FIELD_GET's record check, ...) would see the wrong one. Every
+    /// other field compares exactly as `Value.eql` already does. Only
+    /// `.object{.string}` is considered among object payloads — a list/map/
+    /// struct is never itself built via `addConstant` (those come from
+    /// MAKE_LIST/MAKE_MAP/MAKE_STRUCT at runtime; only a map-literal KEY,
+    /// itself a string, reaches the constant pool) — so `.list`/`.map`/
+    /// `.record` simply never match, which is also the correct answer for
+    /// them (list/map/record equality is pointer identity, and two
+    /// separately-built ones are never the same object to begin with).
+    fn constantEql(a: Value, b: Value) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .int => |v| v == b.int,
+            .float => |v| v == b.float,
+            .boolean => |v| v == b.boolean,
+            .array_ref => |v| v.base == b.array_ref.base and v.len == b.array_ref.len,
+            .stream => |v| std.meta.eql(v, b.stream),
+            .null_value => true,
+            .enum_value => |v| v.type_index == b.enum_value.type_index and v.variant == b.enum_value.variant,
+            .function => |v| v.index == b.function.index,
+            .object => |v| switch (v.payload) {
+                .string => |s| b.object.payload == .string and std.mem.eql(u8, s, b.object.payload.string),
+                .list, .map, .record => false,
+            },
+        };
     }
 
     /// Human-readable listing, one instruction per line, primarily for
@@ -460,6 +513,60 @@ test "addConstant returns sequential pool indices" {
 
     try std.testing.expectEqual(@as(u32, 0), a);
     try std.testing.expectEqual(@as(u32, 1), b);
+}
+
+test "addConstant interns a repeated scalar into the same pool entry" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, .{ .int = 7 });
+    const b = try chunk.addConstant(allocator, .{ .int = 7 });
+
+    try std.testing.expectEqual(a, b);
+    try std.testing.expectEqual(@as(usize, 1), chunk.constants.items.len);
+}
+
+test "addConstant never interns an int onto an equal-valued float, or vice versa" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const int_idx = try chunk.addConstant(allocator, .{ .int = 1 });
+    const float_idx = try chunk.addConstant(allocator, .{ .float = 1.0 });
+
+    try std.testing.expect(int_idx != float_idx);
+    try std.testing.expectEqual(@as(usize, 2), chunk.constants.items.len);
+}
+
+test "addConstant interns a repeated string literal, freeing the redundant allocation" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    // Two SEPARATELY allocated strings with the same content, exactly as
+    // `Compiler.compileLiteral` builds one fresh per occurrence of the same
+    // source literal — proves interning compares by content, not identity,
+    // and that the second (redundant) allocation is freed rather than
+    // leaked or double-freed (`std.testing.allocator` catches either).
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "hello"));
+    const b = try chunk.addConstant(allocator, try Value.newString(allocator, "hello"));
+
+    try std.testing.expectEqual(a, b);
+    try std.testing.expectEqual(@as(usize, 1), chunk.constants.items.len);
+    try std.testing.expectEqualStrings("hello", chunk.constants.items[0].asStringBytes().?);
+}
+
+test "addConstant does not intern distinct strings" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const a = try chunk.addConstant(allocator, try Value.newString(allocator, "foo"));
+    const b = try chunk.addConstant(allocator, try Value.newString(allocator, "bar"));
+
+    try std.testing.expect(a != b);
+    try std.testing.expectEqual(@as(usize, 2), chunk.constants.items.len);
 }
 
 test "disassemble renders operands appropriately for each instruction shape" {
