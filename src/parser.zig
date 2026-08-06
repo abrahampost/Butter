@@ -1048,6 +1048,7 @@ pub const Parser = struct {
             .kw_listdir => return self.listDirExpr(),
             .kw_remove => return self.removeExpr(),
             .kw_rename => return self.renameExpr(),
+            .kw_mkdir => return self.mkdirExpr(),
             .kw_exec => return self.execExpr(),
             .kw_now => return self.nowExpr(),
             .kw_random => return self.randomExpr(),
@@ -1488,6 +1489,15 @@ pub const Parser = struct {
         const to = try self.expression();
         _ = try self.expect(.rparen, "expected ')' after the destination path");
         return self.createExpr(.{ .path_rename = .{ .from = from, .to = to } });
+    }
+
+    /// <mkdir-expr> ::= 'mkdir' '(' <expression> ')'
+    fn mkdirExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'mkdir'
+        _ = try self.expect(.lparen, "expected '(' after 'mkdir'");
+        const path = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the path");
+        return self.createExpr(.{ .path_mkdir = path });
     }
 
     /// <exec-expr> ::= 'exec' '(' <expression> ',' <expression> ')'
@@ -2092,24 +2102,25 @@ test "getenv(x) CAN stand alone as a top-level statement, unlike int(x)" {
     try std.testing.expectEqualStrings("HOME", result.program[0].kind.expr_stmt.env_get.literal.string);
 }
 
-test "parses exists(...)/listDir(...)/remove(...)/rename(...) as expressions" {
+test "parses exists(...)/listDir(...)/remove(...)/rename(...)/mkdir(...) as expressions" {
     try expectExprSexpr("exists(\"a.txt\")", "(exists \"a.txt\")");
     try expectExprSexpr("listDir(\"dir\")", "(listDir \"dir\")");
     try expectExprSexpr("remove(\"a.txt\")", "(remove \"a.txt\")");
     try expectExprSexpr("rename(\"a.txt\", \"b.txt\")", "(rename \"a.txt\" \"b.txt\")");
+    try expectExprSexpr("mkdir(\"dir\")", "(mkdir \"dir\")");
     try expectExprSexpr("exists(dir + \"/a.txt\")", "(exists (+ dir \"/a.txt\"))");
 }
 
-test "exists(x)/listDir(x)/remove(x)/rename(x, y) CAN each stand alone as a top-level statement" {
-    // None of `exists`/`listDir`/`remove`/`rename` is a <type> keyword, so
-    // (like `getenv`) nothing dispatches on them before expression parsing
-    // begins — each reaches exprStatement and parses as an ordinary
-    // discarded expression.
+test "exists(x)/listDir(x)/remove(x)/rename(x, y)/mkdir(x) CAN each stand alone as a top-level statement" {
+    // None of `exists`/`listDir`/`remove`/`rename`/`mkdir` is a <type>
+    // keyword, so (like `getenv`) nothing dispatches on them before
+    // expression parsing begins — each reaches exprStatement and parses as
+    // an ordinary discarded expression.
     const allocator = std.testing.allocator;
-    var result = try parseProgramSource(allocator, "exists(\"a\")\nlistDir(\"a\")\nremove(\"a\")\nrename(\"a\", \"b\")\n");
+    var result = try parseProgramSource(allocator, "exists(\"a\")\nlistDir(\"a\")\nremove(\"a\")\nrename(\"a\", \"b\")\nmkdir(\"a\")\n");
     defer result.parser.deinit();
 
-    try std.testing.expectEqual(@as(usize, 4), result.program.len);
+    try std.testing.expectEqual(@as(usize, 5), result.program.len);
 }
 
 test "parses exec(...) as an expression" {

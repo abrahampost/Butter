@@ -296,6 +296,16 @@ pub const Expr = union(enum) {
     /// error" split as `path_remove`). Any other failure is
     /// `RuntimeError.RenameFailed`.
     path_rename: PathRename,
+    /// `mkdir(path)` — creates the directory named by `path`, evaluating to
+    /// whether a NEW directory was made: `true` if `path` didn't exist and
+    /// now does, `false` if a directory was already there (the mirror image
+    /// of `path_remove`'s "absent is a no-op" split — here, "already
+    /// present" is the no-op). NOT recursive: a missing parent directory is
+    /// `RuntimeError.MkdirFailed`, not silently created, matching
+    /// `list_dir`/`path_remove`'s own one-level-only stance. `path` existing
+    /// as something other than a directory (a plain file, say) is also
+    /// `RuntimeError.MkdirFailed`, not the no-op case.
+    path_mkdir: *Expr,
     /// `exec(command, args)` (GRAMMAR.bnf design note 3x) — spawns `command`
     /// with `args` (a `list` of strings) as its own argv[1..], waits for it
     /// to exit, and evaluates to a fresh `map` with three keys, always all
@@ -915,6 +925,11 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
             try printExpr(writer, r.from);
             try writer.writeAll(" ");
             try printExpr(writer, r.to);
+            try writer.writeAll(")");
+        },
+        .path_mkdir => |e| {
+            try writer.writeAll("(mkdir ");
+            try printExpr(writer, e);
             try writer.writeAll(")");
         },
         .exec => |x| {

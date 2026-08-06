@@ -376,7 +376,7 @@ test "env: with no host env, every variable is unset" {
     try std.testing.expectEqualStrings("false\n0\n", actual);
 }
 
-test "dir_ops: exists/listDir/remove/rename against a real scratch directory" {
+test "dir_ops: exists/listDir/remove/rename/mkdir against a real scratch directory" {
     try expectCaseOutputWithFs("dir_ops");
 }
 

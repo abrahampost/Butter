@@ -60,9 +60,9 @@ pub const RuntimeError = error{
     FilesUnavailable,
 
     // Directory and filesystem metadata (ISA.bnf section 16, GRAMMAR.bnf
-    // design note 3w). `path_exists` never raises any of these three — an
+    // design note 3w). `path_exists` never raises any of these four — an
     // access failure it can't otherwise classify just reads as `false` — so
-    // this trio only ever comes from `listDir`/`remove`/`rename`.
+    // this quartet only ever comes from `listDir`/`remove`/`rename`/`mkdir`.
     /// `listDir(path)` couldn't list `path`'s entries — it doesn't exist,
     /// isn't a directory, or can't be opened for another reason (no
     /// permission, an I/O error). Unlike `remove`/`rename` below, there is
@@ -80,6 +80,13 @@ pub const RuntimeError = error{
     /// error). `from` simply not existing is NOT this, for the same reason
     /// it isn't for `RemoveFailed`.
     RenameFailed,
+    /// `mkdir(path)` couldn't create `path` as a directory (a missing
+    /// parent directory, no permission, an I/O error, or `path` already
+    /// existing as something OTHER than a directory — a plain file, say).
+    /// `path` already existing as a directory is NOT this — `mkdir` reports
+    /// that by evaluating to `false` instead, the mirror image of
+    /// `RemoveFailed`'s own "absent is a no-op" split.
+    MkdirFailed,
 
     // Subprocess execution (ISA.bnf section 17, GRAMMAR.bnf design note
     // 3x). `Vm.diagnostic` carries which command and why for the latter two
@@ -960,6 +967,34 @@ pub const Vm = struct {
         return true;
     }
 
+    /// `mkdir(path)` (ISA.bnf section 16) — creates `path` as a directory,
+    /// non-recursively (a missing PARENT directory is a failure, not
+    /// silently created, matching `listDir`/`removePath`'s own
+    /// one-level-only stance). Mirrors `removePath`'s "absent is a no-op"
+    /// split from the other direction: `path` already existing AS A
+    /// DIRECTORY evaluates to `false` (mkdir is a no-op against a target
+    /// it's already reached), not an error. `createDir` alone can't tell
+    /// that apart from `path` existing as something else (a plain file) —
+    /// both report `error.PathAlreadyExists` — so that case is
+    /// disambiguated the same way `removePath` disambiguates `error.IsDir`:
+    /// with a follow-up call, here `openDir`, which fails with
+    /// `error.NotDir` for a non-directory. Any other failure (that
+    /// follow-up open failing, or `createDir` itself failing with anything
+    /// other than `PathAlreadyExists`) is `RuntimeError.MkdirFailed`.
+    fn makeDir(self: *Vm, host: Host, path: []const u8) RuntimeError!bool {
+        const fs = host.fs orelse return self.failFile(RuntimeError.FilesUnavailable, "mkdir", path, "this program was run without filesystem access");
+
+        fs.dir.createDir(fs.io, path, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                var existing = fs.dir.openDir(fs.io, path, .{}) catch |open_err| return self.failFile(RuntimeError.MkdirFailed, "mkdir", path, @errorName(open_err));
+                existing.close(fs.io);
+                return false;
+            },
+            else => return self.failFile(RuntimeError.MkdirFailed, "mkdir", path, @errorName(err)),
+        };
+        return true;
+    }
+
     /// `exec(command, args)` (ISA.bnf section 17) — spawns `command` with
     /// `args` (each already checked string-shaped by the EXEC handler below)
     /// as its own argv[1..], waits for it to exit, and returns a fresh `map`
@@ -1245,6 +1280,7 @@ pub const Vm = struct {
             error.ListDirFailed,
             error.RemoveFailed,
             error.RenameFailed,
+            error.MkdirFailed,
             error.ProcessesUnavailable,
             error.ProcessSpawnFailed,
             error.ProcessTerminatedAbnormally,
@@ -1961,6 +1997,12 @@ pub const Vm = struct {
                 const to = to_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 const from = from_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 try self.push(.{ .boolean = try self.renamePath(host, from, to) });
+            },
+            .path_mkdir => {
+                const path_val = try self.pop();
+                defer path_val.decref(self.allocator);
+                const path = path_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
+                try self.push(.{ .boolean = try self.makeDir(host, path) });
             },
 
             // ---- Subprocess execution (ISA.bnf section 17) ----
@@ -3430,9 +3472,9 @@ test "open with a non-string path is a type mismatch" {
 // `std.testing.tmpDir`) provides; this file has none of its own the way
 // the Files section above doesn't either.
 
-test "exists/listDir/remove/rename without filesystem access are FilesUnavailable" {
+test "exists/listDir/remove/rename/mkdir without filesystem access are FilesUnavailable" {
     const allocator = std.testing.allocator;
-    inline for (.{ .path_exists, .list_dir, .path_remove }) |op| {
+    inline for (.{ .path_exists, .list_dir, .path_remove, .path_mkdir }) |op| {
         var chunk: Chunk = .{};
         defer chunk.deinit(allocator);
 
@@ -3456,9 +3498,9 @@ test "exists/listDir/remove/rename without filesystem access are FilesUnavailabl
     try expectRuntimeError(&chunk, RuntimeError.FilesUnavailable);
 }
 
-test "exists/listDir/remove/rename on a non-string operand are TypeMismatch" {
+test "exists/listDir/remove/rename/mkdir on a non-string operand are TypeMismatch" {
     const allocator = std.testing.allocator;
-    inline for (.{ .path_exists, .list_dir, .path_remove }) |op| {
+    inline for (.{ .path_exists, .list_dir, .path_remove, .path_mkdir }) |op| {
         var chunk: Chunk = .{};
         defer chunk.deinit(allocator);
 
@@ -5805,6 +5847,7 @@ test "every RuntimeError variant has the catchability ISA.bnf section 14 documen
         RuntimeError.ListDirFailed,
         RuntimeError.RemoveFailed,
         RuntimeError.RenameFailed,
+        RuntimeError.MkdirFailed,
         RuntimeError.ProcessesUnavailable,
         RuntimeError.ProcessSpawnFailed,
         RuntimeError.ProcessTerminatedAbnormally,

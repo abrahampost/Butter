@@ -1,18 +1,15 @@
 # try/catch (GRAMMAR.bnf design note 3u, ISA.bnf section 14) — one case
 # per catchable RuntimeError variant a Butter program can actually raise.
 #
-# Seven catchable variants are deliberately absent, because no program text
+# Six catchable variants are deliberately absent, because no program text
 # can provoke them: FilesUnavailable needs an embedder that supplied no
 # filesystem, StreamWriteFailed needs an output stream that fails mid-write
 # (both covered by unit tests in src/compiler.zig), StreamReadFailed and
 # FileCloseFailed need a genuine OS-level I/O failure — src/vm.zig's
 # catchability-table test is the only per-variant coverage those two can
-# get — RemoveFailed (design note 3w) needs a non-empty directory to
-# remove, which nothing here can create: Butter has no `mkdir` builtin
-# (src/compiler.zig's own RemoveFailed test seeds one directly via Zig,
-# outside the language) — and ProcessSpawnFailed/ProcessTerminatedAbnormally
-# (design note 3x) need `exec` permission, which this case deliberately
-# doesn't have (see ProcessesUnavailable below); both are covered instead by
+# get — and ProcessSpawnFailed/ProcessTerminatedAbnormally (design note 3x)
+# need `exec` permission, which this case deliberately doesn't have (see
+# ProcessesUnavailable below); both are covered instead by
 # src/compiler.zig's `runProgramWithProcess` tests. The four NON-catchable
 # variants have their own escape tests in src/vm.zig; by construction none
 # of them can appear here, since a program that raises one never reaches its
@@ -164,6 +161,21 @@ try {
     rename("data.txt", "no_such_dir/moved.txt")
 } catch e {
     show("RenameFailed", e)
+}
+
+try {
+    mkdir("nonempty_dir")
+    int f := open("nonempty_dir/inside.txt", write)
+    close f
+    remove("nonempty_dir")
+} catch e {
+    show("RemoveFailed", e)
+}
+
+try {
+    mkdir("no_such_dir/sub")
+} catch e {
+    show("MkdirFailed", e)
 }
 
 # --- Subprocess execution (design note 3x) ----------------------------

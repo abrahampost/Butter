@@ -16,6 +16,8 @@ StreamClosed
 CannotCloseStandardStream
 ListDirFailed
 RenameFailed
+RemoveFailed
+MkdirFailed
 ProcessesUnavailable
 ClockUnavailable
 InvalidRange

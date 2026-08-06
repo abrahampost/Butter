@@ -16,7 +16,7 @@
 | [json.butter](json.butter) | **Runs today** | `map`/`list` as first-class heap values, bracket-indexing that chains through nested values, `has`/`keys`, `json(...)` parsing a byte buffer read from a real file into a map/list tree, and `stringify(...)` rendering a value back into (properly escaped) JSON text and writing it out again (GRAMMAR.bnf design notes 3m/3n/3o, ISA.bnf sections 11/12/13). Reads [data.json](data.json); creates/overwrites `dump.json`. |
 | [env_vars.butter](env_vars.butter) | **Runs today** | `getenv`/`hasenv` (GRAMMAR.bnf design note 3v, ISA.bnf section 15) — reading configuration from the environment, with a built-in default that a variable overrides, `hasenv` telling an exported-but-empty setting from an absent one, and a numeric setting parsed under `try`/`catch`. Set `EDITOR`/`BUTTER_WIDTH`/`BUTTER_HEIGHT` to see it react. |
 | [cli_args.butter](cli_args.butter) | **Runs today** | The bare `args` keyword (GRAMMAR.bnf design note 3p, ISA.bnf's PUSH_ARGS) — everything after a literal `--` on the CLI's own command line, as a `list` of strings. Needs `-- <name> ...` passed on the command line. |
-| [dir_ops.butter](dir_ops.butter) | **Runs today** | `exists`/`listDir`/`remove`/`rename` (GRAMMAR.bnf design note 3w, ISA.bnf section 16) — checking a path without opening it, listing a real directory's entries, and moving/deleting a scratch file, each showing the "absent is a no-op, not an error" bool split and a genuine failure caught via `try`/`catch`. Creates and cleans up `examples/dir_ops_scratch.txt`. |
+| [dir_ops.butter](dir_ops.butter) | **Runs today** | `exists`/`listDir`/`remove`/`rename`/`mkdir` (GRAMMAR.bnf design note 3w, ISA.bnf section 16) — checking a path without opening it, listing a real directory's entries, moving/deleting a scratch file, and creating/removing a scratch directory, each showing the "absent"/"already there" is-a-no-op bool split and a genuine failure caught via `try`/`catch`. Creates and cleans up `examples/dir_ops_scratch.txt` and `examples/dir_ops_scratch_dir`. |
 | [exec.butter](exec.butter) | **Runs today** | `exec(command, args)` (GRAMMAR.bnf design note 3x, ISA.bnf section 17) — spawning a real child process and capturing its `stdout`/`stderr`/`exit_code` as a `map`, plus a missing-program `ProcessSpawnFailed` caught via `try`/`catch`. Picks a small per-OS shell command via `hasenv("windir")`. |
 | [time_random.butter](time_random.butter) | **Runs today** | `now()`/`random()`/`random(a, b)` (GRAMMAR.bnf design note 3y, ISA.bnf section 18) — a timestamp, a crude time+randomness unique ID, a die roll and a coin flip via `random(a, b)`'s end-exclusive range, an empty-range `InvalidRange` caught via `try`/`catch`, and a trivial `now()`-based timing measurement. |
 | [string_interpolation.butter](string_interpolation.butter) | **Runs today** | `"...${expr}..."` interpolation (GRAMMAR.bnf design note 3ae, ISA.bnf section 23) — a variable, arithmetic, a struct field, a function call, list/map values and indexing, an enum variant, escaping a literal `${`/`$` with `\$`, and a nested interpolated string inside `${...}`. |
@@ -81,8 +81,8 @@ create/overwrite one file on disk.
 `dir_ops.butter` is likewise relative-to-current-directory, and also lists
 `examples/` itself — run it from the repo root as shown above. Unlike
 `files.butter`/`json.butter`, it doesn't leave anything behind: the scratch
-file it creates gets renamed and then removed again before the program
-ends.
+file it creates gets renamed and then removed again, and the scratch
+directory it creates gets removed again, before the program ends.
 
 `time_random.butter` draws real wall-clock time and real entropy (the CLI
 never sets `Host.rng_seed` — see ISA.bnf section 18), so its output is

@@ -57,6 +57,7 @@ pub const TokenType = enum {
     kw_listdir,
     kw_remove,
     kw_rename,
+    kw_mkdir,
     kw_exec,
     kw_now,
     kw_random,
@@ -144,6 +145,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "listDir", .kw_listdir },
     .{ "remove", .kw_remove },
     .{ "rename", .kw_rename },
+    .{ "mkdir", .kw_mkdir },
     .{ "exec", .kw_exec },
     .{ "now", .kw_now },
     .{ "random", .kw_random },
@@ -761,6 +763,12 @@ test "'exists'/'listDir'/'remove'/'rename' are recognized as keywords" {
     try expectTokenTypes("exists listDir remove rename existsx listdir Remove", &.{
         .kw_exists,  .kw_listdir, .kw_remove,  .kw_rename,
         .identifier, .identifier, .identifier, .eof,
+    });
+}
+
+test "'mkdir' is recognized as a keyword" {
+    try expectTokenTypes("mkdir mkdirx Mkdir", &.{
+        .kw_mkdir, .identifier, .identifier, .eof,
     });
 }
 

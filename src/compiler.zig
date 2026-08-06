@@ -1046,6 +1046,7 @@ pub const Compiler = struct {
             .list_dir => StaticType{ .scalar = .list },
             .path_remove => StaticType{ .scalar = .bool },
             .path_rename => StaticType{ .scalar = .bool },
+            .path_mkdir => StaticType{ .scalar = .bool },
             .exec => StaticType{ .scalar = .map },
             .time_now => StaticType{ .scalar = .float },
             .random_float => StaticType{ .scalar = .float },
@@ -1646,6 +1647,10 @@ pub const Compiler = struct {
                 try self.compileExpr(r.from);
                 try self.compileExpr(r.to);
                 _ = try self.chunk.emit(self.allocator, .path_rename);
+            },
+            .path_mkdir => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .path_mkdir);
             },
             .exec => |x| {
                 try self.compileExpr(x.command);
@@ -4262,7 +4267,7 @@ test "rename(...) into a missing destination directory is RenameFailed, not a si
     , tmp.dir, &out_buf, &err_buf));
 }
 
-test "a program run with no filesystem access can't use exists/listDir/remove/rename" {
+test "a program run with no filesystem access can't use exists/listDir/remove/rename/mkdir" {
     const allocator = std.testing.allocator;
     var out_buf: [64]u8 = undefined;
     var err_buf: [64]u8 = undefined;
@@ -4278,13 +4283,56 @@ test "a program run with no filesystem access can't use exists/listDir/remove/re
     try std.testing.expectError(vm_mod.RuntimeError.FilesUnavailable, runProgramWithIo(allocator,
         \\rename("a.txt", "b.txt")
     , "", &out_buf, &err_buf));
+    try std.testing.expectError(vm_mod.RuntimeError.FilesUnavailable, runProgramWithIo(allocator,
+        \\mkdir("anything")
+    , "", &out_buf, &err_buf));
 }
 
-test "listDir(...)'s static type is list, remove/rename's is bool" {
+test "listDir(...)'s static type is list, remove/rename/mkdir's is bool" {
     const allocator = std.testing.allocator;
     try expectCompileError(allocator, "int n := listDir(\".\")\n", SemanticError.TypeMismatch);
     try expectCompileError(allocator, "int n := remove(\"a\")\n", SemanticError.TypeMismatch);
     try expectCompileError(allocator, "int n := rename(\"a\", \"b\")\n", SemanticError.TypeMismatch);
+    try expectCompileError(allocator, "int n := mkdir(\"a\")\n", SemanticError.TypeMismatch);
+}
+
+test "mkdir(...) creates a directory, evaluating to whether it was newly made" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    const result = try runProgramWithFs(allocator,
+        \\print exists("sub")
+        \\print mkdir("sub")
+        \\print exists("sub")
+        \\print mkdir("sub")
+    , tmp.dir, &out_buf, &err_buf);
+    try std.testing.expectEqualStrings("false\ntrue\ntrue\nfalse\n", result.out);
+}
+
+test "mkdir(...) is not recursive: a missing parent directory is MkdirFailed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.MkdirFailed, runProgramWithFs(allocator,
+        \\mkdir("no-such-parent/sub")
+    , tmp.dir, &out_buf, &err_buf));
+}
+
+test "mkdir(...) on a path that already exists as a file is MkdirFailed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.MkdirFailed, runProgramWithFs(allocator,
+        \\int f := open("blocker.txt", write)
+        \\close f
+        \\mkdir("blocker.txt")
+    , tmp.dir, &out_buf, &err_buf));
 }
 
 // ---- Subprocess execution (GRAMMAR.bnf design note 3x, ISA.bnf section 17)

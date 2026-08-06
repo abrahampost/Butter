@@ -1,5 +1,5 @@
 # Directory and filesystem metadata (GRAMMAR.bnf design note 3w, ISA.bnf
-# section 16): exists/listDir/remove/rename against a real scratch
+# section 16): exists/listDir/remove/rename/mkdir against a real scratch
 # directory (this case runs via expectCaseOutputWithFs).
 
 print exists("a.txt")
@@ -38,6 +38,14 @@ print remove("c.txt")
 print exists("c.txt")
 print remove("c.txt")
 
+# mkdir: true the first time a directory is created, false once it's
+# already there — the mirror image of remove's own "absent is a no-op"
+# split.
+print mkdir("newdir")
+print exists("newdir")
+print mkdir("newdir")
+print remove("newdir")
+
 # Genuine failures (as opposed to "absent") still raise, and are catchable
 # like any other file-related RuntimeError.
 try {
@@ -48,6 +56,12 @@ try {
 
 try {
     rename("b.txt", "no-such-dir/renamed.txt")
+} catch e {
+    print e.error
+}
+
+try {
+    mkdir("no-such-dir/sub")
 } catch e {
     print e.error
 }

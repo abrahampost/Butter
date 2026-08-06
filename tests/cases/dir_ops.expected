@@ -10,5 +10,10 @@ false
 true
 false
 false
+true
+true
+false
+true
 ListDirFailed
 RenameFailed
+MkdirFailed

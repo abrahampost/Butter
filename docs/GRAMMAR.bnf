@@ -47,7 +47,7 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'map' | 'list' | 'push' | 'keys' | 'has' | 'delete'
                | 'json' | 'stringify' | 'null' | 'args' | 'exit'
                | 'try' | 'catch' | 'getenv' | 'hasenv'
-               | 'exists' | 'listDir' | 'remove' | 'rename'
+               | 'exists' | 'listDir' | 'remove' | 'rename' | 'mkdir'
                | 'exec'
                | 'now' | 'random'
                | 'struct' | 'enum'
@@ -256,6 +256,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <list-dir-expr>
                       | <remove-expr>
                       | <rename-expr>
+                      | <mkdir-expr>
                       | <exec-expr>
                       | <now-expr>
                       | <random-expr>
@@ -334,12 +335,13 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <hasenv-expr>       ::= 'hasenv' '(' <expression> ')'
 
 (* Directory and filesystem metadata (design note 3w). Like getenv/hasenv,
-   none of these four is also a <type> keyword, so each is a legal bare
+   none of these five is also a <type> keyword, so each is a legal bare
    <expr-stmt> too. *)
 <exists-expr>       ::= 'exists' '(' <expression> ')'
 <list-dir-expr>     ::= 'listDir' '(' <expression> ')'
 <remove-expr>       ::= 'remove' '(' <expression> ')'
 <rename-expr>       ::= 'rename' '(' <expression> ',' <expression> ')'
+<mkdir-expr>        ::= 'mkdir' '(' <expression> ')'
 
 (* Subprocess execution (design note 3x). Like getenv/exists/rename, 'exec'
    is not also a <type> keyword, so a bare <expr-stmt> use is legal too. *)
@@ -831,7 +833,20 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      an I/O error) is `RuntimeError.RenameFailed`, NOT folded into the
      `false` case — unlike `from` missing, none of those is something a
      caller would want to silently treat as "nothing happened".
-   - All four are capability-gated exactly like `open` (`Host.fs`,
+   - `mkdir(path)` creates `path` as a directory, evaluating to whether a
+     NEW directory was made — `true` if `path` didn't exist and now does,
+     `false` if a directory was already there. This is the mirror image of
+     `remove`'s own "absent is a no-op, not an error" split: here, ALREADY
+     PRESENT is the no-op, since a directory that's already there means
+     `mkdir` already reached the state it was asked for. NOT recursive —
+     like `listDir`/`remove`, it operates on exactly `path` and nothing
+     else, so a missing PARENT directory is a failure, not silently created
+     the way `open(..., write)` silently creates a missing FILE. `path`
+     existing as something other than a directory (a plain file, say) is
+     also a failure, not folded into the no-op case, for the same reason
+     `remove`'s non-empty-directory case isn't folded into ITS no-op case —
+     any other failure (that included) is `RuntimeError.MkdirFailed`.
+   - All five are capability-gated exactly like `open` (`Host.fs`,
      GRAMMAR.bnf's Files design notes) — `RuntimeError.FilesUnavailable`
      with no filesystem access at all — and resolve a relative `path` the
      same way `open` does: against the process's current directory, not any
@@ -839,7 +854,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    - Every path argument is an arbitrary `<expression>`, not a literal,
      matching `getenv`'s own name argument — so a computed path
      (`remove(dir + "/" + name)`) works without needing string
-     interpolation. None of the four checks its argument's type at compile
+     interpolation. None of the five checks its argument's type at compile
      time (same as `open`'s path and `getenv`'s name): a non-`string`
      argument is a runtime `RuntimeError.TypeMismatch`. *)
 
@@ -1150,12 +1165,13 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      carries no diagnostic detail — most of them. `error` is the stable one
      to branch on (`if e.error == "KeyNotFound"`); `message`'s exact wording
      is not a compatibility promise.
-   - NOT EVERY ERROR IS CATCHABLE. The 28 that are, are the ones a program
+   - NOT EVERY ERROR IS CATCHABLE. The 29 that are, are the ones a program
      could plausibly do something about — `TypeMismatch`, `DivisionByZero`,
      `Overflow`, `IndexOutOfBounds`, `ByteOutOfRange`, `KeyNotFound`,
      `JsonParseFailed`, `NumberParseFailed`, `InvalidExitCode`,
-     `ListDirFailed`, `RemoveFailed`, `RenameFailed` (design note 3w),
-     `ProcessesUnavailable`, `ProcessSpawnFailed`, `ProcessTerminatedAbnormally`
+     `ListDirFailed`, `RemoveFailed`, `RenameFailed`, `MkdirFailed`
+     (design note 3w), `ProcessesUnavailable`, `ProcessSpawnFailed`,
+     `ProcessTerminatedAbnormally`
      (design note 3x), `ClockUnavailable`, `InvalidRange` (design note 3y),
      `InvalidCharLength` (design note 3ab), and the ten stream/file ones.
      `StackOverflow`, `StackUnderflow`, `CallStackOverflow`

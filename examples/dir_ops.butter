@@ -1,5 +1,6 @@
-# Directory and filesystem metadata: exists/listDir/remove/rename against
-# real files on disk (GRAMMAR.bnf design note 3w, ISA.bnf section 16).
+# Directory and filesystem metadata: exists/listDir/remove/rename/mkdir
+# against real files on disk (GRAMMAR.bnf design note 3w, ISA.bnf section
+# 16).
 #
 #   zig build run -- examples/dir_ops.butter
 #
@@ -43,11 +44,25 @@ print "new name exists: " + stringify(exists(renamed))
 print "removed: " + stringify(remove(renamed))
 print "removed again: " + stringify(remove(renamed))
 
-# A genuine failure (as opposed to "absent") still raises, same as
-# `open`/`close`'s own errors — caught exactly the same way (GRAMMAR.bnf
-# design note 3u).
+# `mkdir` is the mirror image of `remove`'s "absent is a no-op" split:
+# here, ALREADY PRESENT is the no-op, so creating the same directory twice
+# is `true` then `false` rather than raising the second time.
+string scratch_dir := "examples/dir_ops_scratch_dir"
+print "scratch dir made: " + stringify(mkdir(scratch_dir))
+print "scratch dir made again: " + stringify(mkdir(scratch_dir))
+print "removed scratch dir: " + stringify(remove(scratch_dir))
+
+# A genuine failure (as opposed to "absent"/"already there") still raises,
+# same as `open`/`close`'s own errors — caught exactly the same way
+# (GRAMMAR.bnf design note 3u).
 try {
     listDir("examples/no-such-directory")
 } catch e {
     print "listDir on a missing directory: " + e.error
+}
+
+try {
+    mkdir("examples/no-such-directory/sub")
+} catch e {
+    print "mkdir with a missing parent: " + e.error
 }

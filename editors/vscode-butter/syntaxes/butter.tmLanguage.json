@@ -107,7 +107,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.butter",
-          "match": "\\b(print|len|read|write|open|close|push|keys|has|delete|json|stringify|getenv|hasenv|exists|listDir|remove|rename|exec|now|random)\\b"
+          "match": "\\b(print|len|read|write|open|close|push|keys|has|delete|json|stringify|getenv|hasenv|exists|listDir|remove|rename|mkdir|exec|now|random)\\b"
         },
         {
           "name": "entity.name.function.butter",

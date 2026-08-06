@@ -1253,15 +1253,16 @@
    must stay in exact sync — the former hardcodes the field indices the
    latter's declaration order fixes.
 
-   CATCHABLE vs NOT. Twenty-seven RuntimeError variants are catchable:
+   CATCHABLE vs NOT. Twenty-nine RuntimeError variants are catchable:
    TypeMismatch, DivisionByZero, Overflow, IndexOutOfBounds, ByteOutOfRange,
    StreamReadFailed, StreamWriteFailed, FileOpenFailed, TooManyOpenFiles,
    FileCloseFailed, StreamNotReadable, StreamNotWritable, StreamClosed,
    CannotCloseStandardStream, FilesUnavailable, KeyNotFound, JsonParseFailed,
    NumberParseFailed, InvalidExitCode, ListDirFailed, RemoveFailed,
-   RenameFailed (section 16), ProcessesUnavailable, ProcessSpawnFailed,
-   ProcessTerminatedAbnormally (section 17), ClockUnavailable, and
-   InvalidRange (section 18).
+   RenameFailed, MkdirFailed (section 16), ProcessesUnavailable,
+   ProcessSpawnFailed, ProcessTerminatedAbnormally (section 17),
+   ClockUnavailable, InvalidRange (section 18), and InvalidCharLength
+   (section 21).
 
    Four are not: StackOverflow, StackUnderflow, CallStackOverflow, and
    HandlerStackOverflow. These are VM-integrity failures rather than program
@@ -1375,8 +1376,8 @@
 
 (* --------------------------------------------------------------------------
    16. DIRECTORY AND FILESYSTEM METADATA (PATH_EXISTS, LIST_DIR, PATH_REMOVE,
-       PATH_RENAME — one opcode each, no new value kind, reuses section 10's
-       `Host.fs`; GRAMMAR.bnf design note 3w)
+       PATH_RENAME, PATH_MKDIR — one opcode each, no new value kind, reuses
+       section 10's `Host.fs`; GRAMMAR.bnf design note 3w)
    -------------------------------------------------------------------------- *)
 
    PATH_EXISTS               ( path -- bool )  pops path (must be
@@ -1516,24 +1517,66 @@
                                                Pushes `true` on success. What
                                                `rename(from, to)` compiles
                                                to.
+   PATH_MKDIR                 ( path -- bool ) pops path (same TypeMismatch
+                                               rule and FilesUnavailable gate
+                                               as PATH_EXISTS). Creates
+                                               `path` as a directory against
+                                               `fs.dir`, NON-recursively — a
+                                               missing PARENT directory is a
+                                               failure, not silently created,
+                                               matching LIST_DIR/PATH_REMOVE's
+                                               own one-level-only stance.
+                                               `path` already existing AS A
+                                               DIRECTORY pushes `false`, not
+                                               an error — the mirror image of
+                                               PATH_REMOVE's "absent is a
+                                               no-op" split (here, ALREADY
+                                               PRESENT is the no-op, since
+                                               `path` is already in the state
+                                               PATH_MKDIR was asked to reach
+                                               it). The underlying create
+                                               call alone can't tell that
+                                               case apart from `path`
+                                               existing as something else —
+                                               a plain file, say — both
+                                               report the same underlying
+                                               "already there" error, so
+                                               `vm.zig`'s `makeDir` follows up
+                                               with an `openDir` attempt to
+                                               disambiguate, the same way
+                                               PATH_REMOVE's own `removePath`
+                                               follows up a delete attempt
+                                               with a second one when the
+                                               first reports `IsDir`. Any
+                                               other failure — that follow-up
+                                               open failing, or the create
+                                               itself failing for any reason
+                                               OTHER than "already exists" —
+                                               is `RuntimeError.MkdirFailed`
+                                               (with a `Vm.diagnostic`:
+                                               operation `"mkdir"`, the path,
+                                               and the underlying cause) —
+                                               on success, pushes `true`.
+                                               What `mkdir(path)` compiles
+                                               to.
 
-   NONE OF THE FOUR TAKES AN OPERAND, for the same reason GET_ENV/HAS_ENV
+   NONE OF THE FIVE TAKES AN OPERAND, for the same reason GET_ENV/HAS_ENV
    don't (section 15): every path is an ordinary popped `Value`, not a
    compile-time constant, so a computed path
    (`remove(dir + "/" + name)`) works with no special codegen. REFCOUNTS
    follow `Vm.pop`'s usual convention (section 14's addendum): each pops and
    decrefs every path operand it's handed; PATH_EXISTS/PATH_REMOVE/
-   PATH_RENAME's results are plain scalar BOOLs (nothing to incref);
-   LIST_DIR's result is a fresh heap Object nobody else holds a reference to,
-   exactly like MAP_KEYS's (section 11).
+   PATH_RENAME/PATH_MKDIR's results are plain scalar BOOLs (nothing to
+   incref); LIST_DIR's result is a fresh heap Object nobody else holds a
+   reference to, exactly like MAP_KEYS's (section 11).
 
    REUSES `Host.fs` (section 10) RATHER THAN ADDING A SECOND CAPABILITY GATE.
-   A program that can `open` a file can already reach everything these four
+   A program that can `open` a file can already reach everything these five
    opcodes need — `fs.dir` is the same `std.Io.Dir` OPEN resolves a relative
    path against — so gating them separately would only mean an embedder that
    grants file access has to remember to grant this too, for no added
    safety. `Host.fs` null still means the same thing it always has:
-   `RuntimeError.FilesUnavailable` for all four, exactly like OPEN.
+   `RuntimeError.FilesUnavailable` for all five, exactly like OPEN.
    ========================================================================== *)
 
 
@@ -1546,7 +1589,7 @@
    EXEC has its full stack-effect entry in section 3; this section is the
    capability-gate and Host-wiring detail, the same split section 10 (Files)
    and section 16 (Directory/filesystem metadata) give OPEN and
-   PATH_EXISTS/LIST_DIR/PATH_REMOVE/PATH_RENAME respectively.
+   PATH_EXISTS/LIST_DIR/PATH_REMOVE/PATH_RENAME/PATH_MKDIR respectively.
 
    `Host.process: ?Process = null` (vm.zig) — `Process` is `{ io: std.Io,
    dir: std.Io.Dir }`, the EXACT SAME SHAPE as `Host.Fs` (section 10). This
