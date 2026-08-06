@@ -1462,25 +1462,63 @@ pub const Vm = struct {
     /// which is the loop in `run`, which is precisely where a handler needs
     /// to catch it.
     inline fn step(self: *Vm, ex: *Exec, host: Host) !Flow {
-        const instr = ex.chunk.code.items[ex.ip];
+        var instr = ex.chunk.code.items[ex.ip];
         ex.ip += 1;
-        switch (instr.op) {
+        // `sw:` + `continue :sw` below (Zig's labeled-switch-continue) is a
+        // direct-threaded-dispatch experiment: opcodes on the hot path
+        // (arithmetic, locals, jumps, calls, containers) fetch the next
+        // instruction and jump straight to its case instead of returning to
+        // `run`'s `while(true)` and re-entering this switch from its single
+        // shared dispatch site. That gives each hot opcode's "what comes
+        // next" branch its own indirect-jump instruction (and so its own
+        // branch-predictor history) instead of funneling every opcode
+        // through one shared jump-table branch. Cold/rare opcodes (I/O,
+        // paths, JSON, env, handlers, exit/throw/halt) are deliberately left
+        // as plain cases that fall through to `return .running` below,
+        // unwinding back to `run`'s loop exactly as before — correctness
+        // (error propagation via `try`, `run`'s catchable/unwindToHandler
+        // logic, `exec.ip - 1` naming the failing instruction) is unaffected
+        // either way, since `continue :sw` is just a jump, not a call: a
+        // `try` failing inside any case still unwinds out of `step` itself,
+        // and `ex.ip` is always left one past whatever instruction is about
+        // to run, exactly like the original single-dispatch top of this
+        // function.
+        sw: switch (instr.op) {
             .push_const => {
                 const v = ex.chunk.constants.items[instr.operand];
                 v.incref();
                 try self.push(v);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
-            .push_true => try self.push(.{ .boolean = true }),
-            .push_false => try self.push(.{ .boolean = false }),
+            .push_true => {
+                try self.push(.{ .boolean = true });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
+            .push_false => {
+                try self.push(.{ .boolean = false });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
             .pop => {
                 const v = try self.pop();
                 v.decref(self.allocator);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             .load_local => {
                 const v = self.stack[ex.bp + instr.operand];
                 v.incref();
                 try self.push(v);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .store_local => {
                 const new_v = try self.peek(0);
@@ -1491,6 +1529,9 @@ pub const Vm = struct {
                 new_v.incref();
                 self.stack[ex.bp + instr.operand].decref(self.allocator);
                 self.stack[ex.bp + instr.operand] = new_v;
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             // Only ever emitted for a for-loop's own hidden variable
             // (compiler.zig's `compileFor`), always INT by construction —
@@ -1501,6 +1542,9 @@ pub const Vm = struct {
             .inc_local => {
                 const slot = ex.bp + instr.operand;
                 self.stack[slot] = .{ .int = try checkedAdd(self.stack[slot].int, 1) };
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             .load_index => {
@@ -1520,6 +1564,9 @@ pub const Vm = struct {
                 const v = self.stack[ex.bp + idx.slot + @as(usize, @intCast(idx_val.int))];
                 v.incref();
                 try self.push(v);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .store_index => {
                 const v = try self.pop();
@@ -1540,11 +1587,17 @@ pub const Vm = struct {
                 self.stack[ex.bp + idx.slot + @as(usize, @intCast(idx_val.int))].decref(self.allocator);
                 self.stack[ex.bp + idx.slot + @as(usize, @intCast(idx_val.int))] = v;
                 try self.push(v);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             .make_array_ref => {
                 const idx = chunk_mod.unpackIndexOperand(instr.operand);
                 try self.push(.{ .array_ref = .{ .base = @intCast(ex.bp + idx.slot), .len = idx.length } });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .load_index_ref => {
                 const idx_val = try self.pop();
@@ -1558,6 +1611,9 @@ pub const Vm = struct {
                 const v = self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))];
                 v.incref();
                 try self.push(v);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .store_index_ref => {
                 const v = try self.pop();
@@ -1574,11 +1630,17 @@ pub const Vm = struct {
                 self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))].decref(self.allocator);
                 self.stack[ref.array_ref.base + @as(usize, @intCast(idx_val.int))] = v;
                 try self.push(v);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .load_ref_len => {
                 const ref = self.stack[ex.bp + instr.operand];
                 if (ref != .array_ref) return RuntimeError.TypeMismatch;
                 try self.push(.{ .int = ref.array_ref.len });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             // ---- Maps, lists, and the heap (ISA.bnf section 11) ----
@@ -1598,6 +1660,9 @@ pub const Vm = struct {
                 }
                 const obj = try Object.create(self.allocator, .{ .list = list });
                 try self.push(.{ .object = obj });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .make_map => {
                 const n = instr.operand;
@@ -1628,6 +1693,9 @@ pub const Vm = struct {
                     key_val.decref(self.allocator); // the key Value itself is never retained
                 }
                 try self.push(.{ .object = obj });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             // ---- Records (ISA.bnf section 19) ----
@@ -1650,6 +1718,9 @@ pub const Vm = struct {
                     .fields = fields,
                 } });
                 try self.push(.{ .object = obj });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .field_get => {
                 const container = try self.pop();
@@ -1664,6 +1735,9 @@ pub const Vm = struct {
                 const v = container.object.payload.record.fields[instr.operand];
                 v.incref();
                 try self.push(v);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .field_set => {
                 const v = try self.pop();
@@ -1676,6 +1750,9 @@ pub const Vm = struct {
                 fields[instr.operand].decref(self.allocator);
                 fields[instr.operand] = v;
                 try self.push(v);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             .index_get => {
@@ -1685,6 +1762,9 @@ pub const Vm = struct {
                 defer container.decref(self.allocator);
                 const result = try indexGet(self.allocator, container, index_val);
                 try self.push(result);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .index_slice => {
                 const end_val = try self.pop();
@@ -1695,6 +1775,9 @@ pub const Vm = struct {
                 defer container.decref(self.allocator);
                 const result = try indexSlice(self.allocator, container, start_val, end_val);
                 try self.push(result);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .index_set => {
                 const v = try self.pop();
@@ -1707,6 +1790,9 @@ pub const Vm = struct {
                 defer container.decref(self.allocator);
                 try indexSet(self.allocator, container, index_val, v);
                 try self.push(v);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             .list_push => {
@@ -1717,6 +1803,9 @@ pub const Vm = struct {
                 if (container != .object or container.object.payload != .list) return RuntimeError.TypeMismatch;
                 try container.object.payload.list.append(self.allocator, v); // moves v in
                 try self.push(.{ .int = @intCast(container.object.payload.list.items.len) });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .map_has => {
                 const key_val = try self.pop();
@@ -1726,6 +1815,9 @@ pub const Vm = struct {
                 if (container != .object or container.object.payload != .map) return RuntimeError.TypeMismatch;
                 const key = key_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 try self.push(.{ .boolean = container.object.mapGet(key) != null });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .map_delete => {
                 const key_val = try self.pop();
@@ -1735,6 +1827,9 @@ pub const Vm = struct {
                 if (container != .object or container.object.payload != .map) return RuntimeError.TypeMismatch;
                 const key = key_val.asStringBytes() orelse return RuntimeError.TypeMismatch;
                 try self.push(.{ .boolean = container.object.mapDelete(self.allocator, key) });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .map_keys => {
                 const container = try self.pop();
@@ -1754,6 +1849,9 @@ pub const Vm = struct {
                 }
                 const result_obj = try Object.create(self.allocator, .{ .list = list });
                 try self.push(.{ .object = result_obj });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .len_value => {
                 const v = try self.pop();
@@ -1771,6 +1869,9 @@ pub const Vm = struct {
                     .record => return RuntimeError.TypeMismatch,
                 };
                 try self.push(.{ .int = @intCast(len) });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             // ---- JSON (ISA.bnf section 12) ----
@@ -1907,6 +2008,9 @@ pub const Vm = struct {
                     return err;
                 };
                 try self.push(.{ .object = obj });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             .interp_concat => {
@@ -1959,6 +2063,9 @@ pub const Vm = struct {
                     return err;
                 };
                 try self.push(.{ .object = obj });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             // ---- Environment variables (ISA.bnf section 15) ----
@@ -2067,12 +2174,42 @@ pub const Vm = struct {
                 try self.push(.{ .int = r.intRangeLessThan(i64, start_val.int, end_val.int) });
             },
 
-            .add => try self.add(),
-            .sub => try self.sub(),
-            .mul => try self.mul(),
-            .div => try self.div(),
-            .mod => try self.mod(),
-            .pow => try self.pow(),
+            .add => {
+                try self.add();
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
+            .sub => {
+                try self.sub();
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
+            .mul => {
+                try self.mul();
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
+            .div => {
+                try self.div();
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
+            .mod => {
+                try self.mod();
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
+            .pow => {
+                try self.pow();
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
 
             .neg => {
                 const v = try self.pop();
@@ -2087,6 +2224,9 @@ pub const Vm = struct {
                         return RuntimeError.TypeMismatch;
                     },
                 }
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .not => {
                 const v = try self.pop();
@@ -2095,6 +2235,9 @@ pub const Vm = struct {
                     return RuntimeError.TypeMismatch;
                 }
                 try self.push(.{ .boolean = !v.boolean });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             .eq => {
@@ -2103,6 +2246,9 @@ pub const Vm = struct {
                 const a = try self.pop();
                 defer a.decref(self.allocator);
                 try self.push(.{ .boolean = Value.eql(a, b) });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .neq => {
                 const b = try self.pop();
@@ -2110,17 +2256,48 @@ pub const Vm = struct {
                 const a = try self.pop();
                 defer a.decref(self.allocator);
                 try self.push(.{ .boolean = !Value.eql(a, b) });
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
-            .lt => try self.compare(.lt),
-            .lte => try self.compare(.lte),
-            .gt => try self.compare(.gt),
-            .gte => try self.compare(.gte),
+            .lt => {
+                try self.compare(.lt);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
+            .lte => {
+                try self.compare(.lte);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
+            .gt => {
+                try self.compare(.gt);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
+            .gte => {
+                try self.compare(.gte);
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
 
-            .jump => ex.ip = instr.operand,
+            .jump => {
+                ex.ip = instr.operand;
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
+            },
             .jump_if_false => {
                 const cond = try self.peek(0);
                 if (cond != .boolean) return RuntimeError.TypeMismatch;
                 if (!cond.boolean) ex.ip = instr.operand;
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             // Same check as JUMP_IF_FALSE, but pops unconditionally instead
             // of leaving the condition for a separate POP — see chunk.zig's
@@ -2131,6 +2308,9 @@ pub const Vm = struct {
                 defer cond.decref(self.allocator);
                 if (cond != .boolean) return RuntimeError.TypeMismatch;
                 if (!cond.boolean) ex.ip = instr.operand;
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             .push_handler => {
@@ -2163,6 +2343,9 @@ pub const Vm = struct {
                 ex.chunk = &func.chunk;
                 ex.ip = 0;
                 ex.return_width = func.return_width;
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             // Identical to CALL except the callee's function-table index
             // comes from a popped `Value.function` (a named-function-value
@@ -2181,6 +2364,9 @@ pub const Vm = struct {
                 ex.chunk = &func.chunk;
                 ex.ip = 0;
                 ex.return_width = func.return_width;
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
             .ret => {
                 // Everything the departing frame owns OTHER than the
@@ -2225,6 +2411,9 @@ pub const Vm = struct {
                 while (ex.handler_count > 0 and ex.handlers[ex.handler_count - 1].frame_count > ex.frame_count) {
                     ex.handler_count -= 1;
                 }
+                instr = ex.chunk.code.items[ex.ip];
+                ex.ip += 1;
+                continue :sw instr.op;
             },
 
             .print => {
