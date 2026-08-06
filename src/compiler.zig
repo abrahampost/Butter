@@ -98,6 +98,23 @@ pub const SemanticError = error{
     /// — unlike every other type, there is no default "zero" function
     /// value to fall back to (design note 3ad).
     MissingFunctionInitializer,
+    /// A method declaration's receiver clause names an enum, not a struct
+    /// (GRAMMAR.bnf design note 3af) — enums are compile-time constants
+    /// with no instance for a receiver parameter to bind. A receiver
+    /// clause naming no declared type at all is `UndefinedType`/
+    /// `TypeNotVisible` instead, exactly like any other named-type
+    /// position (`resolveDeclaredType`); a method call whose base isn't
+    /// statically a struct is `NotAStruct`, exactly like an ordinary field
+    /// access (`resolveStructBase`).
+    ReceiverNotAStruct,
+    /// A struct declares a field and a method (or two methods) with the
+    /// same name — the two would otherwise be ambiguous wherever a bare
+    /// `.name` (no trailing call) is read, since only one of them can win
+    /// (GRAMMAR.bnf design note 3af).
+    DuplicateFieldOrMethod,
+    /// A `.method(...)` call names a method its base's struct type doesn't
+    /// have — the method counterpart of `UnknownField`.
+    UnknownMethod,
 };
 pub const CompileError = SemanticError || std.mem.Allocator.Error;
 
@@ -323,6 +340,33 @@ const FunctionInfo = struct {
     exported: bool,
 };
 
+/// A registered struct method (GRAMMAR.bnf design note 3af) — the
+/// `(receiver_type_index, name)` pair method calls resolve against, kept
+/// entirely separate from `Compiler.functions`' own by-bare-name lookup
+/// (`findFunction`) so that two different structs can each declare a
+/// method with the same name without colliding, and so a bare `dist()`
+/// call can never accidentally resolve to some struct's `dist` method.
+/// `function_index` is where the desugared method (receiver prepended as
+/// parameter 0 — see `compileModules`) actually lives in
+/// `Compiler.functions`/`Program.functions`, exactly like any other
+/// `FunctionInfo.index`; a method call compiles to an ordinary CALL
+/// against it, no different from a plain function call.
+const MethodInfo = struct {
+    receiver_type_index: usize,
+    /// Borrowed from the declaring `ast.StmtKind.MethodDecl.name`, same
+    /// lifetime convention as `FunctionInfo.name`.
+    name: []const u8,
+    /// `[receiver_param] ++ declared_params` — synthesized fresh at
+    /// registration time (there is no existing `ast.Param` slice already
+    /// shaped this way to borrow, unlike a plain function's own `params`).
+    /// Allocator-owned; freed by `Compiler.deinit`. `Compiler.functions`'
+    /// own entry for this method borrows this exact same slice as its
+    /// `.params` — freed here, not there, since `FunctionInfo.params` is
+    /// otherwise always a borrow with nothing for `deinit` to free.
+    params: []ast.Param,
+    function_index: u32,
+};
+
 fn totalParamWidth(params: []const ast.Param) u32 {
     var width: u32 = 0;
     for (params) |p| width += arraySpecWidth(p.array_size);
@@ -366,6 +410,14 @@ pub const Compiler = struct {
     /// rather than growing the frame unboundedly.
     next_slot: u32 = 0,
     functions: std.ArrayList(FunctionInfo) = .empty,
+    /// Every struct method registered across all modules (GRAMMAR.bnf
+    /// design note 3af), built by its own pre-pass in `compileModules`
+    /// after `functions` (a method may call an ordinary function or another
+    /// method, but nothing calls a method before every struct type — and
+    /// therefore every method's receiver — is known). See `MethodInfo`'s
+    /// own doc comment for why this is a separate table from `functions`
+    /// rather than folded into it.
+    methods: std.ArrayList(MethodInfo) = .empty,
     /// Every struct/enum type registered across all modules (GRAMMAR.bnf
     /// design notes 3z/3aa), built by a two-stage pre-pass in
     /// `compileModules` before functions are even registered (a param/
@@ -420,6 +472,8 @@ pub const Compiler = struct {
         self.locals.deinit(self.allocator);
         for (self.functions.items) |f| self.allocator.free(f.param_named_refs);
         self.functions.deinit(self.allocator);
+        for (self.methods.items) |m| self.allocator.free(m.params);
+        self.methods.deinit(self.allocator);
         for (self.types.items) |t| switch (t.kind) {
             .struct_decl => |sd| self.allocator.free(sd.fields),
             .enum_decl => {},
@@ -571,6 +625,82 @@ pub const Compiler = struct {
             }
         }
 
+        // Pass 1b: register every method (GRAMMAR.bnf design note 3af), now
+        // that every struct's fields (pass 0b) and every plain function
+        // (pass 1, above) are known — a method's receiver clause needs the
+        // former to resolve/validate against, and its body may call the
+        // latter. Desugars each one into an ordinary `FunctionInfo` whose
+        // parameter 0 is the receiver (`params[0]`, built fresh below) and
+        // registers it into `self.functions` exactly like a plain function
+        // — so pass 3's body compilation, `compileFunctionBody`'s local-slot
+        // assignment, and CALL's own operand all keep working completely
+        // unchanged; only resolving a `.method(...)` CALL SITE to this
+        // function index goes through the separate `self.methods` table
+        // (`MethodInfo`'s doc comment) instead of `findFunction`.
+        for (modules, 0..) |m, mi| {
+            self.current_module = mi;
+            self.visible_imports = m.imports;
+            for (m.program) |*stmt| {
+                if (stmt.kind != .method_decl) continue;
+                const md = stmt.kind.method_decl;
+                self.current_line = stmt.line;
+
+                const recv_declared = try self.resolveDeclaredType(.named, md.receiver_type);
+                const recv_ref = recv_declared.named_ref.?;
+                if (recv_ref.is_enum) return self.fail(SemanticError.ReceiverNotAStruct, md.receiver_type, "a method's receiver must be a struct, not an enum");
+                const recv_type_index: usize = recv_ref.index;
+
+                // Field/method name collision (GRAMMAR.bnf design note
+                // 3af) — checked against the receiver struct's ALREADY-
+                // RESOLVED fields (pass 0b ran before this pass) and every
+                // method already registered for the same receiver, so
+                // declaration order never matters (same "declare, then
+                // validate regardless of source order" stance every other
+                // pre-pass in `compileModules` already takes).
+                const recv_fields = self.types.items[recv_type_index].kind.struct_decl.fields;
+                for (recv_fields) |fld| {
+                    if (std.mem.eql(u8, fld.name, md.name)) return self.fail(SemanticError.DuplicateFieldOrMethod, md.name, "this struct already declares a field with this name");
+                }
+                for (self.methods.items) |existing| {
+                    if (existing.receiver_type_index == recv_type_index and std.mem.eql(u8, existing.name, md.name)) {
+                        return self.fail(SemanticError.DuplicateFieldOrMethod, md.name, "this struct already declares a method with this name");
+                    }
+                }
+
+                const params = try self.allocator.alloc(ast.Param, md.params.len + 1);
+                errdefer self.allocator.free(params);
+                params[0] = .{ .type = .named, .named_type = md.receiver_type, .name = md.receiver_name };
+                @memcpy(params[1..], md.params);
+
+                const param_named_refs = try self.allocator.alloc(?NamedTypeRef, params.len);
+                param_named_refs[0] = recv_ref;
+                for (md.params, 0..) |p, i| {
+                    param_named_refs[i + 1] = if (p.type == .named) (try self.resolveDeclaredType(p.type, p.named_type)).named_ref else null;
+                }
+                const return_named_ref: ?NamedTypeRef = if (md.return_type == .named) (try self.resolveDeclaredType(md.return_type, md.return_named_type)).named_ref else null;
+
+                const function_index: u32 = @intCast(self.functions.items.len);
+                try self.functions.append(self.allocator, .{
+                    .name = md.name,
+                    .params = params,
+                    .param_named_refs = param_named_refs,
+                    .return_array_size = md.return_array_size,
+                    .return_type = md.return_type,
+                    .return_named_ref = return_named_ref,
+                    .arity = totalParamWidth(params),
+                    .index = function_index,
+                    .module = mi,
+                    .exported = md.exported,
+                });
+                try self.methods.append(self.allocator, .{
+                    .receiver_type_index = recv_type_index,
+                    .name = md.name,
+                    .params = params,
+                    .function_index = function_index,
+                });
+            }
+        }
+
         self.current_module = entry;
         self.current_module_path = modules[entry].path;
         self.visible_imports = modules[entry].imports;
@@ -583,7 +713,7 @@ pub const Compiler = struct {
         var main_chunk: Chunk = blk: {
             errdefer self.chunk.deinit(self.allocator);
             for (modules[entry].program) |*stmt| {
-                if (stmt.kind == .function_decl or stmt.kind == .import_stmt or stmt.kind == .struct_decl or stmt.kind == .enum_decl) continue;
+                if (stmt.kind == .function_decl or stmt.kind == .method_decl or stmt.kind == .import_stmt or stmt.kind == .struct_decl or stmt.kind == .enum_decl) continue;
                 try self.compileStmt(stmt);
             }
             _ = try self.chunk.emit(self.allocator, .halt);
@@ -607,11 +737,51 @@ pub const Compiler = struct {
                 if (stmt.kind != .function_decl) continue;
                 const f = stmt.kind.function_decl;
                 const info = self.findFunction(f.name).?; // registered in pass 1, above
-                const body_chunk = try self.compileFunctionBody(f);
+                const body_chunk = try self.compileFunctionBody(f, info);
                 try compiled.append(self.allocator, .{
                     .name = f.name,
                     .arity = info.arity,
                     .return_width = arraySpecWidth(f.return_array_size),
+                    .chunk = body_chunk,
+                });
+            }
+        }
+
+        // Same shape as the plain-function loop just above, but for methods
+        // (GRAMMAR.bnf design note 3af) — traverses `modules`/`m.program`
+        // identically (filtered to `.method_decl` instead), which is what
+        // keeps this loop's `compiled.append` order lined up with pass 1b's
+        // own registration order: `compiled.items[k]`'s index must equal
+        // `FunctionInfo.index`/`MethodInfo.function_index` for whichever
+        // method is the k-th one appended overall, and both passes visit
+        // every module's methods in this same order. Builds a synthetic
+        // `ast.StmtKind.FunctionDecl` — `compileFunctionBody` neither knows
+        // nor cares that a method's `params`/`info` differ from a plain
+        // function's only by the receiver already folded into `params[0]`.
+        for (modules, 0..) |m, mi| {
+            self.current_module = mi;
+            self.current_module_path = m.path;
+            self.visible_imports = m.imports;
+            for (m.program) |*stmt| {
+                if (stmt.kind != .method_decl) continue;
+                const md = stmt.kind.method_decl;
+                const type_index = self.findTypeIndex(md.receiver_type).?; // registered in pass 1b, above
+                const method = self.findMethod(type_index, md.name).?; // likewise
+                const info = self.functions.items[method.function_index];
+                const synthetic_decl: ast.StmtKind.FunctionDecl = .{
+                    .name = md.name,
+                    .params = method.params,
+                    .return_type = md.return_type,
+                    .return_named_type = md.return_named_type,
+                    .return_array_size = md.return_array_size,
+                    .body = md.body,
+                    .exported = md.exported,
+                };
+                const body_chunk = try self.compileFunctionBody(synthetic_decl, info);
+                try compiled.append(self.allocator, .{
+                    .name = md.name,
+                    .arity = info.arity,
+                    .return_width = arraySpecWidth(md.return_array_size),
                     .chunk = body_chunk,
                 });
             }
@@ -656,7 +826,15 @@ pub const Compiler = struct {
     /// usual. If control falls off the end without an explicit `return`,
     /// the return type's zero value is returned implicitly (the same
     /// `defaultValue` a var-decl without an initializer gets).
-    fn compileFunctionBody(self: *Compiler, f: ast.StmtKind.FunctionDecl) CompileError!Chunk {
+    ///
+    /// `info` is `f`'s own already-registered `FunctionInfo` (pass 1/1b),
+    /// passed in directly by the caller rather than re-derived here via
+    /// `findFunction(f.name)` — a method's own `FunctionInfo.name` is just
+    /// its bare method name (GRAMMAR.bnf design note 3af), which two
+    /// different structs' methods may share, so a by-name lookup here could
+    /// resolve the wrong one; a plain function's name is always unique
+    /// (`DuplicateFunction`), so this changes nothing observable for it.
+    fn compileFunctionBody(self: *Compiler, f: ast.StmtKind.FunctionDecl, info: FunctionInfo) CompileError!Chunk {
         self.chunk = .{};
         errdefer self.chunk.deinit(self.allocator);
         self.locals.clearRetainingCapacity();
@@ -665,11 +843,10 @@ pub const Compiler = struct {
         self.in_function = true;
         self.current_return_array_size = f.return_array_size;
         self.current_return_type = f.return_type;
-        self.current_return_named_ref = self.findFunction(f.name).?.return_named_ref;
+        self.current_return_named_ref = info.return_named_ref;
         defer self.in_function = false;
         defer self.current_return_array_size = null;
 
-        const info = self.findFunction(f.name).?;
         for (f.params, 0..) |p, i| {
             try self.locals.append(self.allocator, .{
                 .name = p.name,
@@ -722,6 +899,16 @@ pub const Compiler = struct {
     fn findFunction(self: *const Compiler, name: []const u8) ?FunctionInfo {
         for (self.functions.items) |f| {
             if (std.mem.eql(u8, f.name, name)) return f;
+        }
+        return null;
+    }
+
+    /// Resolves a struct method by `(receiver_type_index, name)` — see
+    /// `MethodInfo`'s doc comment for why this is a dedicated scan over
+    /// `self.methods` rather than `findFunction`'s bare-name lookup.
+    fn findMethod(self: *const Compiler, receiver_type_index: usize, name: []const u8) ?MethodInfo {
+        for (self.methods.items) |m| {
+            if (m.receiver_type_index == receiver_type_index and std.mem.eql(u8, m.name, name)) return m;
         }
         return null;
     }
@@ -1012,6 +1199,27 @@ pub const Compiler = struct {
                 }
                 break :blk StaticType{ .scalar = info.return_type };
             },
+            // Same shape as `.call`, above, but resolving `mc.method`
+            // against `mc.base`'s own inferred struct type instead of the
+            // bare-name function table (GRAMMAR.bnf design note 3af) — real
+            // errors (`NotAStruct`/`UnknownMethod`/`ArrayUsedAsScalar`) are
+            // likewise deferred to `compileMethodCall`, once this node is
+            // actually compiled.
+            .method_call => |mc| blk: {
+                const bt = try self.inferType(mc.base) orelse break :blk null;
+                const type_index = switch (bt) {
+                    .struct_type => |i| i,
+                    else => break :blk null,
+                };
+                const method = self.findMethod(type_index, mc.method) orelse break :blk null;
+                const info = self.functions.items[method.function_index];
+                if (info.return_array_size != null) break :blk null;
+                if (info.return_type == .named) {
+                    const ref = info.return_named_ref.?;
+                    break :blk if (ref.is_enum) StaticType{ .enum_type = ref.index } else StaticType{ .struct_type = ref.index };
+                }
+                break :blk StaticType{ .scalar = info.return_type };
+            },
             .array_literal => StaticType{ .scalar = .list },
             .map_literal => StaticType{ .scalar = .map },
             .index => |ix| try self.inferIndexType(ix),
@@ -1183,6 +1391,7 @@ pub const Compiler = struct {
                 _ = try self.chunk.emit(self.allocator, .ret);
             },
             .function_decl => unreachable, // top-level only; compileModules never calls compileStmt on this
+            .method_decl => unreachable, // top-level only; compileModules never calls compileStmt on this
             .for_stmt => |f| try self.compileFor(f),
             .import_stmt => unreachable, // top-level only; compileModules never calls compileStmt on this
             .struct_decl => unreachable, // top-level only; compileModules never calls compileStmt on this
@@ -1542,6 +1751,7 @@ pub const Compiler = struct {
                 _ = try self.emitLocalOp(a.name, .store_local);
             },
             .call => |c| try self.compileCall(c),
+            .method_call => |mc| try self.compileMethodCall(mc),
             // Reached only when a bracketed literal ISN'T a fixed-array
             // initializer (compileVarDecl/the array/generic-array value
             // helpers all intercept `.array_literal` themselves before ever
@@ -1747,21 +1957,60 @@ pub const Compiler = struct {
         }
         const info = self.findFunction(c.name) orelse return self.fail(SemanticError.UndefinedFunction, c.name, "undefined function");
         if (!self.functionVisible(info)) return self.fail(SemanticError.FunctionNotVisible, c.name, "function exists but isn't exported by a module this file imports");
-        if (c.args.len != info.params.len) return self.fail(SemanticError.ArityMismatch, c.name, "wrong number of arguments");
-        for (c.args, info.params, 0..) |arg, param, i| {
+        try self.compileArgs(c.name, info.params, info.param_named_refs, c.args);
+        _ = try self.chunk.emitWithOperand(self.allocator, .call, info.index);
+        return info;
+    }
+
+    /// Checks arity, then type-checks and compiles each argument against
+    /// `params`/`param_named_refs` (using `compileArrayArgument`/
+    /// `compileGenericArrayArgument` for array-typed parameters, exactly
+    /// like an ordinary call) — the part of resolving a call that's
+    /// identical whether the callee is an ordinary top-level function
+    /// (`compileCallCommon`) or a struct method (`compileMethodCall`); the
+    /// two differ only in how the CALLEE itself resolves and in whether a
+    /// receiver value needs pushing before these arguments do.
+    /// `diag_name` is whatever `self.fail` should name the call by (a
+    /// function's or method's own name) if an argument doesn't fit.
+    fn compileArgs(self: *Compiler, diag_name: []const u8, params: []const ast.Param, param_named_refs: []const ?NamedTypeRef, args: []const *ast.Expr) CompileError!void {
+        if (args.len != params.len) return self.fail(SemanticError.ArityMismatch, diag_name, "wrong number of arguments");
+        for (args, params, param_named_refs) |arg, param, named_ref| {
             if (param.array_size) |spec| {
                 switch (spec) {
                     .fixed => |len| try self.compileArrayArgument(arg, len),
                     .generic => try self.compileGenericArrayArgument(arg),
                 }
             } else {
-                const dt: DeclaredType = .{ .type = param.type, .named_ref = info.param_named_refs[i], .func_sig = param.func_sig };
-                try self.checkExpectedType(arg, dt, c.name, "argument's type does not match the parameter's declared type");
+                const dt: DeclaredType = .{ .type = param.type, .named_ref = named_ref, .func_sig = param.func_sig };
+                try self.checkExpectedType(arg, dt, diag_name, "argument's type does not match the parameter's declared type");
                 try self.compileExpr(arg);
             }
         }
+    }
+
+    /// `base.method(args)` (GRAMMAR.bnf design note 3af) — resolves `base`'s
+    /// static struct type exactly like `compileFieldAccess` does
+    /// (`resolveStructBase`), looks up `method` against that struct's own
+    /// registered methods (`findMethod`, never `findFunction` — see
+    /// `MethodInfo`'s doc comment), then compiles `base` itself as the
+    /// desugared function's first argument (the receiver, `params[0]`)
+    /// followed by `args` against `params[1..]` (`compileArgs`) — same CALL
+    /// opcode an ordinary function call emits, just against the method's own
+    /// resolved function index. Never reached for a method call used
+    /// somewhere an ARRAY result is needed (a matching array var-decl
+    /// initializer, array argument, or array return) — unlike `.call`,
+    /// those three contexts don't have a `.method_call` case of their own;
+    /// not supported this pass (GRAMMAR.bnf design note 3af).
+    fn compileMethodCall(self: *Compiler, mc: ast.Expr.MethodCall) CompileError!void {
+        const type_index = try self.resolveStructBase(mc.base);
+        const method = self.findMethod(type_index, mc.method) orelse return self.fail(SemanticError.UnknownMethod, mc.method, "this struct has no method with this name");
+        const info = self.functions.items[method.function_index];
+        if (!self.functionVisible(info)) return self.fail(SemanticError.FunctionNotVisible, mc.method, "method exists but isn't exported by a module this file imports");
+        if (info.return_array_size != null) return self.fail(SemanticError.ArrayUsedAsScalar, mc.method, "a method returning an array can't be used as a plain value here");
+
+        try self.compileExpr(mc.base);
+        try self.compileArgs(mc.method, info.params[1..], info.param_named_refs[1..], mc.args);
         _ = try self.chunk.emitWithOperand(self.allocator, .call, info.index);
-        return info;
     }
 
     /// Calls through a func-typed local/parameter's own runtime value
@@ -3760,6 +4009,173 @@ test "enum: referencing an unknown variant is a compile error" {
 test "enum: a duplicate variant name in the declaration is a compile error" {
     const allocator = std.testing.allocator;
     try expectCompileError(allocator, "enum Color { Red, Red }\n", SemanticError.DuplicateVariant);
+}
+
+// ---- Struct methods (GRAMMAR.bnf design note 3af) ------------------------
+
+test "method: declare and call on a struct value, receiver reads its own fields" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\func (Point p) sum() -> int {
+        \\    return p.x + p.y
+        \\}
+        \\Point pt := Point{x: 3, y: 4}
+        \\print pt.sum()
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("7\n", output);
+}
+
+test "method: takes its own parameters alongside the receiver" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\func (Point p) scaled(int f) -> Point {
+        \\    return Point{x: p.x * f, y: p.y * f}
+        \\}
+        \\Point pt := Point{x: 3, y: 4}
+        \\Point doubled := pt.scaled(2)
+        \\print doubled.x
+        \\print doubled.y
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("6\n8\n", output);
+}
+
+test "method: mutating a field through the receiver is visible to the caller (reference semantics)" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Counter { int n }
+        \\func (Counter c) inc() -> int {
+        \\    c.n := c.n + 1
+        \\    return c.n
+        \\}
+        \\Counter counter := Counter{n: 0}
+        \\counter.inc()
+        \\counter.inc()
+        \\print counter.n
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("2\n", output);
+}
+
+test "method: a method body may call another method and an ordinary function" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x, int y }
+        \\func double(int n) -> int { return n * 2 }
+        \\func (Point p) sum() -> int { return p.x + p.y }
+        \\func (Point p) doubledSum() -> int { return double(p.sum()) }
+        \\Point pt := Point{x: 3, y: 4}
+        \\print pt.doubledSum()
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("14\n", output);
+}
+
+test "method: two different structs may each declare a method with the same name" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\struct Point { int x }
+        \\struct Vector { int x }
+        \\func (Point p) dist() -> int { return p.x }
+        \\func (Vector v) dist() -> int { return v.x * 2 }
+        \\Point p := Point{x: 5}
+        \\Vector v := Vector{x: 5}
+        \\print p.dist()
+        \\print v.dist()
+        \\
+    , &buf);
+    try std.testing.expectEqualStrings("5\n10\n", output);
+}
+
+test "method: a struct declaring both a field and a method with the same name is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x, int y }\nfunc (Point p) x() -> int { return p.x }\n", SemanticError.DuplicateFieldOrMethod);
+}
+
+test "method: a struct declaring two methods with the same name is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x }\nfunc (Point p) dist() -> int { return 0 }\nfunc (Point p) dist() -> int { return 1 }\n", SemanticError.DuplicateFieldOrMethod);
+}
+
+test "method: a receiver naming an enum instead of a struct is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "enum Color { Red, Blue }\nfunc (Color c) name() -> string { return \"x\" }\n", SemanticError.ReceiverNotAStruct);
+}
+
+test "method: a receiver naming an undeclared type is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "func (Foo f) bar() -> int { return 0 }\n", SemanticError.UndefinedType);
+}
+
+test "method: calling a method the struct doesn't have is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x }\nPoint p := Point{x: 1}\nprint p.bogus()\n", SemanticError.UnknownMethod);
+}
+
+test "method: calling a method on a statically non-struct value is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int x := 5\nprint x.dist()\n", SemanticError.NotAStruct);
+}
+
+test "method: calling with the wrong number of arguments is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x }\nfunc (Point p) add(int a, int b) -> int { return p.x + a + b }\nPoint p := Point{x: 1}\nprint p.add(1)\n", SemanticError.ArityMismatch);
+}
+
+test "method: calling with an argument of the wrong type is a compile error" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "struct Point { int x }\nfunc (Point p) add(int a) -> int { return p.x + a }\nPoint p := Point{x: 1}\nprint p.add(\"oops\")\n", SemanticError.TypeMismatch);
+}
+
+test "method: exported from a directly imported module is callable" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+
+    var lib = try parseSource(allocator, "export struct Point { int x, int y }\nexport func (Point p) sum() -> int { return p.x + p.y }\n");
+    defer lib.parser.deinit();
+    var main = try parseSource(allocator, "Point p := Point{x: 3, y: 4}\nprint p.sum()\n");
+    defer main.parser.deinit();
+
+    const units = [_]ModuleUnit{
+        .{ .program = main.program, .imports = &.{1} },
+        .{ .program = lib.program },
+    };
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    var compiled = try compiler.compileModules(0, &units);
+    defer compiled.deinit(allocator);
+
+    var vm = vm_mod.Vm.init(allocator);
+    var writer = std.Io.Writer.fixed(&buf);
+    try vm.run(&compiled, .{ .out = &writer });
+    try std.testing.expectEqualStrings("7\n", writer.buffered());
+}
+
+test "method: a non-exported method from an imported module is not visible" {
+    const allocator = std.testing.allocator;
+
+    var lib = try parseSource(allocator, "export struct Point { int x, int y }\nfunc (Point p) sum() -> int { return p.x + p.y }\n");
+    defer lib.parser.deinit();
+    var main = try parseSource(allocator, "Point p := Point{x: 3, y: 4}\nprint p.sum()\n");
+    defer main.parser.deinit();
+
+    const units = [_]ModuleUnit{
+        .{ .program = main.program, .imports = &.{1} },
+        .{ .program = lib.program },
+    };
+
+    var compiler = Compiler.init(allocator);
+    defer compiler.deinit();
+    try std.testing.expectError(CompileError.FunctionNotVisible, compiler.compileModules(0, &units));
 }
 
 test "compileModules: a struct exported by a directly imported module is usable" {

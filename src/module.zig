@@ -159,12 +159,15 @@ pub const Loader = struct {
                     // executable code by itself (compiler.zig's
                     // `compileModules` never calls `compileStmt` on either),
                     // so it can't introduce the module-initialization-order
-                    // problem this check exists to sidestep.
-                    .function_decl, .import_stmt, .struct_decl, .enum_decl => {},
+                    // problem this check exists to sidestep. A method
+                    // declaration (design note 3af) is permitted for the
+                    // exact same reason — it compiles to no executable code
+                    // of its own either, just a registration.
+                    .function_decl, .method_decl, .import_stmt, .struct_decl, .enum_decl => {},
                     else => return self.fail(
                         LoadError.ImportedFileHasTopLevelCode,
                         key,
-                        "an imported file may only contain 'import' statements, function declarations, and struct/enum declarations",
+                        "an imported file may only contain 'import' statements, function declarations, method declarations, and struct/enum declarations",
                     ),
                 }
             }
@@ -523,7 +526,7 @@ test "the bundled collections stdlib imports by name with no matching file on di
     defer loader.deinit();
 
     const entry = try loader.loadEntry(
-        "import \"collections.std.butter\"\nSet s := setNew()\nprint setAdd(s, \"a\")\n",
+        "import \"collections.std.butter\"\nSet s := setNew()\nprint s.add(\"a\")\n",
         "main.butter",
         ".",
     );
@@ -543,34 +546,34 @@ test "the bundled collections stdlib's Set/Stack/Queue run correctly end to end"
         \\import "collections.std.butter"
         \\
         \\Set a := setNew()
-        \\setAdd(a, "x")
-        \\setAdd(a, "y")
+        \\a.add("x")
+        \\a.add("y")
         \\Set b := setNew()
-        \\setAdd(b, "y")
-        \\setAdd(b, "z")
-        \\print setAdd(a, "x")
-        \\print setHas(a, "x")
-        \\print setSize(setUnion(a, b))
-        \\print setSize(setIntersection(a, b))
-        \\print setSize(setDifference(a, b))
-        \\print setEquals(a, a)
-        \\print setEquals(a, b)
-        \\print setRemove(a, "x")
-        \\print setSize(a)
+        \\b.add("y")
+        \\b.add("z")
+        \\print a.add("x")
+        \\print a.contains("x")
+        \\print a.union(b).size()
+        \\print a.intersection(b).size()
+        \\print a.difference(b).size()
+        \\print a.equals(a)
+        \\print a.equals(b)
+        \\print a.discard("x")
+        \\print a.size()
         \\
         \\Stack st := stackNew()
-        \\stackPush(st, "one")
-        \\stackPush(st, "two")
-        \\print stackPeek(st)
-        \\print stackPop(st)
-        \\print stackSize(st)
+        \\st.add("one")
+        \\st.add("two")
+        \\print st.peek()
+        \\print st.pop()
+        \\print st.size()
         \\
         \\Queue q := queueNew()
-        \\queueEnqueue(q, "one")
-        \\queueEnqueue(q, "two")
-        \\print queuePeek(q)
-        \\print queueDequeue(q)
-        \\print queueSize(q)
+        \\q.enqueue("one")
+        \\q.enqueue("two")
+        \\print q.peek()
+        \\print q.dequeue()
+        \\print q.size()
         \\
     ,
         "main.butter",

@@ -332,11 +332,13 @@ pub const Parser = struct {
         if (self.check(.kw_import)) return self.importDeclaration();
         if (self.match(.kw_export)) {
             if (self.isFunctionDeclStart()) return self.functionDeclaration(true);
+            if (self.isMethodDeclStart()) return self.methodDeclaration(true);
             if (self.check(.kw_struct)) return self.structDeclaration(true);
             if (self.check(.kw_enum)) return self.enumDeclaration(true);
             return self.fail("expected 'func', 'struct', or 'enum' after 'export'");
         }
         if (self.isFunctionDeclStart()) return self.functionDeclaration(false);
+        if (self.isMethodDeclStart()) return self.methodDeclaration(false);
         if (self.check(.kw_struct)) return self.structDeclaration(false);
         if (self.check(.kw_enum)) return self.enumDeclaration(false);
         return self.declaration();
@@ -344,15 +346,33 @@ pub const Parser = struct {
 
     /// `func` immediately followed by an IDENTIFIER is always a function
     /// DECLARATION (`func NAME(...) -> T { ... }`); `func` followed
-    /// directly by `(` is instead a function-VALUE TYPE (GRAMMAR.bnf design
-    /// note 3ad) leading an ordinary top-level var-declaration, e.g.
+    /// directly by `(` is either a method declaration's receiver clause
+    /// (`isMethodDeclStart`, below) or a function-VALUE TYPE (GRAMMAR.bnf
+    /// design note 3ad) leading an ordinary top-level var-declaration, e.g.
     /// `func(int) bool matcher := isEven` — `declaration`'s own `.kw_func`
-    /// dispatch (below) handles that case via `varDeclaration`/`parseType`.
-    /// This one-token lookahead is exactly what keeps the two `func`-led
-    /// productions from colliding at the top level (a var-declaration
-    /// doesn't get its own leading keyword the way struct/enum/import do).
+    /// dispatch (below) handles that last case via `varDeclaration`/
+    /// `parseType`. This one-token lookahead is exactly what keeps the
+    /// `func`-led productions from colliding at the top level (a
+    /// var-declaration doesn't get its own leading keyword the way
+    /// struct/enum/import do).
     fn isFunctionDeclStart(self: *Parser) bool {
         return self.check(.kw_func) and self.peekAt(1).type == .identifier;
+    }
+
+    /// `func` followed by `(` then two consecutive IDENTIFIER tokens is a
+    /// method declaration's receiver clause (GRAMMAR.bnf design note 3af,
+    /// `<method-decl>` ::= `'func' '(' <type> IDENTIFIER ')' ...`, receiver
+    /// type first — the same `<type> IDENTIFIER` order every other
+    /// parameter/field in this grammar uses, not Go's `(name Type)`) —
+    /// distinguished from a `<func-type>`-led var-declaration
+    /// (`isFunctionDeclStart`'s doc comment), whose own parenthesized list
+    /// is always bare `<type>`s, each one followed by `,` or `)`, never
+    /// immediately by a second identifier (a func-type's parameters are
+    /// never named). This is the same two-identifiers-in-a-row trick
+    /// `declaration`'s own struct/enum-typed var-declaration lookahead
+    /// already relies on.
+    fn isMethodDeclStart(self: *Parser) bool {
+        return self.check(.kw_func) and self.peekAt(1).type == .lparen and self.peekAt(2).type == .identifier and self.peekAt(3).type == .identifier;
     }
 
     /// <import-decl> ::= 'import' STRING <end>
@@ -483,12 +503,20 @@ pub const Parser = struct {
     /// `exported` is whatever `topLevelDeclaration` determined from an
     /// optional leading 'export' keyword, which this function itself never
     /// looks at (the 'func' token must already be the current token).
-    fn functionDeclaration(self: *Parser, exported: bool) Error!ast.Stmt {
-        const line = self.peek().line;
-        _ = self.advance(); // 'func'
-        const name_tok = try self.expect(.identifier, "expected a function name");
+    /// The shared tail of `<function-decl>` and `<method-decl>`
+    /// (GRAMMAR.bnf design note 3af) once each one's own leading keyword(s)
+    /// and name(s) have already been consumed: `'(' [ <param-list> ] ')'
+    /// '->' <type> [ '[' [ INT ] ']' ] <block>`.
+    const ParsedSignatureTail = struct {
+        params: []ast.Param,
+        return_type: ast.ValueType,
+        return_named_type: ?[]const u8,
+        return_array_size: ?ast.ArraySpec,
+        body: []ast.Stmt,
+    };
 
-        _ = try self.expect(.lparen, "expected '(' after function name");
+    fn parseSignatureTail(self: *Parser) Error!ParsedSignatureTail {
+        _ = try self.expect(.lparen, "expected '(' after function/method name");
         var params: std.ArrayList(ast.Param) = .empty;
         if (!self.check(.rparen)) {
             while (true) {
@@ -509,18 +537,67 @@ pub const Parser = struct {
         const return_type = try self.parseType();
         // Not supported this pass (GRAMMAR.bnf design note 3ad) — a
         // function value's own return type stays a plain scalar/map/list.
-        if (return_type.type == .func) return self.fail("a function cannot return a function type (not supported yet)");
+        if (return_type.type == .func) return self.fail("a function or method cannot return a function type (not supported yet)");
         const return_array_size = if (return_type.type == .map or return_type.type == .list or return_type.type == .named) null else try self.parseArraySpec();
 
         const body_stmt = try self.block();
 
-        return ast.Stmt{ .kind = .{ .function_decl = .{
-            .name = name_tok.lexeme,
+        return .{
             .params = try params.toOwnedSlice(self.allocator()),
             .return_type = return_type.type,
             .return_named_type = return_type.named_type,
             .return_array_size = return_array_size,
             .body = body_stmt.kind.block,
+        };
+    }
+
+    fn functionDeclaration(self: *Parser, exported: bool) Error!ast.Stmt {
+        const line = self.peek().line;
+        _ = self.advance(); // 'func'
+        const name_tok = try self.expect(.identifier, "expected a function name");
+        const tail = try self.parseSignatureTail();
+
+        return ast.Stmt{ .kind = .{ .function_decl = .{
+            .name = name_tok.lexeme,
+            .params = tail.params,
+            .return_type = tail.return_type,
+            .return_named_type = tail.return_named_type,
+            .return_array_size = tail.return_array_size,
+            .body = tail.body,
+            .exported = exported,
+        } }, .line = line };
+    }
+
+    /// <method-decl> ::= 'func' '(' <type> IDENTIFIER ')' IDENTIFIER
+    ///                    '(' [ <param-list> ] ')' '->' <type>
+    ///                    [ '[' [ INT ] ']' ] <block>
+    ///
+    /// See `isMethodDeclStart`'s doc comment for why the receiver clause
+    /// puts the type before the name (`<type> IDENTIFIER`, matching
+    /// `<param>`/`<field>` everywhere else in this grammar) rather than
+    /// Go's `(name Type)` order. `receiver_type` is left unresolved here
+    /// (bare source text) — compiler.zig checks it actually names a
+    /// declared struct, the same way a `<param>`'s own named type is only
+    /// resolved once compilation begins.
+    fn methodDeclaration(self: *Parser, exported: bool) Error!ast.Stmt {
+        const line = self.peek().line;
+        _ = self.advance(); // 'func'
+        _ = try self.expect(.lparen, "expected '(' to start a method's receiver clause");
+        const receiver_type_tok = try self.expect(.identifier, "expected the receiver's struct type name");
+        const receiver_name_tok = try self.expect(.identifier, "expected the receiver's parameter name");
+        _ = try self.expect(.rparen, "expected ')' after the receiver clause");
+        const name_tok = try self.expect(.identifier, "expected a method name");
+        const tail = try self.parseSignatureTail();
+
+        return ast.Stmt{ .kind = .{ .method_decl = .{
+            .receiver_name = receiver_name_tok.lexeme,
+            .receiver_type = receiver_type_tok.lexeme,
+            .name = name_tok.lexeme,
+            .params = tail.params,
+            .return_type = tail.return_type,
+            .return_named_type = tail.return_named_type,
+            .return_array_size = tail.return_array_size,
+            .body = tail.body,
             .exported = exported,
         } }, .line = line };
     }
@@ -1113,20 +1190,39 @@ pub const Parser = struct {
         return self.createExpr(.{ .index = .{ .base = base, .index = start_expr } });
     }
 
-    /// `'.' IDENTIFIER` postfix suffix (GRAMMAR.bnf design notes 3z/3aa) —
-    /// see `primary`'s doc comment. Called with `base` already parsed and
-    /// '.' as the next token (mirrors `finishIndex`). Always produces a
-    /// `.field_access` node regardless of whether it ends up being read or
-    /// assigned to — `assignment` is what turns a trailing `':=' <expr>`
-    /// into a `.field_assign` instead, exactly mirroring `.index`/
-    /// `.index_assign`. Whether `base.field` actually means a struct field
-    /// or an enum variant reference is never decided here — see
-    /// `ast.Expr.field_access`'s doc comment; the parser treats every
+    /// `'.' IDENTIFIER [ '(' [ <arg-list> ] ')' ]` postfix suffix
+    /// (GRAMMAR.bnf design notes 3z/3aa/3af) — see `primary`'s doc comment.
+    /// Called with `base` already parsed and '.' as the next token (mirrors
+    /// `finishIndex`). A trailing '(' right after the identifier — nothing
+    /// else in this grammar puts a call directly after a field/variant name
+    /// — is what turns this into a `.method_call` instead of an ordinary
+    /// `.field_access`; otherwise this always produces a `.field_access`
+    /// node regardless of whether it ends up being read or assigned to —
+    /// `assignment` is what turns a trailing `':=' <expr>` into a
+    /// `.field_assign` instead, exactly mirroring `.index`/`.index_assign`
+    /// (a `.method_call` is never an assignment target, so `assignment`
+    /// never needs to know about it at all — it only ever recognizes a
+    /// trailing `':='` right after the bare `.field_access` shape).
+    /// Whether a resulting `.field_access` actually means a struct field or
+    /// an enum variant reference is never decided here — see
+    /// `ast.Expr.field_access`'s doc comment; the parser treats every plain
     /// `.`-postfix identically and leaves disambiguation to compiler.zig.
     fn finishField(self: *Parser, base: *ast.Expr) Error!*ast.Expr {
         _ = self.advance(); // '.'
-        const field_tok = try self.expect(.identifier, "expected a field name after '.'");
-        return self.createExpr(.{ .field_access = .{ .base = base, .field = field_tok.lexeme } });
+        const field_tok = try self.expect(.identifier, "expected a field or method name after '.'");
+        if (!self.check(.lparen)) {
+            return self.createExpr(.{ .field_access = .{ .base = base, .field = field_tok.lexeme } });
+        }
+        _ = self.advance(); // '('
+        var args: std.ArrayList(*ast.Expr) = .empty;
+        if (!self.check(.rparen)) {
+            while (true) {
+                try args.append(self.allocator(), try self.expression());
+                if (!self.match(.comma)) break;
+            }
+        }
+        _ = try self.expect(.rparen, "expected ')' after arguments");
+        return self.createExpr(.{ .method_call = .{ .base = base, .method = field_tok.lexeme, .args = try args.toOwnedSlice(self.allocator()) } });
     }
 
     /// Whether the `{` right after an just-consumed IDENTIFIER actually

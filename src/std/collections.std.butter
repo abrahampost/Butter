@@ -1,12 +1,19 @@
 # Set, Stack, and Queue — three collections, each a struct wrapping a
-# `map` that holds its actual contents.
+# `map` that holds its actual contents, with the operations on it exposed
+# as struct methods (GRAMMAR.bnf design note 3af). Each type has a
+# `xNew()` constructor (a plain function — there's no receiver to hang it
+# off of yet); everything else is a method called on the resulting value,
+# e.g. `s.add("x")`, `st.pop()`, `q.dequeue()`.
 #
 # Set   — membership only. An element's presence is a key in `items`
 #          (the value at that key is unused); this is why Set elements
-#          are `string`, the only type a map key can be.
+#          are `string`, the only type a map key can be. Method names
+#          avoid the `has`/`remove` keywords (ISA builtins), hence
+#          `contains`/`discard`.
 # Stack — LIFO, string elements, `items` keyed "0".."n-1". `len(items)` is
 #          always the current size, since those keys are always
-#          contiguous from 0 — no separate size field needed.
+#          contiguous from 0 — no separate size field needed. `push` is
+#          also a reserved keyword, hence `add`.
 # Queue — FIFO, string elements. Unlike Stack, dequeuing drops the
 #          *front* key, so the live keys in `items` aren't contiguous
 #          from 0 over time; `head`/`tail` fields (real `int`s, not
@@ -14,7 +21,7 @@
 #
 # Popping/peeking/dequeuing an empty collection raises the same
 # `RuntimeError.KeyNotFound` a plain missing-key map read would — guard
-# with the *IsEmpty functions first, same as you'd guard a map with `has`.
+# with `isEmpty()` first, same as you'd guard a map with `has`.
 
 # ---- Set --------------------------------------------------------------
 
@@ -26,35 +33,35 @@ export func setNew() -> Set {
     return Set{items: {}}
 }
 
-export func setHas(Set s, string item) -> bool {
+export func (Set s) contains(string item) -> bool {
     return has(s.items, item)
 }
 
-export func setAdd(Set s, string item) -> bool {
-    if has(s.items, item) {
+export func (Set s) add(string item) -> bool {
+    if s.contains(item) {
         return false
     }
     s.items[item] := true
     return true
 }
 
-export func setRemove(Set s, string item) -> bool {
+export func (Set s) discard(string item) -> bool {
     return delete(s.items, item)
 }
 
-export func setSize(Set s) -> int {
+export func (Set s) size() -> int {
     return len(s.items)
 }
 
-export func setIsEmpty(Set s) -> bool {
+export func (Set s) isEmpty() -> bool {
     return len(s.items) == 0
 }
 
-export func setToList(Set s) -> list {
+export func (Set s) toList() -> list {
     return keys(s.items)
 }
 
-export func setUnion(Set a, Set b) -> Set {
+export func (Set a) union(Set b) -> Set {
     map result := {}
     list aKeys := keys(a.items)
     for i in 0..len(aKeys) {
@@ -67,40 +74,40 @@ export func setUnion(Set a, Set b) -> Set {
     return Set{items: result}
 }
 
-export func setIntersection(Set a, Set b) -> Set {
+export func (Set a) intersection(Set b) -> Set {
     map result := {}
     list aKeys := keys(a.items)
     for i in 0..len(aKeys) {
-        if has(b.items, aKeys[i]) {
+        if b.contains(aKeys[i]) {
             result[aKeys[i]] := true
         }
     }
     return Set{items: result}
 }
 
-export func setDifference(Set a, Set b) -> Set {
+export func (Set a) difference(Set b) -> Set {
     map result := {}
     list aKeys := keys(a.items)
     for i in 0..len(aKeys) {
-        if !has(b.items, aKeys[i]) {
+        if !b.contains(aKeys[i]) {
             result[aKeys[i]] := true
         }
     }
     return Set{items: result}
 }
 
-export func setIsSubset(Set a, Set b) -> bool {
+export func (Set a) isSubset(Set b) -> bool {
     list aKeys := keys(a.items)
     for i in 0..len(aKeys) {
-        if !has(b.items, aKeys[i]) {
+        if !b.contains(aKeys[i]) {
             return false
         }
     }
     return true
 }
 
-export func setEquals(Set a, Set b) -> bool {
-    return setIsSubset(a, b) and setIsSubset(b, a)
+export func (Set a) equals(Set b) -> bool {
+    return a.isSubset(b) and b.isSubset(a)
 }
 
 # ---- Stack (LIFO) -------------------------------------------------------
@@ -113,27 +120,27 @@ export func stackNew() -> Stack {
     return Stack{items: {}}
 }
 
-export func stackPush(Stack s, string item) -> int {
+export func (Stack s) add(string item) -> int {
     s.items[stringify(len(s.items))] := item
     return len(s.items)
 }
 
-export func stackPop(Stack s) -> string {
+export func (Stack s) pop() -> string {
     string topKey := stringify(len(s.items) - 1)
     string item := s.items[topKey]
     delete(s.items, topKey)
     return item
 }
 
-export func stackPeek(Stack s) -> string {
+export func (Stack s) peek() -> string {
     return s.items[stringify(len(s.items) - 1)]
 }
 
-export func stackSize(Stack s) -> int {
+export func (Stack s) size() -> int {
     return len(s.items)
 }
 
-export func stackIsEmpty(Stack s) -> bool {
+export func (Stack s) isEmpty() -> bool {
     return len(s.items) == 0
 }
 
@@ -149,21 +156,21 @@ export func queueNew() -> Queue {
     return Queue{items: {}, head: 0, tail: 0}
 }
 
-export func queueSize(Queue q) -> int {
+export func (Queue q) size() -> int {
     return q.tail - q.head
 }
 
-export func queueIsEmpty(Queue q) -> bool {
-    return queueSize(q) == 0
+export func (Queue q) isEmpty() -> bool {
+    return q.size() == 0
 }
 
-export func queueEnqueue(Queue q, string item) -> int {
+export func (Queue q) enqueue(string item) -> int {
     q.items[stringify(q.tail)] := item
     q.tail := q.tail + 1
-    return queueSize(q)
+    return q.size()
 }
 
-export func queueDequeue(Queue q) -> string {
+export func (Queue q) dequeue() -> string {
     string frontKey := stringify(q.head)
     string item := q.items[frontKey]
     delete(q.items, frontKey)
@@ -171,6 +178,6 @@ export func queueDequeue(Queue q) -> string {
     return item
 }
 
-export func queuePeek(Queue q) -> string {
+export func (Queue q) peek() -> string {
     return q.items[stringify(q.head)]
 }

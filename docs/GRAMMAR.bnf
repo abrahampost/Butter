@@ -88,6 +88,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    3z, 3aa). *)
 <top-level-decl>    ::= <import-decl>
                       | [ 'export' ] <function-decl>
+                      | [ 'export' ] <method-decl>
                       | [ 'export' ] <struct-decl>
                       | [ 'export' ] <enum-decl>
                       | <declaration>
@@ -109,6 +110,21 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <param-list>        ::= <param> { ',' <param> }
 
 <param>             ::= <type> [ '[' [ INT ] ']' ] IDENTIFIER
+
+(* A struct method (design note 3af) — the receiver clause reuses
+   <param>'s own `<type> IDENTIFIER` order (receiver type, then receiver
+   name), NOT Go's `(name Type)` order, both for consistency with every
+   other parameter/field position in this grammar and because it's what
+   keeps this production's lookahead unambiguous against a <func-type>-led
+   var-declaration (`func(int) bool matcher := isEven`): two consecutive
+   IDENTIFIER tokens right after '(' can never be a func-type's own
+   parameter list (each entry there is a bare <type>, never followed
+   immediately by a second identifier), so `func (` + IDENTIFIER +
+   IDENTIFIER always starts a <method-decl>. `receiver_type` must name a
+   declared struct, never an enum. *)
+<method-decl>       ::= 'func' '(' <type> IDENTIFIER ')' IDENTIFIER
+                         '(' [ <param-list> ] ')'
+                         '->' <type> [ '[' [ INT ] ']' ] <block>
 
 (* `path` resolves relative to the IMPORTING file's own directory. *)
 <import-decl>       ::= 'import' STRING <end>
@@ -223,10 +239,14 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
    '.' IDENTIFIER chains the exact same way (design notes 3z, 3aa) — a
    struct field read or an enum variant reference; which one is decided by
    the compiler, never here (a shape that's neither, e.g. `5.x`, is
-   likewise left to the compiler to reject). *)
+   likewise left to the compiler to reject). A '.' IDENTIFIER immediately
+   followed by '(' is instead a METHOD CALL (design note 3af) — the
+   trailing '(' is what disambiguates it from an ordinary field/variant
+   read; nothing else in this grammar puts a call directly after a
+   field/variant name. *)
 <primary>           ::= <atom> { <postfix> }
 <postfix>           ::= '[' <expression> [ '..' <expression> ] ']'
-                      | '.' IDENTIFIER
+                      | '.' IDENTIFIER [ '(' [ <arg-list> ] ')' ]
 
 <atom>              ::= INT
                       | FLOAT
@@ -1039,6 +1059,74 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      though every OTHER checked position (assignment, a parameter, a return)
      does enforce the exact type match. *)
 
+(* --- Struct methods (design note 3af) ---
+   - `func (<type> IDENTIFIER) NAME(...) -> <type> <block>` declares a
+     METHOD on a struct type — top-level only, same as a plain function.
+     `<type>` in the receiver clause must name an already-declared STRUCT
+     (never an enum, never a scalar/map/list): an enum value is a plain
+     scalar constant (design note 3aa) with no heap instance for a receiver
+     to bind, so a method with an enum receiver is
+     `SemanticError.ReceiverNotAStruct`.
+   - DESUGARS TO AN ORDINARY FUNCTION whose first parameter is the receiver
+     — `func (Point p) dist() -> float {...}` compiles exactly as if it had
+     been written `func <mangled> (Point p) -> float {...}` and registered
+     under a name no source program can spell (the compiler's own function
+     table, keyed however it likes — GRAMMAR.bnf places no requirement on
+     it beyond "not a legal IDENTIFIER"). This is what makes a method body
+     behave exactly like any other function body — no nesting, no closures
+     (Functions design note, above), same static-type-checking treatment
+     for every parameter/return/local (design note 3t) — with no separate
+     mechanism to define or maintain.
+   - CALLS ARE RESOLVED STATICALLY, AT COMPILE TIME, by the receiver
+     expression's own declared struct type (`<primary> '.' IDENTIFIER '('
+     args ')'`, the <postfix> grammar above) — never by any runtime tag or
+     vtable. There is no dynamic dispatch, no interfaces, and no way for two
+     structs to satisfy a common "method contract" checked at a call site: a
+     method call is, after resolution, indistinguishable from an ordinary
+     function call to a fixed, compile-time-known function index. A call
+     naming a method the receiver's struct type doesn't have is
+     `SemanticError.UnknownMethod` — the method counterpart of
+     `SemanticError.UnknownField`.
+   - THE RECEIVER IS ALWAYS PASSED BY REFERENCE, with no separate value-
+     receiver spelling (unlike Go's `(p Point)` vs `(p *Point)`) — because a
+     struct value already IS a heap reference, refcounted exactly like a
+     `map`/`list` (design note 3z), passing it as a method's first parameter
+     is no different from passing it to any other function: no copy is
+     made, so `c.n := c.n + 1` inside a method body mutates the SAME record
+     the caller holds, visible immediately after the call returns, with no
+     extra syntax to opt into that behavior.
+   - A METHOD NAME MUST NOT COLLIDE WITH THAT STRUCT'S OWN FIELD NAMES, NOR
+     WITH ANOTHER METHOD ALREADY DECLARED ON THE SAME STRUCT
+     (`SemanticError.DuplicateFieldOrMethod`) — checked once, at
+     registration, regardless of which one (the field or the method) the
+     source file happens to declare first, the same "declare, then validate
+     regardless of order" stance every other struct/method pre-pass in this
+     grammar already takes. Two DIFFERENT structs may freely declare a
+     method with the same name (`Point.dist`, `Vector.dist`) — a method
+     name lives in a namespace scoped to its own receiver type, not a
+     single flat table the way plain function names are (Functions design
+     note, above), so this is never a `SemanticError.DuplicateFunction`.
+   - EXPORTED PER-METHOD, independently of its receiver struct's own
+     `export` (design note h/3z/3aa): a struct may be exported for its
+     type/fields/literal-construction while only some (or none) of its
+     methods are separately marked `export`, exactly the same independence
+     a module's plain top-level functions already have from each other.
+   - A METHOD REFERENCE IS NEVER USABLE AS A FUNCTION VALUE (design note
+     3ad) — its own first parameter is always struct-typed, which
+     `functionIsValueEligible` already excludes for any function, so this
+     needs no separate rule; there is also no syntax to reference a method
+     bare (`p.dist` with no call is an ordinary, if likely mistaken,
+     `.field_access` attempt — `SemanticError.UnknownField` if `dist` isn't
+     also a field name), unlike a plain top-level function's own name.
+   - NOT SUPPORTED THIS PASS: a method may not return an array (fixed or
+     generic) when that result is needed in one of the three ARRAY-typed
+     contexts an ordinary function call can feed (a matching array
+     var-declaration's initializer, an array-typed call argument, or an
+     array return) — those three contexts recognize a bare array-typed
+     local name or a `.call`, but not yet a `.method_call`; a scalar/map/
+     list/struct/enum-returning method works everywhere an ordinary call's
+     result does. *)
+
 (* --- Process exit code ---
    - `exit <expression>` halts the entire program immediately, from
      anywhere — the top level, mid-loop, mid-expression-statement, or
@@ -1062,10 +1150,12 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 
 (* --- import/export ---
    - Function AND struct/enum declarations may be exported/imported (design
-     notes 3z, 3aa extend this to type declarations) — a top-level
-     var-declaration still can't be, sidestepping any notion of module
-     initialization order. An imported file may only contain more imports,
-     function declarations, and struct/enum declarations at its top level.
+     notes 3z, 3aa extend this to type declarations; design note 3af extends
+     it again to methods, exported independently of their receiver struct)
+     — a top-level var-declaration still can't be, sidestepping any notion
+     of module initialization order. An imported file may only contain more
+     imports, function declarations, method declarations, and struct/enum
+     declarations at its top level.
    - Visibility is direct-import-only, not transitive: importing B doesn't
      expose what B itself imports — true of a struct/enum type exactly as
      it is of a function.

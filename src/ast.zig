@@ -154,6 +154,14 @@ pub const Expr = union(enum) {
     grouping: *Expr,
     assign: Assign,
     call: Call,
+    /// `<base>.IDENTIFIER '(' args ')'` (GRAMMAR.bnf design note 3af) — a
+    /// struct method call, distinguished from `.field_access` purely by the
+    /// trailing '(' the parser sees right after the identifier (`primary`'s
+    /// postfix loop). `base`'s static type must be a struct, and `method`
+    /// one of the methods declared with that struct as their receiver;
+    /// compiler.zig resolves both, exactly the way `.field_access` resolves
+    /// `base`'s struct type and field.
+    method_call: MethodCall,
     array_literal: []*Expr,
     index: Index,
     index_assign: IndexAssign,
@@ -397,6 +405,17 @@ pub const Expr = union(enum) {
         args: []*Expr,
     };
 
+    /// `base.method(args)` (GRAMMAR.bnf design note 3af). `args` never
+    /// includes `base` itself — the receiver — compiler.zig prepends it as
+    /// the underlying function's own first argument at codegen time, the
+    /// same way `MethodDecl.receiver_name`/`receiver_type` desugar to that
+    /// function's first declared parameter at registration time.
+    pub const MethodCall = struct {
+        base: *Expr,
+        method: []const u8,
+        args: []*Expr,
+    };
+
     /// `<base>[index]`. `base` is a general expression, not just a bare
     /// name — this is what lets bracket-indexing CHAIN for map/list values
     /// (`doc["a"]["b"]`, GRAMMAR.bnf design note 3m), unlike an array
@@ -551,6 +570,16 @@ pub const StmtKind = union(enum) {
     print_stmt: *Expr,
     expr_stmt: *Expr,
     function_decl: FunctionDecl,
+    /// `[export] func '(' IDENTIFIER IDENTIFIER ')' IDENTIFIER '(' params ')'
+    /// '->' <type> <block>` (GRAMMAR.bnf design note 3af) — a struct method.
+    /// Only ever produced at the top level, same restriction as
+    /// `function_decl`. Never itself compiled directly: compiler.zig
+    /// desugars it into an ordinary function whose first parameter is the
+    /// receiver (`receiver_name IDENTIFIER receiver_type`), then compiles
+    /// that exactly like any other `function_decl` — a method call is
+    /// resolved statically at its call site (by the receiver's declared
+    /// struct type), never through any runtime dispatch mechanism.
+    method_decl: MethodDecl,
     return_stmt: *Expr,
     for_stmt: For,
     import_stmt: Import,
@@ -635,6 +664,27 @@ pub const StmtKind = union(enum) {
         /// Whether this function is callable from a file that imports this
         /// one (see GRAMMAR.bnf design note h). Irrelevant for calls from
         /// within the same file, which are always allowed regardless.
+        exported: bool = false,
+    };
+
+    /// See `StmtKind.method_decl`'s doc comment. `receiver_type` must name a
+    /// declared struct (never an enum — GRAMMAR.bnf design note 3af); which
+    /// one is resolved by compiler.zig, same as `Param.named_type` elsewhere.
+    pub const MethodDecl = struct {
+        receiver_name: []const u8,
+        receiver_type: []const u8,
+        name: []const u8,
+        params: []Param,
+        return_type: ValueType,
+        /// Set only when `return_type == .named` — see `FunctionDecl`'s
+        /// sibling field of the same name.
+        return_named_type: ?[]const u8 = null,
+        /// null for a plain scalar return type; see `ArraySpec` otherwise.
+        return_array_size: ?ArraySpec = null,
+        body: []Stmt,
+        /// See `FunctionDecl.exported`'s doc comment — a method opts into
+        /// cross-module visibility independently of its receiver struct's
+        /// own `StructDecl.exported`, exactly like a plain function does.
         exported: bool = false,
     };
 
@@ -738,6 +788,16 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
         .call => |c| {
             try writer.print("(call {s}", .{c.name});
             for (c.args) |arg| {
+                try writer.writeAll(" ");
+                try printExpr(writer, arg);
+            }
+            try writer.writeAll(")");
+        },
+        .method_call => |mc| {
+            try writer.writeAll("(methodcall ");
+            try printExpr(writer, mc.base);
+            try writer.print(" {s}", .{mc.method});
+            for (mc.args) |arg| {
                 try writer.writeAll(" ");
                 try printExpr(writer, arg);
             }
@@ -1070,6 +1130,24 @@ pub fn printStmt(writer: *std.Io.Writer, stmt: *const Stmt, depth: usize) std.Io
             if (f.return_array_size) |spec| try printArraySpecSuffix(writer, spec);
             try writer.writeAll(")\n");
             for (f.body) |*s| {
+                try printStmt(writer, s, depth + 1);
+                try writer.writeAll("\n");
+            }
+            try writer.splatByteAll(' ', depth * 2);
+            try writer.writeAll(")");
+        },
+        .method_decl => |md| {
+            const prefix = if (md.exported) "export " else "";
+            try writer.print("({s}func ({s} {s}) {s} (", .{ prefix, md.receiver_name, md.receiver_type, md.name });
+            for (md.params, 0..) |p, i| {
+                if (i > 0) try writer.writeAll(" ");
+                try writer.writeAll(valueTypeName(p.type, p.named_type));
+                if (p.array_size) |spec| try printArraySpecSuffix(writer, spec);
+            }
+            try writer.print(") {s}", .{valueTypeName(md.return_type, md.return_named_type)});
+            if (md.return_array_size) |spec| try printArraySpecSuffix(writer, spec);
+            try writer.writeAll(")\n");
+            for (md.body) |*s| {
                 try printStmt(writer, s, depth + 1);
                 try writer.writeAll("\n");
             }
