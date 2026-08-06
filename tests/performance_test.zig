@@ -77,7 +77,7 @@ test "function_calls: 2,000,000 calls to a trivial non-recursive function" {
     try expectCasePerformance("function_calls", 5000.0);
 }
 
-test "struct_methods: 300,000 heap struct allocations + method calls" {
+test "struct_methods: 150,000 heap struct allocations + method calls" {
     try expectCasePerformance("struct_methods", 5000.0);
 }
 
@@ -85,6 +85,6 @@ test "string_format: 30,000 rounds of multi-expression string interpolation" {
     try expectCasePerformance("string_format", 5000.0);
 }
 
-test "higher_order_calls: 2,000,000 indirect calls through a func-typed parameter" {
+test "higher_order_calls: 2,000,000 CALL_VALUE dispatches through a func-typed local, isolated from function_calls' CALL by an otherwise-identical loop" {
     try expectCasePerformance("higher_order_calls", 5000.0);
 }

@@ -69,7 +69,7 @@ does a lot of, rather than checking printed output:
 | [function_calls.butter](perf_cases/function_calls.butter) | Call/return overhead — 2,000,000 calls to a trivial non-recursive function. |
 | [struct_methods.butter](perf_cases/struct_methods.butter) | Heap struct allocation + method dispatch — 150,000 rounds of allocating a `Point` and calling a method on it. |
 | [string_format.butter](perf_cases/string_format.butter) | String interpolation — 30,000 rounds of a `"...${expr}..."` string with three embedded expressions. |
-| [higher_order_calls.butter](perf_cases/higher_order_calls.butter) | Indirect calls through a `func(...)`-typed parameter — 2,000,000 calls to a predicate passed into a higher-order function, as opposed to function_calls' direct calls. |
+| [higher_order_calls.butter](perf_cases/higher_order_calls.butter) | CALL_VALUE dispatch — function_calls.butter's exact loop, but calling through a `func(...)`-typed local (compiled to CALL_VALUE) instead of a name (CALL), isolating indirect-call overhead from everything else a more realistic higher-order-function use would also exercise. |
 
 Each test reports `compile` (lex + parse + import resolution + codegen)
 and `run` (executing the compiled bytecode) separately, since only the
@@ -105,25 +105,28 @@ treat this as a baseline snapshot to compare future runs against, not a
 guarantee):
 
 ```
-loop_sum             compile=    0.021ms  run=  270.027ms  total=  270.048ms
-fib_recursive        compile=    0.020ms  run=   31.446ms  total=   31.467ms
-bubble_sort          compile=    0.042ms  run=   31.489ms  total=   31.531ms
-list_push            compile=    0.011ms  run=   12.862ms  total=   12.874ms
-map_ops              compile=    0.011ms  run=    2.594ms  total=    2.605ms
-string_concat        compile=    0.004ms  run=    0.893ms  total=    0.897ms
-function_calls       compile=    0.024ms  run=  176.360ms  total=  176.384ms
-struct_methods       compile=    0.024ms  run=   34.059ms  total=   34.082ms
-string_format        compile=    0.015ms  run=   11.093ms  total=   11.108ms
-higher_order_calls   compile=    0.027ms  run=  263.606ms  total=  263.634ms
+loop_sum             compile=    0.032ms  run=  267.525ms  total=  267.557ms
+fib_recursive        compile=    0.021ms  run=   31.628ms  total=   31.649ms
+bubble_sort          compile=    0.045ms  run=   31.534ms  total=   31.580ms
+list_push            compile=    0.014ms  run=   13.227ms  total=   13.242ms
+map_ops              compile=    0.013ms  run=    2.634ms  total=    2.647ms
+string_concat        compile=    0.006ms  run=    0.860ms  total=    0.866ms
+function_calls       compile=    0.023ms  run=  178.518ms  total=  178.541ms
+struct_methods       compile=    0.024ms  run=   33.943ms  total=   33.967ms
+string_format        compile=    0.017ms  run=   10.948ms  total=   10.964ms
+higher_order_calls   compile=    0.029ms  run=  184.505ms  total=  184.535ms
 ```
 
 `compile` is negligible everywhere, as expected — it's `run` that matters
-for VM optimization work. `higher_order_calls` costs about 1.5x
-`function_calls` per call (~132ns vs. ~88ns) despite doing the same 2M
-calls to an equally trivial function — the only difference is the call
-going through a `func(...)`-typed value instead of a name resolved at
-compile time, which is a reasonable place to look first if indirect-call
-overhead ever needs shrinking.
+for VM optimization work. `higher_order_calls` runs the exact same loop as
+`function_calls` (same 2M calls to the same trivial function), so the
+small gap between them (~3-6% run to run) isolates what CALL_VALUE's
+runtime callee lookup actually costs over CALL's compile-time operand —
+see [src/vm.zig](../src/vm.zig)'s `.call`/`.call_value` handlers. Earlier
+revisions of this case called an indirect predicate from inside a
+filter/count loop instead, which also did array indexing and branching
+the direct case didn't; that shape made the gap look like ~1.5x, when
+in fact most of that difference was the extra work, not the dispatch.
 
 To add a case: drop `<name>.butter` in `perf_cases/` (sized so it takes
 somewhere from a few to a few hundred milliseconds — long enough that

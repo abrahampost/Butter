@@ -1,24 +1,21 @@
-func isEven(int n) -> bool {
-    return n % 2 == 0
+# Same loop as function_calls.butter, with the same 2,000,000 calls to the
+# same trivial function — the only difference is `op` being a func-typed
+# local (compiled to CALL_VALUE, which reads its callee off the stack)
+# instead of `add` being called by name (CALL, whose callee is a compile-
+# time operand). Keeping everything else identical isolates that one
+# opcode's dispatch cost instead of also mixing in array indexing and
+# branching, which a more "realistic" filter/count higher-order-function
+# case would (see git history for the previous version of this file if
+# that broader shape is ever needed again).
+
+func add(int a, int b) -> int {
+    return a + b
 }
 
-func countMatching(list xs, func(int) bool pred) -> int {
-    int count := 0
-    for i in 0..len(xs) {
-        if pred(xs[i]) {
-            count := count + 1
-        }
-    }
-    return count
-}
-
-list xs
-for i in 0..1000 {
-    push(xs, i)
-}
+func(int, int) int op := add
 
 int total := 0
-for i in 0..2000 {
-    total := total + countMatching(xs, isEven)
+for i in 0..2000000 {
+    total := op(total, i)
 }
 print total
