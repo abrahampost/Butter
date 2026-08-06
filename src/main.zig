@@ -148,6 +148,12 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
+    // Bytecode-level peephole cleanup (jump threading, unreachable-code
+    // elimination) — see peephole.zig. Distinct from the AST pass above:
+    // this cleans up jumps codegen itself introduces, which the AST pass
+    // can't see since they have no source statement behind them.
+    try butter.peephole.optimizeProgram(gpa, &chunk);
+
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
