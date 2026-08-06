@@ -1588,13 +1588,11 @@ pub const Compiler = struct {
     fn compileIf(self: *Compiler, i: ast.StmtKind.If) CompileError!void {
         try self.checkExpectedType(i.condition, DeclaredType.builtin(.bool), "if", "condition must be a bool");
         try self.compileExpr(i.condition);
-        const then_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false, 0);
-        _ = try self.chunk.emit(self.allocator, .pop);
+        const then_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false_pop, 0);
         try self.compileStmt(i.then_branch);
 
         const else_jump = try self.chunk.emit(self.allocator, .jump);
         self.chunk.patchOperand(then_jump, @intCast(self.chunk.code.items.len));
-        _ = try self.chunk.emit(self.allocator, .pop);
 
         if (i.else_branch) |eb| try self.compileStmt(eb);
         self.chunk.patchOperand(else_jump, @intCast(self.chunk.code.items.len));
@@ -1667,21 +1665,18 @@ pub const Compiler = struct {
         const loop_start = self.chunk.code.items.len;
         try self.checkExpectedType(w.condition, DeclaredType.builtin(.bool), "while", "condition must be a bool");
         try self.compileExpr(w.condition);
-        const exit_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false, 0);
-        _ = try self.chunk.emit(self.allocator, .pop);
+        const exit_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false_pop, 0);
 
         try self.compileStmt(w.body);
         _ = try self.chunk.emitWithOperand(self.allocator, .jump, @intCast(loop_start));
 
         self.chunk.patchOperand(exit_jump, @intCast(self.chunk.code.items.len));
-        _ = try self.chunk.emit(self.allocator, .pop);
     }
 
     /// `for v in start..end body` desugars directly to the same
     /// backpatched-jump while-loop pattern `compileWhile` uses (ISA.bnf
-    /// section 4) — no new opcodes, exactly the same way `and`/`or` are
-    /// "sugar" over JUMP_IF_FALSE/JUMP rather than dedicated instructions.
-    /// It needs two hidden locals of its own, scoped to a wrapper block
+    /// section 4), condition and all — both use JUMP_IF_FALSE_POP the same
+    /// way. It needs two hidden locals of its own, scoped to a wrapper block
     /// only `compileFor` knows about: the end bound (evaluated once, up
     /// front — not re-evaluated per iteration) and the loop variable
     /// itself, which the body resolves like any other local by name.
@@ -1704,8 +1699,7 @@ pub const Compiler = struct {
         _ = try self.chunk.emitWithOperand(self.allocator, .load_local, var_slot);
         _ = try self.chunk.emitWithOperand(self.allocator, .load_local, end_slot);
         _ = try self.chunk.emit(self.allocator, .lt);
-        const exit_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false, 0);
-        _ = try self.chunk.emit(self.allocator, .pop);
+        const exit_jump = try self.chunk.emitWithOperand(self.allocator, .jump_if_false_pop, 0);
 
         try self.compileStmt(f.body);
 
@@ -1718,7 +1712,6 @@ pub const Compiler = struct {
         _ = try self.chunk.emitWithOperand(self.allocator, .jump, @intCast(loop_start));
 
         self.chunk.patchOperand(exit_jump, @intCast(self.chunk.code.items.len));
-        _ = try self.chunk.emit(self.allocator, .pop);
 
         self.scope_depth -= 1;
         try self.popLocalsAbove(self.scope_depth);

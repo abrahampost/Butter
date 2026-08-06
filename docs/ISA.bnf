@@ -28,6 +28,11 @@
    c) ORTHOGONAL AND MINIMAL. Exactly one conditional branch (JUMP_IF_FALSE)
       and one unconditional one (JUMP); there is no JUMP_IF_TRUE because
       'or' is expressible as JUMP_IF_FALSE + JUMP (section 4).
+      JUMP_IF_FALSE_POP (section 3) is the one deliberate exception: not a
+      new orthogonal primitive but a peephole fusion of JUMP_IF_FALSE with
+      the POP that if/while/for always emit right after it, justified
+      purely by how hot that exact pair is (every loop iteration, every
+      branch taken).
 
    Every LOAD_LOCAL/STORE_LOCAL operand is a slot index relative to the
    current call frame's base pointer, not absolute (sections 5-6). Top-level
@@ -227,6 +232,27 @@
                                                condition itself on both paths
                                                (section 4). TypeMismatch if
                                                the peeked value isn't BOOL.
+
+   JUMP_IF_FALSE_POP #target  ( bool -- )     a peephole fusion of
+                                               JUMP_IF_FALSE followed by the
+                                               POP every if/while/for use
+                                               site (section 4) always emits
+                                               right after it — one dispatch
+                                               instead of two per branch
+                                               taken and per loop iteration.
+                                               ALWAYS pops the condition, on
+                                               both the taken and
+                                               fall-through paths — unlike
+                                               JUMP_IF_FALSE, so it is only
+                                               correct where the condition's
+                                               value is never needed again.
+                                               'and'/'or' (section 4) still
+                                               use plain JUMP_IF_FALSE, since
+                                               their short-circuit path needs
+                                               the condition's value to
+                                               survive as the expression's
+                                               result. TypeMismatch if the
+                                               popped value isn't BOOL.
 
    PUSH_HANDLER #target                       pushes a handler onto the
                                                handler stack (section 14),
@@ -587,12 +613,10 @@
    if-stmt (condition, then, optional else):
 
        <condition>
-       JUMP_IF_FALSE  else_target
-       POP                          (* discard a truthy condition *)
+       JUMP_IF_FALSE_POP  else_target   (* pops the condition either way *)
        <then-branch>
        JUMP  end_target
      else_target:
-       POP                          (* discard a falsy condition either way *)
        [ <else-branch> ]
      end_target:
 
@@ -600,12 +624,10 @@
 
      loop_start:
        <condition>
-       JUMP_IF_FALSE  exit_target
-       POP
+       JUMP_IF_FALSE_POP  exit_target
        <body>
        JUMP  loop_start
      exit_target:
-       POP
 
    try-stmt (body, error binding, handler — section 14):
 
@@ -633,10 +655,17 @@
    struct, landing it precisely in slot N. The end-of-scope POP then
    discards it with no special case.
 
+   'and' and 'or' deliberately use plain JUMP_IF_FALSE + POP rather than
+   JUMP_IF_FALSE_POP: unlike if/while/for above, the condition's own value
+   is the expression's RESULT on the short-circuiting path (see 'and'
+   below), so it must survive on the stack across the jump — the one thing
+   JUMP_IF_FALSE_POP's unconditional pop cannot allow.
+
    'and' (short-circuits a false left operand without evaluating right):
 
        <left>
-       JUMP_IF_FALSE  end_target
+       JUMP_IF_FALSE  end_target    (* if false, LEAVES it — that's the
+                                       expression's result *)
        POP                          (* left true -> discard it *)
        <right>
      end_target:
@@ -646,7 +675,8 @@
 
        <left>
        JUMP_IF_FALSE  else_target
-       JUMP  end_target             (* left true -> skip right *)
+       JUMP  end_target             (* left true -> skip right, left's own
+                                       value is already the result *)
      else_target:
        POP                          (* left false -> discard it *)
        <right>
@@ -802,8 +832,7 @@
        LOAD_LOCAL  var_slot
        LOAD_LOCAL  end_slot
        LT
-       JUMP_IF_FALSE  exit_target
-       POP
+       JUMP_IF_FALSE_POP  exit_target
        <body>                        (* v resolves as an ordinary local *)
        LOAD_LOCAL  var_slot
        PUSH_CONST  #1
@@ -812,12 +841,12 @@
        POP
        JUMP  loop_start
      exit_target:
-       POP
        (* both hidden locals popped as the wrapper scope closes, section 5 *)
 
-   No new opcodes are involved. The hidden end-bound local is given the
-   empty string as its name — never a legal IDENTIFIER lexeme — so it can
-   never collide with a name the program actually writes.
+   No opcodes beyond what section 4's while-stmt already uses. The hidden
+   end-bound local is given the empty string as its name — never a legal
+   IDENTIFIER lexeme — so it can never collide with a name the program
+   actually writes.
 
 
 (* --------------------------------------------------------------------------

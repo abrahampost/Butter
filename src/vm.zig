@@ -2112,6 +2112,16 @@ pub const Vm = struct {
                 if (cond != .boolean) return RuntimeError.TypeMismatch;
                 if (!cond.boolean) ex.ip = instr.operand;
             },
+            // Same check as JUMP_IF_FALSE, but pops unconditionally instead
+            // of leaving the condition for a separate POP — see chunk.zig's
+            // doc comment on why that's only sound where the condition's
+            // value itself is never needed after the branch.
+            .jump_if_false_pop => {
+                const cond = try self.pop();
+                defer cond.decref(self.allocator);
+                if (cond != .boolean) return RuntimeError.TypeMismatch;
+                if (!cond.boolean) ex.ip = instr.operand;
+            },
 
             .push_handler => {
                 if (ex.handler_count >= max_handlers) return RuntimeError.HandlerStackOverflow;

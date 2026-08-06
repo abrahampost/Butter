@@ -50,6 +50,16 @@ pub const OpCode = enum(u8) {
 
     jump,
     jump_if_false,
+    // Fuses JUMP_IF_FALSE with the POP the compiler always emits right after
+    // it in `if`/`while`/`for` (compiler.zig's `compileIf`/`compileWhile`/
+    // `compileFor`) — one dispatch instead of two on every branch taken and
+    // every loop iteration. Unlike JUMP_IF_FALSE, this ALWAYS pops the
+    // condition, on both the taken and fall-through paths, so it's only a
+    // correct substitute where the condition's value is discarded either
+    // way — NOT for `and`/`or` (compileLogicAnd/compileLogicOr), which need
+    // the condition's own value to survive on the stack as the short-circuit
+    // result when the jump IS taken.
+    jump_if_false_pop,
 
     // Error handling (ISA.bnf section 14). PUSH_HANDLER's operand is the
     // offset of the catch block's first instruction in the CURRENT chunk;
@@ -326,7 +336,7 @@ pub const Chunk = struct {
                     const idx = unpackIndexOperand(instr.operand);
                     try writer.print(" slot={d} len={d}\n", .{ idx.slot, idx.length });
                 },
-                .jump, .jump_if_false, .push_handler => try writer.print(" -> {d}\n", .{instr.operand}),
+                .jump, .jump_if_false, .jump_if_false_pop, .push_handler => try writer.print(" -> {d}\n", .{instr.operand}),
                 .call, .make_list, .make_map, .make_struct, .field_get, .field_set => try writer.print(" #{d}\n", .{instr.operand}),
                 .open => {
                     const mode: value_mod.OpenMode = @enumFromInt(instr.operand);
