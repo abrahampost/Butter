@@ -15,6 +15,18 @@ pub const OpCode = enum(u8) {
 
     load_local,
     store_local,
+    // Fuses the for-loop increment's LOAD_LOCAL + PUSH_CONST #1 + ADD +
+    // STORE_LOCAL + POP (compiler.zig's `compileFor`) into one dispatch:
+    // stack[bp+operand] += 1 in place, no push/pop at all. Only ever
+    // emitted for the loop's own hidden variable, which `compileFor`
+    // declares INT and every in-body reassignment (compileStmt's `.assign`
+    // arm) is type-checked against before it can reach STORE_LOCAL — so,
+    // like FIELD_GET/FIELD_SET (ISA.bnf section 19), there is no reachable
+    // program state where this slot holds anything but INT, and no
+    // TypeMismatch check is needed. Overflow IS still possible — the body
+    // can reassign the loop variable arbitrarily close to i64 max before
+    // this runs — so it's checked exactly as ADD's own INT/INT path would.
+    inc_local,
     load_index,
     store_index,
 
@@ -331,7 +343,7 @@ pub const Chunk = struct {
                     try self.constants.items[instr.operand].print(writer);
                     try writer.writeAll(")\n");
                 },
-                .load_local, .store_local, .load_index_ref, .store_index_ref, .load_ref_len => try writer.print(" slot={d}\n", .{instr.operand}),
+                .load_local, .store_local, .inc_local, .load_index_ref, .store_index_ref, .load_ref_len => try writer.print(" slot={d}\n", .{instr.operand}),
                 .load_index, .store_index, .make_array_ref => {
                     const idx = unpackIndexOperand(instr.operand);
                     try writer.print(" slot={d} len={d}\n", .{ idx.slot, idx.length });

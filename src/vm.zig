@@ -1492,6 +1492,16 @@ pub const Vm = struct {
                 self.stack[ex.bp + instr.operand].decref(self.allocator);
                 self.stack[ex.bp + instr.operand] = new_v;
             },
+            // Only ever emitted for a for-loop's own hidden variable
+            // (compiler.zig's `compileFor`), always INT by construction —
+            // see chunk.zig's OpCode.inc_local doc comment. No incref/decref
+            // (INT carries no refcount) and no TypeMismatch check (nothing
+            // else can ever reach here); overflow is still checked, exactly
+            // as ADD's own INT/INT path would.
+            .inc_local => {
+                const slot = ex.bp + instr.operand;
+                self.stack[slot] = .{ .int = try checkedAdd(self.stack[slot].int, 1) };
+            },
 
             .load_index => {
                 const idx_val = try self.pop();

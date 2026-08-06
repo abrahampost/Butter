@@ -1679,7 +1679,13 @@ pub const Compiler = struct {
     /// way. It needs two hidden locals of its own, scoped to a wrapper block
     /// only `compileFor` knows about: the end bound (evaluated once, up
     /// front — not re-evaluated per iteration) and the loop variable
-    /// itself, which the body resolves like any other local by name.
+    /// itself, which the body resolves like any other local by name. The
+    /// increment is a single INC_LOCAL rather than the general
+    /// LOAD_LOCAL+PUSH_CONST+ADD+STORE_LOCAL+POP sequence a hand-written
+    /// `v := v + 1` would compile to — safe here specifically because
+    /// `var_slot` is declared INT immediately below and every in-body
+    /// reassignment of `v` is type-checked against that before it can ever
+    /// reach STORE_LOCAL (see INC_LOCAL's own doc comment, chunk.zig).
     fn compileFor(self: *Compiler, f: ast.StmtKind.For) CompileError!void {
         self.scope_depth += 1;
 
@@ -1703,12 +1709,7 @@ pub const Compiler = struct {
 
         try self.compileStmt(f.body);
 
-        const one_idx = try self.chunk.addConstant(self.allocator, .{ .int = 1 });
-        _ = try self.chunk.emitWithOperand(self.allocator, .load_local, var_slot);
-        _ = try self.chunk.emitWithOperand(self.allocator, .push_const, one_idx);
-        _ = try self.chunk.emit(self.allocator, .add);
-        _ = try self.chunk.emitWithOperand(self.allocator, .store_local, var_slot);
-        _ = try self.chunk.emit(self.allocator, .pop);
+        _ = try self.chunk.emitWithOperand(self.allocator, .inc_local, var_slot);
         _ = try self.chunk.emitWithOperand(self.allocator, .jump, @intCast(loop_start));
 
         self.chunk.patchOperand(exit_jump, @intCast(self.chunk.code.items.len));
