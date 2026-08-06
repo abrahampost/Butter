@@ -1,0 +1,6 @@
+int total := 0
+for i in 0..30000 {
+    string s := "item ${i}: value=${i * 2}, half=${i / 2}"
+    total := total + len(s)
+}
+print total

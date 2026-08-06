@@ -1,0 +1,24 @@
+func isEven(int n) -> bool {
+    return n % 2 == 0
+}
+
+func countMatching(list xs, func(int) bool pred) -> int {
+    int count := 0
+    for i in 0..len(xs) {
+        if pred(xs[i]) {
+            count := count + 1
+        }
+    }
+    return count
+}
+
+list xs
+for i in 0..1000 {
+    push(xs, i)
+}
+
+int total := 0
+for i in 0..2000 {
+    total := total + countMatching(xs, isEven)
+}
+print total

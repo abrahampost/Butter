@@ -19,55 +19,15 @@
 //! slower than release ones and not representative of real-world
 //! performance — run with `-Doptimize=ReleaseFast` for numbers worth
 //! comparing against other language implementations.
+//!
+//! For run-over-run regression tracking (as opposed to this file's
+//! per-case absolute thresholds), see perf_report.zig and
+//! perf_compare.zig, which CI runs on every push/PR (`zig build
+//! perf-report` + `zig build perf-compare`) to flag a case that got
+//! meaningfully slower than the last run on the same branch.
 
 const std = @import("std");
-const butter = @import("butter");
-
-const Timing = struct {
-    compile_ns: i96,
-    run_ns: i96,
-};
-
-/// Compiles and runs `source`, discarding its printed output, and returns
-/// how long each phase took. Mirrors integration_test.zig's `run`, split
-/// into its compile and execute halves so each can be timed separately.
-fn benchmark(allocator: std.mem.Allocator, source: []const u8) !Timing {
-    const io = std.testing.io;
-
-    const t0 = std.Io.Clock.now(.awake, io);
-
-    var loader = butter.module.Loader.init(allocator, io, std.Io.Dir.cwd());
-    defer loader.deinit();
-
-    const entry = try loader.loadEntry(source, "<bench>", ".");
-    const modules = try butter.module.toCompilerUnits(loader.allocator(), loader.order.items, entry);
-
-    var compiler = butter.compiler.Compiler.init(allocator);
-    defer compiler.deinit();
-    var compiled = try compiler.compileModules(modules.entry_index, modules.units);
-    defer compiled.deinit(allocator);
-
-    const t1 = std.Io.Clock.now(.awake, io);
-
-    // A Discarding writer so a benchmark that prints a lot (or a little)
-    // isn't measuring output-buffering cost instead of VM execution cost.
-    var discard_buffer: [256]u8 = undefined;
-    var discarding: std.Io.Writer.Discarding = .init(&discard_buffer);
-
-    var vm = butter.vm.Vm.init(allocator);
-    try vm.run(&compiled, .{ .out = &discarding.writer });
-
-    const t2 = std.Io.Clock.now(.awake, io);
-
-    return .{
-        .compile_ns = t0.durationTo(t1).nanoseconds,
-        .run_ns = t1.durationTo(t2).nanoseconds,
-    };
-}
-
-fn msOf(ns: i96) f64 {
-    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
-}
+const bench = @import("perf_bench.zig");
 
 /// Runs tests/perf_cases/<name>.butter, prints its compile/run/total
 /// timings in milliseconds, and asserts the total stays under
@@ -76,13 +36,13 @@ fn expectCasePerformance(comptime name: []const u8, max_total_ms: f64) !void {
     const allocator = std.testing.allocator;
     const source = @embedFile("perf_cases/" ++ name ++ ".butter");
 
-    const timing = try benchmark(allocator, source);
-    const compile_ms = msOf(timing.compile_ns);
-    const run_ms = msOf(timing.run_ns);
+    const timing = try bench.benchmark(allocator, std.testing.io, source);
+    const compile_ms = bench.msOf(timing.compile_ns);
+    const run_ms = bench.msOf(timing.run_ns);
     const total_ms = compile_ms + run_ms;
 
     std.debug.print(
-        "{s:<16} compile={d:>9.3}ms  run={d:>9.3}ms  total={d:>9.3}ms\n",
+        "{s:<20} compile={d:>9.3}ms  run={d:>9.3}ms  total={d:>9.3}ms\n",
         .{ name, compile_ms, run_ms, total_ms },
     );
 
@@ -115,4 +75,16 @@ test "string_concat: 3,000 rounds of O(n) string concatenation" {
 
 test "function_calls: 2,000,000 calls to a trivial non-recursive function" {
     try expectCasePerformance("function_calls", 5000.0);
+}
+
+test "struct_methods: 300,000 heap struct allocations + method calls" {
+    try expectCasePerformance("struct_methods", 5000.0);
+}
+
+test "string_format: 30,000 rounds of multi-expression string interpolation" {
+    try expectCasePerformance("string_format", 5000.0);
+}
+
+test "higher_order_calls: 2,000,000 indirect calls through a func-typed parameter" {
+    try expectCasePerformance("higher_order_calls", 5000.0);
 }

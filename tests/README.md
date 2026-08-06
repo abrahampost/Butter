@@ -67,6 +67,9 @@ does a lot of, rather than checking printed output:
 | [map_ops.butter](perf_cases/map_ops.butter) | Map hashing — 8,000 inserts followed by 8,000 `has()` lookups. |
 | [string_concat.butter](perf_cases/string_concat.butter) | Heap string allocation — 3,000 rounds of `+` concatenation. |
 | [function_calls.butter](perf_cases/function_calls.butter) | Call/return overhead — 2,000,000 calls to a trivial non-recursive function. |
+| [struct_methods.butter](perf_cases/struct_methods.butter) | Heap struct allocation + method dispatch — 150,000 rounds of allocating a `Point` and calling a method on it. |
+| [string_format.butter](perf_cases/string_format.butter) | String interpolation — 30,000 rounds of a `"...${expr}..."` string with three embedded expressions. |
+| [higher_order_calls.butter](perf_cases/higher_order_calls.butter) | Indirect calls through a `func(...)`-typed parameter — 2,000,000 calls to a predicate passed into a higher-order function, as opposed to function_calls' direct calls. |
 
 Each test reports `compile` (lex + parse + import resolution + codegen)
 and `run` (executing the compiled bytecode) separately, since only the
@@ -102,26 +105,72 @@ treat this as a baseline snapshot to compare future runs against, not a
 guarantee):
 
 ```
-loop_sum         compile=    0.075ms  run=  235.739ms  total=  235.813ms
-fib_recursive    compile=    0.042ms  run=   26.638ms  total=   26.679ms
-bubble_sort      compile=    0.058ms  run=   28.298ms  total=   28.356ms
-list_push        compile=    0.041ms  run=   12.035ms  total=   12.076ms
-map_ops          compile=    0.041ms  run=  206.131ms  total=  206.172ms
-string_concat    compile=    0.033ms  run=   10.586ms  total=   10.620ms
-function_calls   compile=    0.036ms  run=  149.319ms  total=  149.354ms
+loop_sum             compile=    0.021ms  run=  270.027ms  total=  270.048ms
+fib_recursive        compile=    0.020ms  run=   31.446ms  total=   31.467ms
+bubble_sort          compile=    0.042ms  run=   31.489ms  total=   31.531ms
+list_push            compile=    0.011ms  run=   12.862ms  total=   12.874ms
+map_ops              compile=    0.011ms  run=    2.594ms  total=    2.605ms
+string_concat        compile=    0.004ms  run=    0.893ms  total=    0.897ms
+function_calls       compile=    0.024ms  run=  176.360ms  total=  176.384ms
+struct_methods       compile=    0.024ms  run=   34.059ms  total=   34.082ms
+string_format        compile=    0.015ms  run=   11.093ms  total=   11.108ms
+higher_order_calls   compile=    0.027ms  run=  263.606ms  total=  263.634ms
 ```
 
 `compile` is negligible everywhere, as expected — it's `run` that matters
-for VM optimization work. `map_ops` (~13µs/insert-or-lookup) and
-`function_calls` (~75ns/call) are the priciest per-operation costs here
-and the first places worth profiling.
+for VM optimization work. `higher_order_calls` costs about 1.5x
+`function_calls` per call (~132ns vs. ~88ns) despite doing the same 2M
+calls to an equally trivial function — the only difference is the call
+going through a `func(...)`-typed value instead of a name resolved at
+compile time, which is a reasonable place to look first if indirect-call
+overhead ever needs shrinking.
 
 To add a case: drop `<name>.butter` in `perf_cases/` (sized so it takes
 somewhere from a few to a few hundred milliseconds — long enough that
 timer resolution and OS scheduling noise don't dominate, short enough
-that the suite stays usable), and add one `test { ... }` block to
+that the suite stays usable), add one `test { ... }` block to
 performance_test.zig calling
-`expectCasePerformance("<name>", <threshold-in-ms>)`.
+`expectCasePerformance("<name>", <threshold-in-ms>)`, and add a matching
+`.{ .name = "<name>", .max_total_ms = <threshold-in-ms> }` entry to
+`cases` in [perf_bench.zig](perf_bench.zig) — the shared list
+[perf_report.zig](perf_report.zig) (below) uses to know which cases exist.
+
+## CI regression tracking
+
+The thresholds above only catch a catastrophic regression (see the
+`5000.0`s throughout performance_test.zig — loose on purpose). Catching a
+real but smaller regression — the VM got 30% slower on one workload, still
+comfortably under any fixed threshold — needs comparing against where the
+branch actually started, not a fixed number. That's what
+[perf_report.zig](perf_report.zig) and [perf_compare.zig](perf_compare.zig)
+are for, and what CI (`.github/workflows/ci.yml`, `performance-tests` job)
+runs on every push/PR:
+
+```bash
+zig build perf-report -Doptimize=ReleaseFast -- --output current.json
+zig build perf-compare -- --current current.json --baseline previous.json --margin 25
+```
+
+`perf-report` runs every case in perf_bench.zig's `cases` list 5 times,
+keeps the fastest run of each (least distorted by scheduler noise), and
+writes the timings as JSON. `perf-compare` reads two such reports and
+flags any case whose `total_ms` grew by more than `--margin` percent
+(default 25 — loose for the same shared-CI-runner-noise reason the
+absolute thresholds are loose), printing a table, a `::warning::`
+annotation per regressed case, and exiting non-zero if anything regressed.
+With `--summary <path>` it also appends a Markdown table there — CI passes
+`$GITHUB_STEP_SUMMARY` so the report shows up on the job's summary page,
+not just buried in the log.
+
+There's no benchmark-dedicated CI machine, so "baseline" here means "the
+last report generated by a push to main," cached between runs via
+`actions/cache`. A PR's run restores that cache entry read-only and
+compares against it; only a push to main overwrites it (even if that
+push's own numbers regressed — a regression that lands on main becomes the
+new normal to compare *future* PRs against, same as an absolute number
+would just be a new reading next time). The very first run ever, before
+any cache entry exists, has nothing to compare against and just reports
+the current numbers.
 
 # Fuzz testing
 

@@ -34,3 +34,59 @@ jobs:
         with:
           version: "0.16.0"
       - run: zig build test-integration
+
+  performance-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - run: zig build test-performance
+
+      # Baseline evolves over time on ubuntu-latest shared runners (still
+      # noisy machine-to-machine and run-to-run, but far less noisy than
+      # comparing against a baseline committed from someone's laptop) — see
+      # tests/perf_compare.zig for why the regression margin below is loose
+      # rather than tight. Only main pushes ever write a new one, so a PR
+      # always compares against the latest baseline main actually produced.
+      - name: Restore previous perf baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: perf-baseline.json
+          # `key` never exact-matches (it's this run's own sha, always
+          # unique) — the point is `restore-keys`, which falls back to
+          # whichever perf-baseline-* entry was saved most recently.
+          key: perf-baseline-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            perf-baseline-${{ runner.os }}-
+
+      - name: Run performance benchmarks (ReleaseFast)
+        run: zig build perf-report -Doptimize=ReleaseFast -- --output perf-current.json
+
+      - name: Compare against baseline
+        run: |
+          set -euo pipefail
+          if [ -f perf-baseline.json ]; then
+            zig build perf-compare -- --current perf-current.json --baseline perf-baseline.json --margin 25 --summary "$GITHUB_STEP_SUMMARY"
+          else
+            zig build perf-compare -- --current perf-current.json --summary "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Runs even if the compare step above failed a regression check (a
+      # regression that lands on main becomes the new normal to compare
+      # future PRs against, the same way a regressed absolute number would
+      # just be the new reading on the next `zig build test-performance`
+      # run) — but not if the benchmarks themselves never produced a report.
+      - name: Save perf baseline
+        if: always() && github.ref == 'refs/heads/main' && hashFiles('perf-current.json') != ''
+        run: cp perf-current.json perf-baseline.json
+
+      - uses: actions/cache/save@v4
+        if: always() && github.ref == 'refs/heads/main' && hashFiles('perf-current.json') != ''
+        with:
+          path: perf-baseline.json
+          key: perf-baseline-${{ runner.os }}-${{ github.sha }}

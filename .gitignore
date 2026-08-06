@@ -2,3 +2,4 @@
 zig-out/
 examples/greeting.txt
 examples/dump.json
+perf-*.json

@@ -23,15 +23,19 @@ The `butter` executable is written to `zig-out/bin/`.
 zig build test              # unit + integration tests + fuzz smoke test
 zig build test-integration  # just the .butter program integration tests
 zig build test-performance  # timed performance benchmarks
+zig build perf-report       # JSON performance report (-- --output <path>)
+zig build perf-compare      # flag regressions between two perf-report runs
 zig build fmt-check         # check formatting (zig fmt --check)
 ```
 
 See [tests/README.md](tests/README.md) for details on how each test suite
-works and how to add cases.
+works, how to add cases, and how `perf-report`/`perf-compare` feed CI's
+run-over-run performance regression check.
 
-CI (`.github/workflows/ci.yml`) runs `zig build fmt-check` and
-`zig build test` on every push/PR to `master` — run both locally before
-opening a PR.
+CI (`.github/workflows/ci.yml`) runs `zig build fmt-check`, `zig build
+test`, and a `performance-tests` job (`zig build test-performance` plus
+the `perf-report`/`perf-compare` regression check above) on every push/PR
+to `master` — run the first two locally before opening a PR.
 
 ## Project layout
 

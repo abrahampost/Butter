@@ -69,6 +69,39 @@ pub fn build(b: *std.Build) void {
     const performance_test_step = b.step("test-performance", "Run the timed .butter program performance benchmarks (add -Doptimize=ReleaseFast for representative numbers)");
     performance_test_step.dependOn(&run_performance_tests.step);
 
+    const perf_report_exe = b.addExecutable(.{
+        .name = "perf_report",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/perf_report.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "butter", .module = mod },
+            },
+        }),
+    });
+    const run_perf_report = b.addRunArtifact(perf_report_exe);
+    run_perf_report.has_side_effects = true; // always rerun; timings shouldn't be cached
+    if (b.args) |args| run_perf_report.addArgs(args);
+
+    const perf_report_step = b.step("perf-report", "Run every performance benchmark and print a JSON report (add -Doptimize=ReleaseFast for representative numbers; pass -- --output <path>)");
+    perf_report_step.dependOn(&run_perf_report.step);
+
+    const perf_compare_exe = b.addExecutable(.{
+        .name = "perf_compare",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/perf_compare.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_perf_compare = b.addRunArtifact(perf_compare_exe);
+    run_perf_compare.has_side_effects = true;
+    if (b.args) |args| run_perf_compare.addArgs(args);
+
+    const perf_compare_step = b.step("perf-compare", "Compare a perf-report JSON file against a previous one and flag regressions (pass -- --current <path> --baseline <path>)");
+    perf_compare_step.dependOn(&run_perf_compare.step);
+
     const fuzz_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/fuzz_test.zig"),
