@@ -150,21 +150,19 @@ pub const Parser = struct {
 
     /// Splits a string-literal atom's raw (quote-stripped) contents into
     /// literal text and `${<expression>}` interpolation parts (GRAMMAR.bnf
-    /// design note 3ae). Fast path: no `$` anywhere at all (the overwhelming
-    /// majority of string literals) is exactly `unescapeString` — same
-    /// borrowed-unchanged-when-possible behavior as before this feature
-    /// existed.
+    /// design note 3ae).
     ///
-    /// The slow path decodes `\n`/`\t`/`\\`/`\"`/`\$` in literal runs exactly
-    /// like `unescapeString`, and for each unescaped `${`, isolates its inner
-    /// text (`findInterpEnd`, mirroring the depth-tracking `lexer.zig`
-    /// already did while first scanning this same token) and recursively
-    /// re-lexes/parses it as an independent `<expression>` (`parseInterpExpr`)
-    /// — a full recursive parse, not a token splice, so any expression form
-    /// works inside `${...}` exactly as it would anywhere else. If every `$`
-    /// turns out to be escaped (`\$`) or a lone `$` never followed by `{`,
-    /// this still collapses back to a plain `.literal.string` — only a
-    /// genuine `${` produces `.string_interp`.
+    /// Fast path: no `$` anywhere (most string literals) — falls straight
+    /// through to `unescapeString`.
+    ///
+    /// Slow path: decodes `\n`/`\t`/`\\`/`\"`/`\$` in literal runs like
+    /// `unescapeString`, and for each unescaped `${`, isolates its inner
+    /// text (`findInterpEnd`) and recursively re-lexes/parses it as an
+    /// independent `<expression>` (`parseInterpExpr`) — a full recursive
+    /// parse, not a token splice, so any expression form works inside
+    /// `${...}`. If every `$` turns out escaped or never followed by `{`,
+    /// this still collapses to a plain `.literal.string` — only a genuine
+    /// `${` produces `.string_interp`.
     fn parseStringOrInterp(self: *Parser, raw: []const u8, tok: Token) Error!*ast.Expr {
         if (std.mem.indexOfScalar(u8, raw, '$') == null) {
             return self.createExpr(.{ .literal = .{ .string = try self.unescapeString(raw) } });
@@ -1225,24 +1223,22 @@ pub const Parser = struct {
         return self.createExpr(.{ .method_call = .{ .base = base, .method = field_tok.lexeme, .args = try args.toOwnedSlice(self.allocator()) } });
     }
 
-    /// Whether the `{` right after an just-consumed IDENTIFIER actually
-    /// starts a struct literal (GRAMMAR.bnf design note 3z), rather than
-    /// being a wholly unrelated STATEMENT block that simply happens to
-    /// immediately follow it — the real case this disambiguates is `for i
-    /// in 0..n { ... }` / `if cond { ... }` / `while cond { ... }`, where
-    /// the bound/condition is a bare identifier immediately followed by the
-    /// construct's own braceless-condition body block (none of `if`/
-    /// `while`/`for` require a separator token before their body, so an
-    /// expression ending in a bare identifier is followed directly by `{`
-    /// there too). A struct literal's `{` is always immediately followed
-    /// (past any newlines — a literal may open on its own line) by
-    /// `IDENTIFIER ':'`, its first field — a shape no Butter STATEMENT
-    /// begins with (assignment is `:=`, one token, never a bare `:`), so
-    /// this lookahead never misfires against a real block's first
-    /// statement. A struct with no fields at all can't be constructed via
-    /// `Type{}` as a result — accepting a bare `{}` here would make it
-    /// indistinguishable from `if cond {}`'s empty body, and a zero-field
-    /// struct is not a case worth that ambiguity.
+    /// Whether the `{` right after a just-consumed IDENTIFIER starts a
+    /// struct literal (GRAMMAR.bnf design note 3z) rather than an unrelated
+    /// STATEMENT block that happens to follow it — the real case being
+    /// disambiguated is `for i in 0..n { ... }` / `if cond { ... }` /
+    /// `while cond { ... }`, none of which need a separator before their
+    /// body, so a bare identifier there is also followed directly by `{`.
+    ///
+    /// The disambiguator: a struct literal's `{` is always immediately
+    /// followed (past newlines) by `IDENTIFIER ':'`, its first field — a
+    /// shape no Butter statement begins with (assignment is `:=`, never a
+    /// bare `:`), so this lookahead can't misfire on a real block's first
+    /// statement.
+    ///
+    /// Consequence: `Type{}` (zero fields) isn't accepted here — it would
+    /// be indistinguishable from `if cond {}`'s empty body, and isn't worth
+    /// the ambiguity.
     fn looksLikeStructLiteral(self: *const Parser) bool {
         if (!self.check(.lbrace)) return false;
         var i: usize = 1;

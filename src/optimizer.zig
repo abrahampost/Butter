@@ -1,32 +1,26 @@
 //! AST-level optimization passes: constant folding and dead-code
-//! elimination, both implemented as a single recursive walk over a parsed
+//! elimination, both as a single recursive walk over a parsed
 //! `ast.Program` that mutates it in place (see `optimizeProgram`).
 //!
-//! This runs BEFORE compiler.zig ever sees the program — there is no
-//! separate typed-IR stage to optimize instead of the raw AST; compiler.zig
-//! fuses type-checking and codegen into one pass over the AST it's handed
-//! (see its own doc comments). One consequence: a statement pruned here as
-//! provably unreachable, or a branch dropped because its condition folded
-//! to a constant, is never type-checked either — whatever compile error it
-//! might have raised goes unreported, the same trade-off any compiler that
-//! eliminates dead code ahead of full semantic analysis makes. Declarations
-//! (`function_decl`/`method_decl`/`import_stmt`/`struct_decl`/`enum_decl`)
-//! are never pruned this way regardless of reachability — they're
-//! registrations, not statements that "run" in sequence, and an exported
-//! function declared after a top-level `exit 0` must still compile and stay
-//! callable from an importer even though the entry module's own flow never
-//! reaches it.
+//! Runs BEFORE compiler.zig sees the program — there's no separate typed-IR
+//! stage; compiler.zig fuses type-checking and codegen into one pass over
+//! the AST it's handed. So a statement pruned here as unreachable, or a
+//! branch dropped by constant folding, is never type-checked either —
+//! whatever compile error it might have raised goes unreported. Exception:
+//! declarations (`function_decl`/`method_decl`/`import_stmt`/`struct_decl`/
+//! `enum_decl`) are never pruned regardless of reachability — they're
+//! registrations, not statements that "run", and an exported function after
+//! a top-level `exit 0` must still compile and stay callable by importers.
 //!
 //! Constant folding never folds an operation that would raise a
-//! `RuntimeError` (overflow, division/modulo by zero) — it simply leaves
-//! that subexpression alone, so the VM still raises the identical error at
-//! the identical point in the program's execution as it would have
-//! unoptimized. Every fold mirrors the exact runtime rule it's replacing
-//! (int/float promotion, string concatenation via `+`, byte-lexicographic
+//! `RuntimeError` (overflow, division/modulo by zero) — it leaves that
+//! subexpression alone so the VM still raises the identical error at the
+//! identical point, unoptimized or not. Every fold mirrors its runtime rule
+//! exactly (int/float promotion, `+` string concat, byte-lexicographic
 //! string ordering, `and`/`or` short-circuiting) — see `vm.zig`'s
 //! `add`/`sub`/`mul`/`div`/`mod`/`pow`/`compare` and `value.zig`'s
-//! `Value.eql`, which this file's `foldArith`/`numericCompare`/
-//! `stringCompare`/`literalEql` each deliberately shadow.
+//! `Value.eql`, mirrored here by `foldArith`/`numericCompare`/
+//! `stringCompare`/`literalEql`.
 
 const std = @import("std");
 const ast = @import("ast.zig");

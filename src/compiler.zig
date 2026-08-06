@@ -295,27 +295,23 @@ fn collectionKind(value_type: ast.ValueType) ?CollectionKind {
 }
 
 /// A function's compile-time signature, registered up front (before any
-/// function body is compiled — see `compileModules`) so that calls resolve
-/// regardless of declaration order. `index` is the position its compiled
-/// `chunk_mod.Function` will occupy in the final `Program.functions`
-/// slice, which is also the operand CALL instructions use to name it.
+/// function body is compiled — see `compileModules`) so calls resolve
+/// regardless of declaration order. `index` is this function's position in
+/// the final `Program.functions` slice, which is also the operand CALL
+/// instructions use to name it.
 ///
 /// `params` is borrowed directly from the declaring `ast.Stmt.FunctionDecl`
-/// (valid for as long as the parsed program it came from outlives
-/// compilation, which it always does) so that a call site can see each
-/// parameter's `array_size` — needed to compile an array argument
-/// differently from a scalar one (see `compileCall`). `arity` is the total
-/// stack-slot width all parameters occupy together (a fixed-size array
-/// parameter costs its declared size in slots, a generic array parameter
-/// costs exactly 1 — it's a single reference value — same as a scalar),
-/// which is what the VM's CALL actually needs; it is deliberately NOT
-/// `params.len` once any parameter is array-typed.
+/// so a call site can see each parameter's `array_size`, needed to compile
+/// an array argument differently from a scalar one (`compileCall`). `arity`
+/// is the total stack-slot width of all parameters together — a fixed-size
+/// array costs its declared size in slots, a generic array costs 1 (a
+/// single reference), same as a scalar — which is what CALL actually
+/// needs; it's deliberately NOT `params.len` once any parameter is array-typed.
 ///
 /// `module`/`exported` exist purely for cross-file visibility (see
-/// `functionVisible`, GRAMMAR.bnf design note h) — the VM itself never
-/// sees either; CALL's operand is still just a flat index into one
-/// program-wide function table, same as before files could import each
-/// other (ISA.bnf section 6/8).
+/// `functionVisible`, GRAMMAR.bnf design note h) — the VM never sees
+/// either; CALL's operand is still just a flat index into one program-wide
+/// function table.
 const FunctionInfo = struct {
     name: []const u8,
     params: []const ast.Param,
@@ -494,23 +490,18 @@ pub const Compiler = struct {
 
     /// Three passes over `modules`, in order:
     ///
-    ///   1. Register every function's name/arity/owning-module up front
-    ///      (across ALL modules, not just the entry one), so that calls —
-    ///      including a function calling itself, two functions calling
-    ///      each other, or a call across files — resolve no matter which
-    ///      order the functions, their callers, or the modules themselves
-    ///      are compiled in.
+    ///   1. Register every function's name/arity/owning-module up front,
+    ///      across ALL modules — so recursion, mutual calls, and cross-file
+    ///      calls all resolve regardless of compile order.
     ///   2. Compile the entry module's top-level statements (everything
-    ///      except function/import declarations) into the main chunk,
-    ///      exactly as before functions or imports existed.
+    ///      except function/import declarations) into the main chunk.
     ///   3. Compile every module's functions into their own chunks.
     ///
     /// `modules` must list each module exactly once — deduplicating a
-    /// diamond-shaped import graph (the same file reached via more than
-    /// one import path) down to one entry is the module loader's job
-    /// (module.zig), not this function's; that's what makes a shared
-    /// dependency's functions get compiled exactly once here rather than
-    /// once per importer.
+    /// diamond-shaped import graph (the same file reached via more than one
+    /// path) is the module loader's job (module.zig), not this function's.
+    /// That's what makes a shared dependency compile once, not once per
+    /// importer.
     pub fn compileModules(self: *Compiler, entry: usize, modules: []const ModuleUnit) CompileError!chunk_mod.Program {
         // Pass 0: register the built-in `Error` struct type (design note 3u)
         // — the type `try`/`catch`'s binding is typed as — before any user
@@ -1613,21 +1604,20 @@ pub const Compiler = struct {
     /// ```
     ///
     /// The binding needs neither a STORE_LOCAL nor an opcode of its own.
-    /// At the `try` statement `next_slot` is some N; the body's own locals
+    /// At the `try` statement, `next_slot` is some N. The body's locals
     /// occupy N upward and `compileBlock` pops them at its end, so the
     /// handler is compiled with `next_slot` back at N and declares the
-    /// binding as an ordinary local at slot N. At run time, a statement
-    /// boundary always has `sp == bp + next_slot` (locals below, no live
-    /// temporaries), so the `sp` PUSH_HANDLER recorded is exactly `bp + N` —
-    /// and unwinding restores that `sp` and then pushes the error map,
-    /// landing it precisely in slot N. `popLocalsAbove` then discards it at
-    /// the end of the handler's scope with no special case.
+    /// binding as an ordinary local at slot N. A statement boundary always
+    /// has `sp == bp + next_slot` at run time, so PUSH_HANDLER records
+    /// `sp == bp + N`; unwinding restores that `sp` and pushes the error
+    /// map, landing it exactly in slot N. `popLocalsAbove` discards it at
+    /// the end of the handler's scope like any other local.
     ///
-    /// Nothing here emits a POP_HANDLER before a `return` inside the body:
-    /// RET drops the departing frame's handlers itself (ISA.bnf section 14),
-    /// which covers every way out of a frame by construction. Butter has no
-    /// `break`/`continue`, so `return`, `exit`, and falling off the end are
-    /// the only other exits, and the latter two need nothing.
+    /// No POP_HANDLER is emitted before a `return` inside the body: RET
+    /// drops the departing frame's handlers itself (ISA.bnf section 14).
+    /// Butter has no `break`/`continue`, so `return`, `exit`, and falling
+    /// off the end are the only other exits, and the latter two need
+    /// nothing extra.
     fn compileTry(self: *Compiler, t: ast.StmtKind.Try) CompileError!void {
         const catch_jump = try self.chunk.emitWithOperand(self.allocator, .push_handler, 0);
 
@@ -1876,13 +1866,10 @@ pub const Compiler = struct {
 
     /// Desugars `"literal ${expr} literal"` (GRAMMAR.bnf design note 3ae)
     /// into PUSH_CONST/TO_STRING per part followed by one INTERP_CONCAT
-    /// (ISA.bnf section 23) — no new heap value kind (still just ordinary
-    /// heap strings, same as `join`), but ONE allocation for the whole
-    /// result rather than a chain of ADDs that would re-copy the growing
-    /// prefix at every step (the same O(n^2) shape `join`'s own design note,
-    /// GRAMMAR.bnf design note 3ac, calls out for a RUNTIME loop of
-    /// concatenation — avoidable here too, since the piece count is fixed at
-    /// COMPILE time, exactly like MAKE_LIST/MAKE_MAP's own count operand).
+    /// (ISA.bnf section 23) — one allocation for the whole result instead of
+    /// a chain of ADDs re-copying the growing prefix each step (the same
+    /// O(n^2) shape `join`'s design note avoids; see `ast.zig`'s
+    /// `string_interp`), since the piece count is fixed at compile time.
     ///
     /// An empty literal part (the common case of an interpolation glued
     /// directly to the opening/closing quote, or to another `${...}`) is
@@ -2107,10 +2094,6 @@ pub const Compiler = struct {
     /// Passing a call's FIXED-size result directly isn't supported (its
     /// values land in a transient stack position with no local slot to
     /// anchor a reference to) — assign it to a local array first.
-    /// Leaves exactly one ARRAY_REF value on the stack for the array local
-    /// named `name`, whichever kind it is: a FIXED local needs a fresh
-    /// reference synthesized to its slots (MAKE_ARRAY_REF), while a GENERIC
-    /// local already holds one, so LOAD_LOCAL forwarding it along is enough.
     /// Shared by every context that wants an array by reference rather than
     /// by value — a generic call argument, and `read`/`write`'s buffer
     /// (ISA.bnf section 9) — which is exactly why neither the I/O opcodes

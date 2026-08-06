@@ -467,13 +467,12 @@ pub const Vm = struct {
     /// the right tool when the success path transfers ownership onward,
     /// plain `defer` when the value is consumed either way.
     ///
-    /// This used to be moot — a `RuntimeError` ended the process, so a
-    /// stranded reference died with it — but `try`/`catch` (TODO #9) will
-    /// resume execution from exactly these paths. See the
-    /// "Discarded-operand reference accounting" tests at the end of this
-    /// file. The one deliberate exception is the errors that stay
-    /// non-catchable: an allocation failure or a stack overflow still ends
-    /// the run, so the few paths that strand a reference on the way out of
+    /// This used to be moot — a `RuntimeError` ended the process, so a leak
+    /// here died with it — but `try`/`catch` (TODO #9) will resume execution
+    /// from exactly these paths. See the "Discarded-operand reference
+    /// accounting" tests at the end of this file. The one deliberate
+    /// exception: allocation failure and stack overflow stay non-catchable
+    /// and still end the run, so the few paths that leak on the way out of
     /// those are left as they are.
     fn pop(self: *Vm) RuntimeError!Value {
         if (self.sp == 0) return RuntimeError.StackUnderflow;
@@ -996,22 +995,18 @@ pub const Vm = struct {
     }
 
     /// `exec(command, args)` (ISA.bnf section 17) — spawns `command` with
-    /// `args` (each already checked string-shaped by the EXEC handler below)
-    /// as its own argv[1..], waits for it to exit, and returns a fresh `map`
-    /// with three keys, always all present: "stdout"/"stderr" (its captured
-    /// output, adopted directly rather than copied — see `mapSetOwnedString`)
-    /// and "exit_code" (an `int` in 0..255).
+    /// `args` as its own argv[1..], waits for it to exit, and returns a
+    /// fresh `map` with three keys, always present: "stdout"/"stderr"
+    /// (captured output, adopted not copied — see `mapSetOwnedString`) and
+    /// "exit_code" (an `int` in 0..255).
     ///
-    /// The spawned process's CURRENT DIRECTORY is `process.dir` — mirroring
-    /// `openFile`'s own `fs.dir`, so an embedder (or a test) that wants
-    /// `exec` and `open`/`exists`/... to agree on "here" passes the same
-    /// `dir` to both `Host.fs` and `Host.process`. Its ENVIRONMENT, by
-    /// contrast, is NOT `Host.env` — that only governs what `getenv`/`hasenv`
-    /// see FROM INSIDE this Butter program; the child inherits this actual
-    /// OS process's own real environment (`environ_map = null`), the same
-    /// way any ordinary shelled-out command would. Its standard input is
-    /// always empty (`std.process.run`'s own `.stdin = .ignore`) — there is
-    /// no way, in this pass, to pipe bytes into a spawned child.
+    /// CURRENT DIRECTORY is `process.dir`, mirroring `openFile`'s `fs.dir`
+    /// — pass the same `dir` to both `Host.fs` and `Host.process` if `exec`
+    /// and `open`/`exists`/... should agree on "here". ENVIRONMENT is NOT
+    /// `Host.env` (that only governs `getenv`/`hasenv` inside this Butter
+    /// program) — the child inherits the real OS process's own environment
+    /// (`environ_map = null`). Standard input is always empty
+    /// (`.stdin = .ignore`) — no way to pipe bytes into a spawned child yet.
     fn execProcess(self: *Vm, host: Host, command: []const u8, args: []const Value) (RuntimeError || std.mem.Allocator.Error)!Value {
         const process = host.process orelse return self.failFile(RuntimeError.ProcessesUnavailable, "exec", command, "this program was run without permission to spawn processes");
 
@@ -1434,55 +1429,38 @@ pub const Vm = struct {
     /// Fetches and executes exactly one instruction, reporting whether the
     /// program is still running afterwards.
     ///
-    /// This is a separate function from `run` rather than that loop's body
-    /// purely so that a failing instruction becomes an error `run` can
-    /// CATCH instead of one that unwinds straight out of the interpreter.
-    /// Nothing uses that yet — `run` still propagates every error exactly as
-    /// it did when this was one function — but it is the seam `try`/`catch`
-    /// needs (TODO #9): a handler can only resume a program if something is
-    /// still on the Zig stack to resume it, and until this split there was
-    /// no such point.
+    /// Split out from `run`'s loop body so a failing instruction is an error
+    /// `run` can eventually CATCH rather than one that unwinds straight out
+    /// of the interpreter — the seam `try`/`catch` needs (TODO #9). Nothing
+    /// uses that yet; `run` still propagates every error as before.
     ///
     /// `ex` is by pointer because most of what an instruction does is
-    /// mutate it — advancing `ip`, pushing and popping frames, switching
-    /// chunks on a call.
+    /// mutate it — advancing `ip`, pushing/popping frames, switching chunks
+    /// on a call.
     ///
-    /// `inline` IS LOAD-BEARING, not a hint. A real call per instruction
-    /// costs 33-42% on the dispatch-bound benchmarks — measured back to
-    /// back with only this keyword changed (`zig build test-performance
-    /// -Doptimize=ReleaseFast`: loop_sum 244ms -> 338ms, function_calls
-    /// 157ms -> 223ms, bubble_sort 28.8ms -> 38.4ms; the allocation-bound
-    /// map_ops is unaffected) — because `ip`/`bp`/`chunk` stop being
-    /// registers the optimizer can keep across iterations and become memory
-    /// round-trips through `ex` instead. Inlined into `run`'s loop, `exec`
-    /// doesn't escape and those fields go back into registers — measured
-    /// back to baseline. There's exactly one call site, so this costs no
-    /// code size. Inlining does NOT weaken the seam described above: `try`
-    /// inside an inline function still yields its error to the CALL SITE,
-    /// which is the loop in `run`, which is precisely where a handler needs
-    /// to catch it.
+    /// `inline` IS LOAD-BEARING, not a hint: a real call per instruction
+    /// costs 33-42% on dispatch-bound benchmarks (loop_sum 244ms -> 338ms,
+    /// function_calls 157ms -> 223ms, bubble_sort 28.8ms -> 38.4ms; measured
+    /// via `zig build test-performance -Doptimize=ReleaseFast`, one keyword
+    /// changed) because `ip`/`bp`/`chunk` fall out of registers into memory
+    /// round-trips through `ex` once `step` is a real call. Inlining costs
+    /// no code size (one call site) and doesn't weaken the seam above: `try`
+    /// inside an inline function still unwinds to the call site in `run`.
     inline fn step(self: *Vm, ex: *Exec, host: Host) !Flow {
         var instr = ex.chunk.code.items[ex.ip];
         ex.ip += 1;
-        // `sw:` + `continue :sw` below (Zig's labeled-switch-continue) is a
-        // direct-threaded-dispatch experiment: opcodes on the hot path
-        // (arithmetic, locals, jumps, calls, containers) fetch the next
-        // instruction and jump straight to its case instead of returning to
-        // `run`'s `while(true)` and re-entering this switch from its single
-        // shared dispatch site. That gives each hot opcode's "what comes
-        // next" branch its own indirect-jump instruction (and so its own
-        // branch-predictor history) instead of funneling every opcode
-        // through one shared jump-table branch. Cold/rare opcodes (I/O,
-        // paths, JSON, env, handlers, exit/throw/halt) are deliberately left
-        // as plain cases that fall through to `return .running` below,
-        // unwinding back to `run`'s loop exactly as before — correctness
-        // (error propagation via `try`, `run`'s catchable/unwindToHandler
-        // logic, `exec.ip - 1` naming the failing instruction) is unaffected
-        // either way, since `continue :sw` is just a jump, not a call: a
-        // `try` failing inside any case still unwinds out of `step` itself,
-        // and `ex.ip` is always left one past whatever instruction is about
-        // to run, exactly like the original single-dispatch top of this
-        // function.
+        // `sw:` + `continue :sw` (Zig's labeled-switch-continue) is a
+        // direct-threaded-dispatch experiment: hot opcodes (arithmetic,
+        // locals, jumps, calls, containers) fetch the next instruction and
+        // jump straight to its case instead of returning to `run`'s
+        // `while(true)` and re-entering this switch from one shared
+        // dispatch site — each hot opcode gets its own indirect-jump branch
+        // (and branch-predictor history) instead of sharing one jump table.
+        // Cold/rare opcodes (I/O, paths, JSON, env, handlers, exit/throw/
+        // halt) stay as plain cases that fall through to `return .running`
+        // below, unwinding to `run`'s loop as before. `continue :sw` is a
+        // jump, not a call, so correctness is unaffected either way: a
+        // `try` failing inside any case still unwinds out of `step` itself.
         sw: switch (instr.op) {
             .push_const => {
                 const v = ex.chunk.constants.items[instr.operand];

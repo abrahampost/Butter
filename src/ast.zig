@@ -7,20 +7,17 @@
 
 const std = @import("std");
 
-/// Re-exported so the AST and the ISA name the same three streams by the
-/// same type (see `value.Stream` for why it's declared over there). Only
-/// `Standard` appears in the AST — the three keyword-named streams, which
-/// are the only streams source code can spell out. A `file` stream has no
-/// syntax at all; it only ever comes from evaluating an `open` at runtime,
-/// which is exactly why the stream that `read`/`write` act on is a general
-/// `*Expr` here rather than a fixed tag (design note 3l).
+/// Re-exported so the AST and ISA share one type for the three streams
+/// (see `value.Stream`). Only `Standard` appears in source — a `file`
+/// stream only ever comes from an `open` at runtime, which is why
+/// `read`/`write`'s stream operand is a general `*Expr` here, not a fixed
+/// tag (design note 3l).
 pub const Stream = @import("value.zig").Stream;
 
-/// `'read' | 'write' | 'append'` in the mode position of an `open`
-/// (re-exported from `value` alongside `Stream`, same reasoning). Kept
-/// distinct from the `read`/`write` *operations* that share those keywords:
-/// the parser only ever looks for a mode where a mode is legal, so there is
-/// no ambiguity to resolve.
+/// `'read' | 'write' | 'append'` in `open`'s mode position (re-exported
+/// from `value` alongside `Stream`). Distinct from the `read`/`write`
+/// operations sharing those keywords — the parser only looks for a mode
+/// where one is legal, so there's no ambiguity.
 pub const OpenMode = @import("value.zig").OpenMode;
 
 pub const ValueType = enum {
@@ -28,48 +25,37 @@ pub const ValueType = enum {
     float,
     bool,
     string,
-    /// A refcounted heap map (GRAMMAR.bnf design note 3m) — unlike the
-    /// other four, this is always exactly one runtime value (a heap
-    /// reference), never a run of raw stack slots, so it never takes the
-    /// `[N]`/`[]` array suffix `Param`/`VarDecl`/`FunctionDecl` otherwise
-    /// allow.
+    /// A refcounted heap map (design note 3m) — always one runtime value
+    /// (a heap reference), never raw stack slots, so it never takes the
+    /// `[N]`/`[]` array suffix `Param`/`VarDecl`/`FunctionDecl` allow.
     map,
-    /// A refcounted heap list (GRAMMAR.bnf design note 3m) — same story as
-    /// `map`, but ordered/indexed by INT instead of by STRING key.
+    /// A refcounted heap list (design note 3m) — same as `map`, but
+    /// ordered/indexed by INT instead of by STRING key.
     list,
-    /// A user-declared `struct` or `enum` type (GRAMMAR.bnf design notes 3z
-    /// and 3aa) — the actual name is never carried here, but in a sibling
-    /// `named_type: ?[]const u8` field alongside whichever `ValueType` this
-    /// is (`Param.named_type`, `Stmt.VarDecl.named_type`,
-    /// `Stmt.FunctionDecl.return_named_type`, `Stmt.FieldDecl.named_type`).
-    /// Keeping `ValueType` itself a plain, payload-less enum — rather than
-    /// turning it into a `union(enum)` — means every existing
-    /// `== .int`/`== .map`-style comparison across parser.zig/compiler.zig
-    /// keeps working unchanged; only call sites that actually need the name
-    /// (compiler.zig's type resolution, this file's debug printer) look at
-    /// the sibling field. The parser never resolves this name against
-    /// anything — that happens once, in compiler.zig, against the set of
-    /// struct/enum types registered across the whole compiled program.
+    /// A user-declared `struct` or `enum` type (design notes 3z/3aa). The
+    /// name itself lives in a sibling `named_type: ?[]const u8` field
+    /// (`Param.named_type`, `Stmt.VarDecl.named_type`, etc.), not here —
+    /// keeping `ValueType` a plain payload-less enum so `== .int`/`== .map`
+    /// comparisons keep working unchanged; only sites that need the name
+    /// (compiler.zig's type resolution, the debug printer) look at the
+    /// sibling field. The parser never resolves the name; compiler.zig
+    /// does, once, against the program's registered struct/enum types.
     named,
-    /// A reference to a top-level, named function (GRAMMAR.bnf design note
-    /// 3ad) — `func(paramTypes) returnType` in source. Unlike `named`, the
-    /// signature travels as a sibling `?*const FuncSig` (`Param.func_sig`/
-    /// `Stmt.VarDecl.func_sig`) rather than a bare name: a function type has
-    /// no declared name of its own to look up, only a structural shape.
-    /// Never legal as a struct field's or a function's own return type in
-    /// this pass (rejected by the parser) — only as a parameter or local
-    /// variable's type.
+    /// A reference to a top-level named function (design note 3ad) —
+    /// `func(paramTypes) returnType` in source. Unlike `named`, the
+    /// signature travels as a sibling `?*const FuncSig`
+    /// (`Param.func_sig`/`Stmt.VarDecl.func_sig`), since a function type
+    /// has no name to look up, only a shape. Only legal as a parameter or
+    /// local variable's type — never a struct field's or a function's own
+    /// return type (rejected by the parser).
     func,
 };
 
 /// The structural signature a `func(paramTypes) returnType` type names
-/// (GRAMMAR.bnf design note 3ad). Deliberately restricted to plain scalars
-/// (`int`/`float`/`bool`/`string`/`map`/`list`) in both `param_types` and
-/// `return_type` — never `.named` (struct/enum) and never nested `.func` —
-/// so that two signatures (or a signature and a concrete function's own
-/// params/return) can be compared purely structurally, with no name
-/// resolution, the same way `BinaryOp`/`ValueType` themselves already
-/// compare with plain `==`.
+/// (design note 3ad). Restricted to plain scalars in `param_types`/
+/// `return_type` — never `.named` or nested `.func` — so two signatures
+/// can be compared structurally with plain `==`, no name resolution
+/// needed.
 pub const FuncSig = struct {
     param_types: []const ValueType,
     return_type: ValueType,
@@ -108,15 +94,13 @@ pub const Literal = union(enum) {
     null_value,
 };
 
-/// A parameter's or a function's return type's optional array-ness: either
-/// a fixed compile-time size (passed/returned by VALUE, a copy — see
-/// GRAMMAR.bnf design note 3e) or `generic` (no declared size — passed by
-/// REFERENCE instead, a single runtime `Value.array_ref` pointing at
-/// whatever array the caller actually supplies, of whatever length it
-/// happens to have — see design note 3e's generic-array addendum). Local
-/// var-declarations don't get this: `ast.Stmt.VarDecl.array_len` stays a
-/// plain `?u32`, since a local's own storage is always something concrete
-/// this compiler allocated slots for, never a reference to someone else's.
+/// A parameter's or return type's optional array-ness: `fixed`
+/// (compile-time size, passed/returned BY VALUE — design note 3e) or
+/// `generic` (no declared size, passed BY REFERENCE as a `Value.array_ref`
+/// to whatever array the caller supplies — design note 3e's generic-array
+/// addendum). Local var-declarations don't use this: `VarDecl.array_len`
+/// stays a plain `?u32`, since a local's storage is always concrete slots
+/// this compiler allocated, never someone else's reference.
 pub const ArraySpec = union(enum) {
     fixed: u32,
     generic,
@@ -133,12 +117,10 @@ pub const Param = struct {
     array_size: ?ArraySpec = null,
 };
 
-/// One `<type> IDENTIFIER` field of a `struct` declaration (GRAMMAR.bnf
-/// design note 3z) — deliberately shaped like `Param` (same grammar, same
-/// `<type> IDENTIFIER` order) but without an `array_size`: a field is always
-/// exactly one `Value` slot in the record's `fields` array, the same
-/// restriction `map`/`list` params already have, extended to every field
-/// type (never a run of raw slots to lay out).
+/// One `<type> IDENTIFIER` field of a `struct` declaration (design note
+/// 3z) — shaped like `Param` but without `array_size`: a field is always
+/// exactly one `Value` slot in the record, the same restriction `map`/
+/// `list` params have, extended to every field type.
 pub const FieldDecl = struct {
     type: ValueType,
     /// Set only when `type == .named` — see `ValueType.named`'s doc comment.
@@ -154,72 +136,56 @@ pub const Expr = union(enum) {
     grouping: *Expr,
     assign: Assign,
     call: Call,
-    /// `<base>.IDENTIFIER '(' args ')'` (GRAMMAR.bnf design note 3af) — a
-    /// struct method call, distinguished from `.field_access` purely by the
-    /// trailing '(' the parser sees right after the identifier (`primary`'s
-    /// postfix loop). `base`'s static type must be a struct, and `method`
-    /// one of the methods declared with that struct as their receiver;
-    /// compiler.zig resolves both, exactly the way `.field_access` resolves
-    /// `base`'s struct type and field.
+    /// `<base>.IDENTIFIER '(' args ')'` (design note 3af) — a struct
+    /// method call, distinguished from `.field_access` by the trailing '('
+    /// (parser.zig's `primary` postfix loop). `base` must statically be a
+    /// struct and `method` one of its declared methods; compiler.zig
+    /// resolves both.
     method_call: MethodCall,
     array_literal: []*Expr,
     index: Index,
     index_assign: IndexAssign,
-    /// `TypeName{field1: expr1, field2: expr2, ...}` (GRAMMAR.bnf design
-    /// note 3z) — constructs a heap record of the declared struct
-    /// `type_name`. Every field is required, keyed by name, any order in
-    /// source; `type_name`/each field's name are unresolved here (bare
-    /// source text) — compiler.zig resolves `type_name` against the
-    /// program's registered struct types, validates the field set exactly,
-    /// and reorders the field expressions into the struct's *declared*
-    /// order before emitting `MAKE_STRUCT` (ISA.bnf section 19), so bytecode
-    /// field order never depends on the order a literal happened to list
-    /// them in.
+    /// `TypeName{field1: expr1, ...}` (design note 3z) — constructs a heap
+    /// record of struct `type_name`. Every field is required, keyed by
+    /// name, any order in source; compiler.zig resolves `type_name`,
+    /// validates the field set, and reorders fields into the struct's
+    /// declared order before emitting `MAKE_STRUCT` (ISA.bnf section 19) —
+    /// bytecode field order never depends on literal order.
     struct_literal: StructLiteral,
-    /// `<base>.IDENTIFIER` (GRAMMAR.bnf design notes 3z/3aa) — a struct
-    /// field read OR an enum variant reference (`Color.Red`); which one is
-    /// never decided here. The parser only ever produces this one shape for
-    /// every `.`-postfix, exactly the way `Index` doesn't care whether its
-    /// `base` is a list or a map — compiler.zig disambiguates by resolving
-    /// `base`: if it's a bare `.variable` that names no local in scope but
-    /// does name a declared enum type, this is an enum-variant reference
-    /// (compiles to a `PUSH_CONST` of a `Value.enum_value`); otherwise
-    /// `base`'s static type must be a struct, and `field` must be one of
-    /// its declared fields (`FIELD_GET`, ISA.bnf section 19) —
-    /// `SemanticError.NotAStruct`/`UnknownField`/`UnknownEnumVariant`
-    /// otherwise. Chains the same way `Index` does (`p.a.b`, `xs[0].x`) for
-    /// free, since both live in the same postfix loop (parser.zig's
-    /// `primary`).
+    /// `<base>.IDENTIFIER` (design notes 3z/3aa) — a struct field read OR
+    /// an enum variant reference (`Color.Red`); undecided here.
+    /// compiler.zig disambiguates by resolving `base`: a bare `.variable`
+    /// naming no local but a declared enum type is an enum-variant
+    /// reference (`PUSH_CONST` of a `Value.enum_value`); otherwise `base`
+    /// must be a struct and `field` one of its declared fields
+    /// (`FIELD_GET`, ISA.bnf section 19), else `SemanticError.NotAStruct`/
+    /// `UnknownField`/`UnknownEnumVariant`. Chains for free (`p.a.b`,
+    /// `xs[0].x`) since it shares `Index`'s postfix loop.
     field_access: FieldAccess,
     /// `<base>.IDENTIFIER := <expression>` — the `.field_access`
     /// counterpart to `.index_assign`; only ever a struct field write
     /// (`assignment()` never turns an enum-variant reference into an
-    /// lvalue, the same way it never does for any other non-lvalue shape).
+    /// lvalue).
     field_assign: FieldAssign,
-    /// `<base>[start..end]` (GRAMMAR.bnf's Strings design notes) — a
-    /// read-only substring, end exclusive, same convention as the
-    /// for-loop's own range. Never produced as an assignment target: unlike
-    /// `.index`, there is no `.slice_assign` counterpart — `assignment`
-    /// only ever turns a `.variable` or `.index` shape into an lvalue, so
-    /// `s[a..b] := v` falls through to its "invalid assignment target"
-    /// error same as any other non-lvalue expression would.
+    /// `<base>[start..end]` (Strings design notes) — a read-only
+    /// substring, end exclusive, same convention as a for-loop range. No
+    /// `.slice_assign` counterpart: `assignment` only turns
+    /// `.variable`/`.index` into lvalues, so `s[a..b] := v` falls through
+    /// to the "invalid assignment target" error.
     slice: Slice,
     /// `len(<expression>)`. Relaxed from a bare array name to an arbitrary
-    /// expression (GRAMMAR.bnf design note 3m) now that a map/list is a
-    /// genuine first-class runtime value — the compiler still special-cases
-    /// a bare `.variable` naming a fixed/generic array to fold to a
-    /// compile-time constant or `LOAD_REF_LEN` exactly as before (arrays
-    /// still aren't first-class, design note 3e); anything else compiles as
-    /// an ordinary expression followed by `LEN_VALUE`.
+    /// expression (design note 3m) now that map/list are first-class. The
+    /// compiler still special-cases a bare `.variable` naming a
+    /// fixed/generic array (folds to a constant or `LOAD_REF_LEN` — arrays
+    /// still aren't first-class, design note 3e); anything else compiles
+    /// as `LEN_VALUE`.
     len_of: *Expr,
     /// One of the three keyword-named streams, as a value.
     stream_literal: Stream.Standard,
-    /// The bare `args` keyword (GRAMMAR.bnf design note 3p) — evaluates to a
-    /// fresh `list` of the program's own command-line arguments, as
-    /// strings. Unlike `stream_literal`, this isn't a compile-time constant:
-    /// the argument count and text vary per run, so it compiles to a
-    /// dedicated opcode (PUSH_ARGS, ISA.bnf) that builds the list from the
-    /// VM's `Host.args` at run time.
+    /// The bare `args` keyword (design note 3p) — a fresh `list` of the
+    /// program's command-line arguments as strings. Not a compile-time
+    /// constant (varies per run), so it compiles to PUSH_ARGS, building
+    /// the list from `Host.args` at run time.
     args_literal,
     read_bytes: ReadBytes,
     write_value: WriteValue,
@@ -239,146 +205,114 @@ pub const Expr = union(enum) {
     /// it was.
     map_delete: MapDelete,
     /// `keys(map)` — a fresh `list` of the map's own keys, in insertion
-    /// order. How map/list iteration works (`for i in 0..len(ks) { ... }`)
-    /// instead of a dedicated foreach form (GRAMMAR.bnf design note 3g).
+    /// order. How map/list iteration works (`for i in 0..len(ks) { ... }`
+    /// instead of a dedicated foreach form (design note 3g).
     map_keys: *Expr,
-    /// `json(buffer, count)` (GRAMMAR.bnf design note 3n) — parses the first
-    /// `count` bytes of an `int` buffer as JSON, evaluating to whatever the
-    /// document's root turns out to be. `buffer` is a bare array name, the
-    /// same restriction `ReadBytes`'s destination has and for the same
-    /// reason: arrays still aren't first-class (design note 3e).
+    /// `json(buffer, count)` (design note 3n) — parses the first `count`
+    /// bytes of an `int` buffer as JSON. `buffer` is a bare array name,
+    /// same restriction as `ReadBytes`'s destination and for the same
+    /// reason: arrays aren't first-class (design note 3e).
     json_parse: JsonParse,
-    /// `stringify(value)` (GRAMMAR.bnf design note 3o) — the reverse of
-    /// `json_parse`: renders an arbitrary value as JSON text, evaluating to
-    /// a fresh heap `string`. `value` is a general expression (unlike
-    /// `json_parse`'s buffer, this has no array-identifier restriction to
-    /// inherit — it reads a value, it doesn't name a buffer to fill).
+    /// `stringify(value)` (design note 3o) — the reverse of `json_parse`:
+    /// renders `value` as JSON text into a fresh `string`. `value` is a
+    /// general expression, unlike `json_parse`'s buffer — it reads a
+    /// value rather than naming a buffer to fill.
     json_stringify: *Expr,
-    /// `int(value)` (GRAMMAR.bnf design note 3r) — parses a `string` as a
-    /// base-10 integer, evaluating to an `int`. Reuses the `int` TYPE
-    /// keyword as call syntax, like `json`/`stringify` above; never
-    /// ambiguous with a `<type>` use since that position is only ever
-    /// consulted at the start of a var-declaration/param/return-type, never
-    /// while parsing an expression.
+    /// `int(value)` (design note 3r) — parses a `string` as base-10,
+    /// evaluating to an `int`. Reuses the `int` TYPE keyword as call
+    /// syntax; never ambiguous with a `<type>` use since that position
+    /// only appears at the start of a var-declaration/param/return-type.
     int_parse: *Expr,
     /// `float(value)` — the `float` counterpart to `int_parse`, parsing a
     /// `string` as a floating-point literal.
     float_parse: *Expr,
-    /// `getenv(name)` (GRAMMAR.bnf design note 3v) — the value of the
-    /// environment variable `name`, as a fresh heap `string`, or `""` when
-    /// it isn't set. Like `args_literal` this reads live `Host` state at run
-    /// time (GET_ENV, ISA.bnf section 15) rather than anything the compiler
-    /// could fold; unlike it, it takes an operand, so it's shaped like the
-    /// `json`/`stringify`/`int`/`float` special forms above instead of being
-    /// a bare keyword.
+    /// `getenv(name)` (design note 3v) — the environment variable `name`'s
+    /// value as a `string`, or `""` if unset. Reads live `Host` state at
+    /// run time (GET_ENV, ISA.bnf section 15) like `args_literal`, but
+    /// takes an operand, so it's shaped like `json`/`stringify`/`int`/
+    /// `float` instead of a bare keyword.
     env_get: *Expr,
-    /// `hasenv(name)` — whether that variable is SET, which `env_get` alone
-    /// can't answer: a variable set to the empty string and one that doesn't
-    /// exist both read as `""`. The same split `map_has` gives a map
-    /// (GRAMMAR.bnf design note 3v).
+    /// `hasenv(name)` — whether the variable is SET; `env_get` alone can't
+    /// answer this since an empty-string value and an unset variable both
+    /// read as `""`. The same split `map_has` gives a map (design note 3v).
     env_has: *Expr,
-    /// `exists(path)` (GRAMMAR.bnf design note 3w) — whether `path` names
-    /// anything on disk right now, as a `bool`. Never raises beyond the
-    /// `FilesUnavailable` capability gate and a non-string `TypeMismatch`:
-    /// any other reason the check can't be answered (permission denied, a
-    /// bad path, ...) reads as `false`, the same "advisory, not a
-    /// guarantee" contract `std.Io.Dir.access` itself documents.
+    /// `exists(path)` (design note 3w) — whether `path` names anything on
+    /// disk, as a `bool`. Never raises beyond the `FilesUnavailable` gate
+    /// and a non-string `TypeMismatch`: any other failure (permission
+    /// denied, bad path) reads as `false` — "advisory, not a guarantee",
+    /// matching `std.Io.Dir.access`.
     path_exists: *Expr,
-    /// `listDir(path)` — the names of `path`'s own entries (files and
-    /// subdirectories, not recursive, no `.`/`..`), as a fresh `list` of
-    /// `string`s in whatever order the OS hands them back. Unlike
-    /// `path_exists`, a `path` that can't actually be listed (missing, not a
-    /// directory, no permission) is `RuntimeError.ListDirFailed` — there is
-    /// no meaningful empty-list fallback for "list this" the way there is
-    /// for "does this exist".
+    /// `listDir(path)` — `path`'s own entries (not recursive, no `.`/
+    /// `..`) as a `list` of `string`s, OS order. Unlike `path_exists`, an
+    /// unlistable `path` (missing, not a directory, no permission) raises
+    /// `RuntimeError.ListDirFailed` — no empty-list fallback.
     list_dir: *Expr,
     /// `remove(path)` — deletes the file or empty directory at `path`,
-    /// evaluating to whether there was anything there to remove (the same
-    /// "present and removed" split `map_delete` gives a map key, extended to
-    /// the filesystem: removing something already gone is a no-op success,
-    /// not an error). Any other failure (no permission, a non-empty
-    /// directory, ...) is `RuntimeError.RemoveFailed`.
+    /// evaluating to whether anything was removed (same "present and
+    /// removed" split as `map_delete`: removing something already gone is
+    /// a no-op success). Any other failure is `RuntimeError.RemoveFailed`.
     path_remove: *Expr,
     /// `rename(from, to)` — moves/renames `from` to `to`, evaluating to
     /// whether `from` existed to be renamed (same "absent is a no-op, not an
     /// error" split as `path_remove`). Any other failure is
     /// `RuntimeError.RenameFailed`.
     path_rename: PathRename,
-    /// `mkdir(path)` — creates the directory named by `path`, evaluating to
-    /// whether a NEW directory was made: `true` if `path` didn't exist and
-    /// now does, `false` if a directory was already there (the mirror image
-    /// of `path_remove`'s "absent is a no-op" split — here, "already
-    /// present" is the no-op). NOT recursive: a missing parent directory is
-    /// `RuntimeError.MkdirFailed`, not silently created, matching
-    /// `list_dir`/`path_remove`'s own one-level-only stance. `path` existing
-    /// as something other than a directory (a plain file, say) is also
-    /// `RuntimeError.MkdirFailed`, not the no-op case.
+    /// `mkdir(path)` — creates the directory at `path`, evaluating to
+    /// whether a NEW one was made (`true` if it didn't exist, `false` if
+    /// already a directory — the mirror of `path_remove`'s no-op split).
+    /// NOT recursive: a missing parent, or `path` existing as a
+    /// non-directory, is `RuntimeError.MkdirFailed`, not silently handled.
     path_mkdir: *Expr,
-    /// `exec(command, args)` (GRAMMAR.bnf design note 3x) — spawns `command`
-    /// with `args` (a `list` of strings) as its own argv[1..], waits for it
-    /// to exit, and evaluates to a fresh `map` with three keys, always all
-    /// present: `"stdout"`/`"stderr"` (its captured output, as strings) and
-    /// `"exit_code"` (an `int`). Like `rename`, both operands are arbitrary
-    /// expressions, not literals, so a computed command/argument list works.
+    /// `exec(command, args)` (design note 3x) — spawns `command` with
+    /// `args` (a `list` of strings) as argv[1..], waits for exit,
+    /// evaluates to a `map` with `"stdout"`/`"stderr"`/`"exit_code"`. Both
+    /// operands are arbitrary expressions, so a computed command/argument
+    /// list works.
     exec: Exec,
-    /// `now()` (GRAMMAR.bnf design note 3y) — the current wall-clock time as
-    /// a fresh `float` of seconds since the Unix epoch, sub-second precision
-    /// included. Like `args_literal` this reads live `Host` state (NOW,
-    /// ISA.bnf section 18) rather than anything the compiler could fold; no
-    /// operand, unlike `getenv`, since there's nothing to name.
+    /// `now()` (design note 3y) — wall-clock time as a `float` of seconds
+    /// since the Unix epoch, sub-second precision. Reads live `Host` state
+    /// (NOW, ISA.bnf section 18); no operand, unlike `getenv`, since
+    /// there's nothing to name.
     time_now,
-    /// `random()` — a fresh `float` uniformly distributed in `[0, 1)`, the
-    /// zero-argument form of `random(...)` (RANDOM_FLOAT, ISA.bnf section
-    /// 18). Distinguished from `random_range` purely by argument count at
-    /// parse time (parser.zig's `randomExpr`), the same way `write`'s two
-    /// forms are.
+    /// `random()` — a `float` uniform in `[0, 1)`, the zero-arg form of
+    /// `random(...)` (RANDOM_FLOAT, ISA.bnf section 18). Distinguished
+    /// from `random_range` by argument count at parse time
+    /// (`randomExpr`), like `write`'s two forms.
     random_float,
-    /// `random(start, end)` — a fresh `int` uniformly distributed over
-    /// `[start, end)`, end EXCLUSIVE — the same convention the for-loop's
-    /// own `start..end` uses, though this is an ordinary two-argument call,
-    /// not `..` syntax (RANDOM_RANGE, ISA.bnf section 18). `start`/`end` are
-    /// arbitrary expressions, checked to be `int` at compile time where
-    /// possible (mirroring the for-loop's own bounds) and always at runtime.
+    /// `random(start, end)` — an `int` uniform over `[start, end)`, end
+    /// EXCLUSIVE (same convention as a for-loop's `start..end`, though
+    /// this is an ordinary call, not `..` syntax; RANDOM_RANGE, ISA.bnf
+    /// section 18). `start`/`end` are checked `int` at compile time where
+    /// possible, always at runtime.
     random_range: RandomRange,
-    /// `ord(s)` (GRAMMAR.bnf design note 3ab) — the numeric byte value
-    /// (0..255) of `s`, which must be a single-byte string: the "characters
-    /// are length-1 strings" convention the Strings design notes already
-    /// establish for `s[i]`, made usable for actual byte-level work (case
-    /// conversion, character-class predicates) without introducing a
-    /// separate `char` type. `RuntimeError.InvalidCharLength` (ISA.bnf
-    /// section 21) if `s`'s byte length isn't exactly 1 — checked, not
-    /// silently truncated to the first byte, matching this VM's usual
-    /// "checked, not trusted" stance.
+    /// `ord(s)` (design note 3ab) — the byte value (0..255) of
+    /// single-byte string `s`, using the "characters are length-1
+    /// strings" convention `s[i]` already has, without a separate `char`
+    /// type. `RuntimeError.InvalidCharLength` (ISA.bnf section 21) if
+    /// `s`'s length isn't exactly 1 — checked, not truncated.
     char_ord: *Expr,
-    /// `join(list, sep)` (GRAMMAR.bnf design note 3ac) — every element of
-    /// `list` (each must be `string`-shaped), concatenated with `sep`
-    /// between consecutive elements, as one fresh string. The single-pass
-    /// counterpart to building a string via repeated `+` in a loop — a
-    /// StringBuilder-shaped problem solved without a new mutable value
-    /// kind, by pairing this with the existing `list`/`push` (ISA.bnf
-    /// section 22).
+    /// `join(list, sep)` (design note 3ac) — every `string` element of
+    /// `list`, concatenated with `sep` between them, as one fresh string.
+    /// The single-pass counterpart to building a string via repeated `+`
+    /// in a loop, solved by pairing with existing `list`/`push` rather
+    /// than adding a mutable value kind (ISA.bnf section 22).
     list_join: Join,
-    /// `"literal ${expr} literal"` (GRAMMAR.bnf design note 3ae) — a STRING
-    /// literal containing one or more `${...}` interpolations, split at
-    /// parse time into an alternating sequence of literal-text and
-    /// sub-expression parts (`parser.zig`'s `parseStringOrInterp`). A STRING
-    /// token with no `${` at all never produces this node — it's still a
-    /// plain `.literal.string`, exactly as before this feature existed; this
-    /// is purely additive. Always evaluates to `string` (`compiler.zig`
-    /// desugars it to PUSH_CONST/TO_STRING per part plus one INTERP_CONCAT
-    /// naming the piece count — ISA.bnf section 23 — no new heap value
-    /// kind, the same stance `join` already takes, and no O(n^2) growth
-    /// the way a chain of ADD would have).
+    /// `"literal ${expr} literal"` (design note 3ae) — a STRING literal
+    /// with one or more `${...}` interpolations, split at parse time into
+    /// alternating literal-text/sub-expression parts (`parser.zig`'s
+    /// `parseStringOrInterp`). A STRING with no `${` stays a plain
+    /// `.literal.string` — purely additive. Always evaluates to `string`:
+    /// `compiler.zig` desugars to PUSH_CONST/TO_STRING per part plus one
+    /// INTERP_CONCAT (ISA.bnf section 23), avoiding both a new heap value
+    /// kind and the O(n^2) growth a chain of ADD would cause.
     string_interp: []InterpPart,
 
-    /// One piece of an interpolated string: either literal text (already
-    /// escape-decoded, same four-plus-`\$` rules `Literal.string` itself
-    /// gets) or a `${...}` sub-expression, in source order. A literal part
-    /// may be empty (`""`), and always appears immediately before/after/
-    /// between the expression parts — `parser.zig` emits one for every gap,
-    /// including empty ones at the very start/end, so `compiler.zig` only
-    /// ever has to reason about ordinary literal/expr alternation, never
-    /// "was there text before the first `${`?" as a special case.
+    /// One piece of an interpolated string: literal text (escape-decoded
+    /// like `Literal.string`) or a `${...}` sub-expression, in source
+    /// order. A literal part may be empty; `parser.zig` emits one for
+    /// every gap, including empty ones at the start/end, so `compiler.zig`
+    /// only ever sees ordinary literal/expr alternation — no "was there
+    /// text before the first `${`?" special case.
     pub const InterpPart = union(enum) {
         literal: []const u8,
         expr: *Expr,
@@ -405,11 +339,11 @@ pub const Expr = union(enum) {
         args: []*Expr,
     };
 
-    /// `base.method(args)` (GRAMMAR.bnf design note 3af). `args` never
-    /// includes `base` itself — the receiver — compiler.zig prepends it as
-    /// the underlying function's own first argument at codegen time, the
-    /// same way `MethodDecl.receiver_name`/`receiver_type` desugar to that
-    /// function's first declared parameter at registration time.
+    /// `base.method(args)` (design note 3af). `args` never includes `base`
+    /// (the receiver) — compiler.zig prepends it as the underlying
+    /// function's first argument at codegen time, matching how
+    /// `MethodDecl.receiver_name`/`receiver_type` desugar to that
+    /// function's first parameter at registration.
     pub const MethodCall = struct {
         base: *Expr,
         method: []const u8,
@@ -417,13 +351,10 @@ pub const Expr = union(enum) {
     };
 
     /// `<base>[index]`. `base` is a general expression, not just a bare
-    /// name — this is what lets bracket-indexing CHAIN for map/list values
-    /// (`doc["a"]["b"]`, GRAMMAR.bnf design note 3m), unlike an array
-    /// (design note 3e), which still only ever resolves through a bare
-    /// `.variable` base: the compiler rejects (or, for a non-identifier
-    /// base, the VM rejects at run time) any other shape for a fixed/
-    /// generic array target, since an array element is always scalar and
-    /// therefore never itself indexable.
+    /// name — this lets bracket-indexing CHAIN for map/list values
+    /// (`doc["a"]["b"]`, design note 3m). An array (design note 3e) still
+    /// only resolves through a bare `.variable` base, since an array
+    /// element is always scalar and never itself indexable.
     pub const Index = struct {
         base: *Expr,
         index: *Expr,
@@ -493,12 +424,10 @@ pub const Expr = union(enum) {
     };
 
     /// `read(stream, buffer)` — fills `buffer`'s elements with raw bytes
-    /// (one byte per element, 0-255) and evaluates to how many were read,
-    /// 0 at end of input (GRAMMAR.bnf design note 3k). `stream` is an
-    /// arbitrary expression so an opened file works everywhere `stdin`
-    /// does, but `buffer` is still a bare array name for the same reason
-    /// `Index`'s and `len_of`'s targets are: arrays aren't first-class
-    /// values there'd be an expression to compute one from.
+    /// (0-255), evaluating to the count read, 0 at EOF (design note 3k).
+    /// `stream` is a general expression so an opened file works anywhere
+    /// `stdin` does; `buffer` stays a bare array name — arrays aren't
+    /// first-class (same as `Index`/`len_of`'s targets).
     pub const ReadBytes = struct {
         stream: *Expr,
         buffer: []const u8,
@@ -514,9 +443,8 @@ pub const Expr = union(enum) {
 
     /// `write(stream, buffer, count)` — writes the first `count` elements
     /// of `buffer` as raw bytes, the inverse of `ReadBytes`. Distinguished
-    /// from `WriteValue` purely by argument count (see parser.zig's
-    /// `writeExpr`), so `write(f, x)` and `write(f, buf, n)` never need
-    /// different keywords.
+    /// from `WriteValue` by argument count (parser.zig's `writeExpr`), so
+    /// `write(f, x)` and `write(f, buf, n)` share one keyword.
     pub const WriteBytes = struct {
         stream: *Expr,
         buffer: []const u8,
@@ -571,55 +499,48 @@ pub const StmtKind = union(enum) {
     expr_stmt: *Expr,
     function_decl: FunctionDecl,
     /// `[export] func '(' IDENTIFIER IDENTIFIER ')' IDENTIFIER '(' params ')'
-    /// '->' <type> <block>` (GRAMMAR.bnf design note 3af) — a struct method.
-    /// Only ever produced at the top level, same restriction as
-    /// `function_decl`. Never itself compiled directly: compiler.zig
+    /// '->' <type> <block>` (design note 3af) — a struct method, top-level
+    /// only like `function_decl`. Never compiled directly: compiler.zig
     /// desugars it into an ordinary function whose first parameter is the
-    /// receiver (`receiver_name IDENTIFIER receiver_type`), then compiles
-    /// that exactly like any other `function_decl` — a method call is
-    /// resolved statically at its call site (by the receiver's declared
-    /// struct type), never through any runtime dispatch mechanism.
+    /// receiver, then compiles that like any `function_decl`. A method
+    /// call resolves statically at its call site, never via runtime
+    /// dispatch.
     method_decl: MethodDecl,
     return_stmt: *Expr,
     for_stmt: For,
     import_stmt: Import,
-    /// `[export] struct IDENTIFIER '{' <field-list> '}'` (GRAMMAR.bnf design
-    /// note 3z) — only ever produced at the top level (see parser.zig's
-    /// `topLevelDeclaration`), matching `function_decl`/`import_stmt`.
-    /// Compiles to nothing by itself (no codegen — purely a registration in
-    /// compiler.zig, the same way `import_stmt` is); a struct name is
-    /// resolved wherever `<type>` names it (`ValueType.named`) and a
-    /// literal constructs it (`Expr.struct_literal`).
+    /// `[export] struct IDENTIFIER '{' <field-list> '}'` (design note 3z)
+    /// — top-level only, matching `function_decl`/`import_stmt`. Compiles
+    /// to nothing itself — purely a registration in compiler.zig; a
+    /// struct name is resolved wherever `<type>` names it
+    /// (`ValueType.named`) and a literal constructs it
+    /// (`Expr.struct_literal`).
     struct_decl: StructDecl,
-    /// `[export] enum IDENTIFIER '{' <variant-list> '}'` (GRAMMAR.bnf design
-    /// note 3aa) — same top-level-only, registration-only shape as
-    /// `struct_decl`. A variant's runtime value is a compile-time constant
-    /// (`Value.enum_value`), never something this statement itself emits
-    /// any code for.
+    /// `[export] enum IDENTIFIER '{' <variant-list> '}'` (design note 3aa)
+    /// — same top-level-only, registration-only shape as `struct_decl`. A
+    /// variant's runtime value is a compile-time constant
+    /// (`Value.enum_value`); this statement itself emits no code.
     enum_decl: EnumDecl,
     /// `close <expression>` — a statement rather than an expression because,
     /// unlike `open`/`read`/`write`, it produces no value; `print` is the
     /// same shape for the same reason (design note 3l).
     close_stmt: *Expr,
     /// `exit <expression>` (design note 3q) — halts the whole program
-    /// immediately, from anywhere (including deep inside nested calls, mid-
-    /// loop, mid-expression-statement), propagating `expression`'s value as
-    /// the process's own exit code. A statement, not an expression, for the
-    /// same reason `close`/`print` are: it produces no value to a caller
-    /// that, by definition, never gets to run.
+    /// immediately from anywhere (nested calls, mid-loop,
+    /// mid-expression), using `expression`'s value as the exit code. A
+    /// statement, not an expression, since there's no caller left to
+    /// receive a value.
     exit_stmt: *Expr,
-    /// `throw <expression>` (design note 3u) — raises `expression` (which
-    /// must statically be the built-in `Error` struct) as a catchable error:
-    /// caught by the nearest enclosing `try` exactly like an internal one,
-    /// or, uncaught, terminates the program the same way an uncaught
-    /// internal error does. A statement, not an expression, for the same
-    /// reason `exit`/`close`/`print` are.
+    /// `throw <expression>` (design note 3u) — raises `expression` (must
+    /// statically be the built-in `Error` struct) as a catchable error,
+    /// caught by the nearest enclosing `try` or, uncaught, terminating the
+    /// program like an internal error would. A statement, not an
+    /// expression, same as `exit`/`close`/`print`.
     throw_stmt: *Expr,
     /// `try <block> catch IDENTIFIER <block>` (design note 3u) — runs
-    /// `body`, and if a catchable runtime error is raised anywhere while it
-    /// does (including several call frames deep), abandons the rest of it
-    /// and runs `handler` instead, with `error_var` bound to a `map`
-    /// describing the failure.
+    /// `body`; if a catchable runtime error is raised anywhere while it
+    /// does (even frames deep), abandons the rest and runs `handler`
+    /// instead, with `error_var` bound to a `map` describing the failure.
     try_stmt: Try,
 
     pub const VarDecl = struct {
@@ -647,10 +568,10 @@ pub const StmtKind = union(enum) {
         body: *Stmt,
     };
 
-    /// Only ever produced at the top level (see parser.zig's
-    /// `topLevelDeclaration`) — Butter has no nested functions or closures,
-    /// so a `.function_decl` can never legally appear as the body of a
-    /// block/if/while, even though the type itself doesn't forbid it.
+    /// Only ever produced at the top level (`topLevelDeclaration`) —
+    /// Butter has no nested functions or closures, so `.function_decl`
+    /// never legally appears as a block/if/while body, though the type
+    /// itself doesn't forbid it.
     pub const FunctionDecl = struct {
         name: []const u8,
         params: []Param,
@@ -699,26 +620,23 @@ pub const StmtKind = union(enum) {
         body: *Stmt,
     };
 
-    /// The two halves of a `try`/`catch`. Both are `[]Stmt` — a block's
-    /// contents — rather than the `*Stmt` `if`/`while`/`for` bodies are:
-    /// braces are mandatory on both sides (design note 3u), so there is no
-    /// braceless single-declaration form for either to represent.
-    ///
-    /// They are separate scopes, and `error_var` is a local of `handler`'s,
-    /// not of `body`'s: a local declared in `body` may never have been
-    /// initialized by the time `handler` runs, which is precisely the case
-    /// `handler` exists to deal with.
+    /// The two halves of a `try`/`catch`. Both are `[]Stmt` rather than
+    /// the `*Stmt` `if`/`while`/`for` bodies use — braces are mandatory on
+    /// both sides (design note 3u), so there's no braceless single-
+    /// statement form. They are separate scopes: `error_var` is a local
+    /// of `handler`'s, not `body`'s, since a local declared in `body` may
+    /// never have been initialized by the time `handler` runs — exactly
+    /// the case `handler` exists to handle.
     pub const Try = struct {
         body: []Stmt,
         error_var: []const u8,
         handler: []Stmt,
     };
 
-    /// `import "path/to/file.butter"` — only ever produced at the top level
-    /// (see parser.zig's `topLevelDeclaration`), matching `function_decl`.
-    /// `path` is exactly the string literal's contents, unresolved — the
-    /// module loader (module.zig) is what turns it into an actual file to
-    /// read, relative to the importing file's own directory.
+    /// `import "path/to/file.butter"` — top-level only, matching
+    /// `function_decl`. `path` is the string literal's raw contents,
+    /// unresolved — module.zig turns it into an actual file, relative to
+    /// the importing file's directory.
     pub const Import = struct {
         path: []const u8,
     };

@@ -1,32 +1,24 @@
 //! Post-codegen bytecode cleanup: two passes over an already-compiled
-//! `Chunk` that clean up artifacts of CODEGEN itself, not of the source
-//! program — so they live here rather than in optimizer.zig, which only
-//! ever sees the AST (see that file's own doc comment on why there's no
-//! separate IR stage between it and the compiler). `compileIf`/
-//! `compileTry` unconditionally emit a JUMP (or POP_HANDLER+JUMP) to skip
-//! past the branch/handler they just compiled — needed when that branch
-//! can fall through, dead weight when it can't (it ends in
-//! return/exit/throw), and the compiler has no way to know which case
-//! it's in when it emits that jump. optimizer.zig's `alwaysTerminates`
-//! only prunes STATEMENTS after a terminator; it has no visibility into
-//! bytecode the compiler emits that isn't backed by any statement at all.
+//! `Chunk`, cleaning up CODEGEN artifacts rather than source-level dead
+//! code (that's optimizer.zig, which only ever sees the AST — see its own
+//! doc comment). `compileIf`/`compileTry` always emit a JUMP (or
+//! POP_HANDLER+JUMP) to skip the branch/handler just compiled, even when
+//! it ends in return/exit/throw and can't fall through: the compiler has
+//! no way to know which case it's in, and optimizer.zig only prunes
+//! statements, not bytecode with no statement behind it.
 //!
-//! Run in this order:
-//!   1. `threadJumps`: a jump-shaped instruction whose target is itself
-//!      an unconditional JUMP is retargeted straight to THAT jump's own
-//!      target, so control never bounces through an intermediate jump
-//!      only to jump again.
-//!   2. `removeUnreachable`: floods reachability out from index 0 through
-//!      fall-through edges (every non-terminator reaches the instruction
-//!      right after it) and jump edges (every JUMP/JUMP_IF_FALSE/
-//!      JUMP_IF_FALSE_POP/PUSH_HANDLER reaches its operand) and drops
-//!      whatever the flood never touches. Threading runs first
-//!      specifically so an intermediate jump left with no remaining
-//!      inbound edge after retargeting is correctly unreachable here too.
+//! Runs in order:
+//!   1. `threadJumps`: retargets a jump whose target is itself an
+//!      unconditional JUMP straight to that jump's own target, so control
+//!      never bounces through an intermediate jump.
+//!   2. `removeUnreachable`: floods reachability from index 0 through
+//!      fall-through edges and jump edges (JUMP/JUMP_IF_FALSE/
+//!      JUMP_IF_FALSE_POP/PUSH_HANDLER) and drops whatever isn't reached.
+//!      Runs after threading so an intermediate jump left with no inbound
+//!      edge is correctly caught here too.
 //!
-//! Both are pure retarget-or-delete transformations over instructions
-//! already emitted — neither ever changes what the chunk computes, only
-//! how much of it there is to dispatch through.
+//! Both passes only retarget or delete existing instructions — neither
+//! changes what the chunk computes, only how much of it there is.
 
 const std = @import("std");
 const chunk_mod = @import("chunk.zig");
