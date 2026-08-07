@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Butter Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/editors/vscode-butter",
+        "${workspaceFolder}"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/editors/vscode-butter/dist/**/*.js"
+      ],
+      "preLaunchTask": "npm: compile - vscode-butter"
+    }
+  ]
+}

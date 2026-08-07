@@ -20,9 +20,11 @@ The `butter` executable is written to `zig-out/bin/`.
 ## Testing
 
 ```bash
-zig build test              # unit + integration tests + fuzz smoke test
+zig build test              # unit + integration tests + fuzz smoke test + LSP unit tests
 zig build test-integration  # just the .butter program integration tests
 zig build test-performance  # timed performance benchmarks
+zig build test-lsp          # the language server's own unit tests (src/lsp/*.zig)
+zig build test-lsp-smoke    # drives the built butter-lsp binary over real stdio JSON-RPC
 zig build perf-report       # JSON performance report (-- --output <path>)
 zig build perf-compare      # flag regressions between two perf-report runs
 zig build fmt-check         # check formatting (zig fmt --check)
@@ -42,9 +44,10 @@ to `master` — run the first two locally before opening a PR.
 | Path | Contents |
 |---|---|
 | [src/](src/) | Lexer, parser, compiler, VM, and standard library |
+| [src/lsp/](src/lsp/) | The `butter-lsp` language server (diagnostics, hover, go-to-definition, completion — see its own design plan for the position-recovery approach) |
 | [examples/](examples/) | Sample `.butter` programs, one per language feature |
-| [tests/](tests/) | Integration, performance, and fuzz tests |
-| [editors/vscode-butter/](editors/vscode-butter/) | VS Code syntax highlighting extension |
+| [tests/](tests/) | Integration, performance, fuzz, and LSP stdio smoke tests |
+| [editors/vscode-butter/](editors/vscode-butter/) | VS Code extension: syntax highlighting + the `butter-lsp` language client |
 | [docs/GRAMMAR.bnf](docs/GRAMMAR.bnf) | Language grammar |
 | [docs/ISA.bnf](docs/ISA.bnf) | Compiled bytecode instruction set |
 
@@ -59,6 +62,10 @@ to `master` — run the first two locally before opening a PR.
 - [DESIGN-error-recovery.md](DESIGN-error-recovery.md) — an example design
   spike for a not-yet-implemented feature; new non-trivial features should
   generally get one of these before implementation
+- [DESIGN-lsp.md](DESIGN-lsp.md) — the `butter-lsp` language server
+  (`src/lsp/`): why it's additive-only (no `ast.zig`/`parser.zig`/
+  `compiler.zig` changes), how it recovers source positions the AST
+  doesn't carry, and what's explicitly out of scope for now
 
 ## Releases
 

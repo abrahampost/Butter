@@ -1,9 +1,9 @@
 {
   "name": "butter-language",
   "displayName": "Butter Language",
-  "description": "Syntax highlighting for the Butter programming language (.butter)",
+  "description": "Syntax highlighting and language server support (diagnostics, hover, go-to-definition, completion) for the Butter programming language (.butter)",
   "repository": {},
-  "version": "0.0.1",
+  "version": "0.1.0",
   "publisher": "zbutter",
   "engines": {
     "vscode": "^1.75.0"
@@ -11,6 +11,7 @@
   "categories": [
     "Programming Languages"
   ],
+  "main": "./dist/extension.js",
   "contributes": {
     "languages": [
       {
@@ -31,6 +32,31 @@
         "scopeName": "source.butter",
         "path": "./syntaxes/butter.tmLanguage.json"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Butter",
+      "properties": {
+        "butter.lsp.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `butter-lsp` executable. Supports `${workspaceFolder}`. Leave empty to look it up on `PATH` (`butter-lsp` / `butter-lsp.exe`) — see [Language Server](https://github.com/abrahampost/Butter#language-server) for how to build/install it."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node18",
+    "watch": "npm run compile -- --watch",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.75.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.4.5"
   }
 }

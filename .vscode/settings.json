@@ -1,0 +1,3 @@
+{
+  "butter.lsp.path": "${workspaceFolder}/zig-out/bin/butter-lsp.exe"
+}

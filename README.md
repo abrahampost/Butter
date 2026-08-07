@@ -62,8 +62,11 @@ butter path/to/program.butter -- foo bar      # program sees `args` == ["foo", "
 
 ## Editor support
 
-A basic VS Code extension providing syntax highlighting for `.butter` files
-lives in [editors/vscode-butter/](editors/vscode-butter/).
+A VS Code extension lives in [editors/vscode-butter/](editors/vscode-butter/):
+syntax highlighting, plus a language server (`butter-lsp`, built by `zig
+build` alongside the `butter` CLI) providing diagnostics, hover, go-to-
+definition, document outline, and completion. See that folder's README
+for setup.
 
 ## Contributing
 

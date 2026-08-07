@@ -30,6 +30,52 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the butter CLI");
     run_step.dependOn(&run_cmd.step);
 
+    const lsp_exe = b.addExecutable(.{
+        .name = "butter-lsp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lsp_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "butter", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(lsp_exe);
+
+    const lsp_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lsp_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "butter", .module = mod },
+            },
+        }),
+    });
+    const run_lsp_tests = b.addRunArtifact(lsp_tests);
+
+    const lsp_test_step = b.step("test-lsp", "Run the language server's unit tests (src/lsp/*.zig)");
+    lsp_test_step.dependOn(&run_lsp_tests.step);
+
+    const lsp_smoke_options = b.addOptions();
+    lsp_smoke_options.addOptionPath("lsp_exe_path", lsp_exe.getEmittedBin());
+
+    const lsp_smoke_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/lsp_smoke_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = lsp_smoke_options.createModule() },
+            },
+        }),
+    });
+    const run_lsp_smoke_test = b.addRunArtifact(lsp_smoke_test);
+
+    const lsp_smoke_test_step = b.step("test-lsp-smoke", "Drive the built butter-lsp binary over real stdio JSON-RPC");
+    lsp_smoke_test_step.dependOn(&run_lsp_smoke_test.step);
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
@@ -117,10 +163,11 @@ pub fn build(b: *std.Build) void {
     const fuzz_test_step = b.step("test-fuzz", "Run the lexer/parser fuzz target (add --fuzz to actually fuzz instead of just smoke-testing)");
     fuzz_test_step.dependOn(&run_fuzz_tests.step);
 
-    const test_step = b.step("test", "Run the full test suite (unit + integration + fuzz smoke test)");
+    const test_step = b.step("test", "Run the full test suite (unit + integration + fuzz smoke test + LSP)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_fuzz_tests.step);
+    test_step.dependOn(&run_lsp_tests.step);
 
     const fmt_check = b.addFmt(.{
         .paths = &.{ "src", "tests", "build.zig" },

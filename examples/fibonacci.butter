@@ -5,8 +5,18 @@ func fib(int n) -> int {
     return fib(n - 1) + fib(n - 2)
 }
 
+func apple (string a) -> bool {
+    if a == "apple" {
+        return true
+    }
+
+    return false
+}
+
 int i := 0
 while i < 10 {
     print fib(i)
     i := i + 1
 }
+
+print apple("past")
