@@ -21,6 +21,11 @@ pub fn definition(allocator: std.mem.Allocator, analysis: *const workspace.Analy
         return .{ .uri = target_uri, .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } } };
     }
 
+    // A builtin keyword-form op (`ord`, `len`, ...) has no declaration site
+    // in Butter source at all — see builtins.zig — so there's nowhere for
+    // "go to definition" to jump.
+    if (r.target == .builtin) return null;
+
     const p = resolve.targetPosition(r.target);
     const len: u32 = @intCast(resolve.targetNameLen(r.target));
     const start = tk.Position.toUtf16(r.module.text, p);
@@ -79,6 +84,19 @@ test "definition on an import statement jumps to the start of that file" {
     try testing.expect(std.mem.endsWith(u8, loc.uri, "math.std.butter"));
     try testing.expectEqual(@as(u32, 0), loc.range.start.line);
     try testing.expectEqual(@as(u32, 0), loc.range.start.character);
+}
+
+test "definition returns null for a builtin keyword-form op like ord" {
+    const gpa = testing.allocator;
+    var a = try analyzeOk(gpa, "print ord(\"x\")\n");
+    defer a.deinit();
+    const mod = a.findModule("<test>").?;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    // "ord" on line 0, right after "print ".
+    const loc = try definition(arena_state.allocator(), &a, mod, .{ .line = 0, .character = 7 });
+    try testing.expect(loc == null);
 }
 
 test "definition returns null when nothing resolves" {

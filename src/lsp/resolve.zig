@@ -23,6 +23,13 @@ const tk = @import("tokens.zig");
 const symbols = @import("symbols.zig");
 const scope_mod = @import("scope.zig");
 const workspace = @import("workspace.zig");
+const builtins = @import("builtins.zig");
+
+pub const BuiltinRef = struct {
+    name: []const u8,
+    pos: tk.Position,
+    info: builtins.Builtin,
+};
 
 pub const Target = union(enum) {
     local: scope_mod.LocalSymbol,
@@ -33,6 +40,7 @@ pub const Target = union(enum) {
     field: struct { owner: symbols.StructSymbol, field: symbols.FieldSymbol },
     variant: struct { owner: symbols.EnumSymbol, variant: symbols.VariantSymbol },
     import: symbols.ImportSymbol,
+    builtin: BuiltinRef,
 };
 
 pub const Resolved = struct {
@@ -53,6 +61,7 @@ pub fn targetPosition(target: Target) tk.Position {
         .field => |f| f.field.pos,
         .variant => |v| v.variant.pos,
         .import => |i| i.path_pos,
+        .builtin => |b| b.pos,
     };
 }
 
@@ -66,6 +75,7 @@ pub fn targetNameLen(target: Target) usize {
         .field => |f| f.field.field.name.len,
         .variant => |v| v.variant.name.len,
         .import => |i| i.path.len + 2, // + surrounding quotes
+        .builtin => |b| b.name.len,
     };
 }
 
@@ -82,6 +92,7 @@ pub fn resolveAt(gpa: std.mem.Allocator, analysis: *const workspace.Analysis, mo
 
     if (role == .import_path) return resolveImportPath(analysis, mod_analysis, tokens[idx]);
     if (role == .field_or_variant or role == .method_call) return resolveMember(gpa, analysis, mod_analysis, tokens, idx, role);
+    if (resolveBuiltin(mod_analysis, tokens, idx)) |r| return r;
 
     const name = tokens[idx].lexeme;
     const file_symbols = mod_analysis.symbols;
@@ -179,6 +190,25 @@ fn resolveMember(gpa: std.mem.Allocator, analysis: *const workspace.Analysis, mo
         if (std.mem.eql(u8, fld.field.name, name)) return .{ .target = .{ .field = .{ .owner = sr.s, .field = fld } }, .module = sr.module };
     }
     return null;
+}
+
+/// Resolves a builtin keyword-form operation (`ord`, `len`, `getenv`, ...)
+/// — see builtins.zig for why these need a hand-maintained table rather
+/// than an AST lookup. `int`/`float` double as `<type>` keywords, so they
+/// only resolve here when immediately followed by '(' (their call form) —
+/// the same followed-by-call heuristic `tokens.zig`'s `roleOf` uses to
+/// tell an identifier `call` from a `variable`.
+fn resolveBuiltin(mod_analysis: workspace.ModuleAnalysis, tokens: []const tk.Token, idx: usize) ?Resolved {
+    const tok = tokens[idx];
+    const info = builtins.lookup(tok.type) orelse return null;
+    if (builtins.requiresCallParen(tok.type)) {
+        const next: ?tk.Token = if (idx + 1 < tokens.len) tokens[idx + 1] else null;
+        if (next == null or next.?.type != .lparen) return null;
+    }
+    return .{
+        .target = .{ .builtin = .{ .name = tok.lexeme, .pos = tk.Position.fromToken(tok), .info = info } },
+        .module = mod_analysis,
+    };
 }
 
 fn resolveImportPath(analysis: *const workspace.Analysis, mod_analysis: workspace.ModuleAnalysis, tok: tk.Token) ?Resolved {
@@ -314,4 +344,45 @@ test "resolveAt resolves an import path to its target module" {
     try testing.expect(r != null);
     try testing.expect(r.?.target == .import);
     try testing.expectEqualStrings("math.std.butter", r.?.module.mod.path);
+}
+
+test "resolveAt resolves a builtin keyword-form call like ord(...)" {
+    const gpa = testing.allocator;
+    var a = try analyzeOk(gpa, "print ord(\"x\")\n");
+    defer a.deinit();
+    const mod = a.findModule("<test>").?;
+
+    // "ord" on line 0, right after "print ".
+    const r = resolveAt(gpa, &a, mod, .{ .line = 0, .character = 7 });
+    try testing.expect(r != null);
+    try testing.expect(r.?.target == .builtin);
+    try testing.expectEqualStrings("ord", r.?.target.builtin.name);
+    try testing.expectEqualStrings("func ord(string) -> int", r.?.target.builtin.info.signature);
+}
+
+test "resolveAt resolves int(...)'s call form but not int's <type> keyword use" {
+    const gpa = testing.allocator;
+    var a = try analyzeOk(gpa, "int x := int(\"5\")\n");
+    defer a.deinit();
+    const mod = a.findModule("<test>").?;
+
+    // The leading "int" (the <type> keyword) at line 0, character 0.
+    const type_use = resolveAt(gpa, &a, mod, .{ .line = 0, .character = 0 });
+    try testing.expect(type_use == null);
+
+    // The call-form "int(" starting at character 9.
+    const call_use = resolveAt(gpa, &a, mod, .{ .line = 0, .character = 9 });
+    try testing.expect(call_use != null);
+    try testing.expect(call_use.?.target == .builtin);
+    try testing.expectEqualStrings("int", call_use.?.target.builtin.name);
+}
+
+test "resolveAt does not resolve an ordinary syntax keyword like 'if'" {
+    const gpa = testing.allocator;
+    var a = try analyzeOk(gpa, "if true {\n    print 1\n}\n");
+    defer a.deinit();
+    const mod = a.findModule("<test>").?;
+
+    const r = resolveAt(gpa, &a, mod, .{ .line = 0, .character = 0 });
+    try testing.expect(r == null);
 }

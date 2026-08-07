@@ -54,8 +54,14 @@ fn render(allocator: std.mem.Allocator, r: resolve.Resolved) ![]const u8 {
         },
         .variant => |vr| try w.print("```butter\n{s}.{s}\n```", .{ vr.owner.name, vr.variant.name }),
         .import => |i| try w.print("```butter\nimport \"{s}\"\n```", .{i.path}),
+        .builtin => |b| try renderBuiltin(w, b),
     }
     return out.toOwnedSlice();
+}
+
+fn renderBuiltin(w: *std.Io.Writer, b: resolve.BuiltinRef) !void {
+    try w.print("```butter\n{s}\n```", .{b.info.signature});
+    try writeDoc(w, b.info.doc);
 }
 
 fn renderFunctionSig(w: *std.Io.Writer, allocator: std.mem.Allocator, f: symbols.FunctionSymbol, is_method: bool) !void {
@@ -223,6 +229,20 @@ test "hover renders a struct field's declared type" {
     try testing.expect(std.mem.indexOf(u8, h.contents.value, "int Point.x") != null);
 }
 
+test "hover renders a builtin keyword-form call's signature and doc" {
+    const gpa = testing.allocator;
+    var a = try analyzeOk(gpa, "print ord(\"x\")\n");
+    defer a.deinit();
+    const mod = a.findModule("<test>").?;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    // "ord" on line 0, right after "print ".
+    const h = (try hover(arena_state.allocator(), &a, mod, .{ .line = 0, .character = 7 })).?;
+    try testing.expect(std.mem.indexOf(u8, h.contents.value, "func ord(string) -> int") != null);
+    try testing.expect(std.mem.indexOf(u8, h.contents.value, "byte value") != null);
+}
+
 test "hover returns null when nothing resolves" {
     const gpa = testing.allocator;
     var a = try analyzeOk(gpa, "print 1\n");
@@ -231,6 +251,10 @@ test "hover returns null when nothing resolves" {
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const h = try hover(arena_state.allocator(), &a, mod, .{ .line = 0, .character = 0 });
+    // "1" (a plain literal, not a builtin keyword or declared symbol) at
+    // character 6 — "print" itself (character 0) now resolves as a
+    // builtin keyword-form op, so it's no longer a valid "nothing here"
+    // case for this test.
+    const h = try hover(arena_state.allocator(), &a, mod, .{ .line = 0, .character = 6 });
     try testing.expect(h == null);
 }

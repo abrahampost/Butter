@@ -23,6 +23,7 @@ const symbols = @import("symbols.zig");
 const scope_mod = @import("scope.zig");
 const protocol = @import("protocol.zig");
 const tk = @import("tokens.zig");
+const builtins = @import("builtins.zig");
 
 const keywords = [_][]const u8{
     "print", "if",     "else",    "while",  "or",     "and",    "true",
@@ -97,7 +98,13 @@ fn findContext(tokens: []const tk.Token, pos: tk.Position) struct { ctx: Context
 fn completeGeneral(allocator: std.mem.Allocator, analysis: *const workspace.Analysis, mod_analysis: workspace.ModuleAnalysis, pos: protocol.Position, prefix: []const u8, out: *std.ArrayList(protocol.CompletionItem)) !void {
     for (keywords) |kw| {
         if (std.mem.startsWith(u8, kw, prefix)) {
-            try out.append(allocator, .{ .label = kw, .kind = protocol.CompletionItemKind.keyword });
+            const info = builtins.lookupByName(kw);
+            try out.append(allocator, .{
+                .label = kw,
+                .kind = protocol.CompletionItemKind.keyword,
+                .detail = if (info) |i| i.signature else null,
+                .documentation = if (info) |i| i.doc else null,
+            });
         }
     }
 
@@ -253,6 +260,32 @@ test "complete offers keywords and top-level symbols filtered by prefix" {
     const items = try complete(arena_state.allocator(), &a, mod, "he", .{ .line = 0, .character = 2 });
     try testing.expect(hasLabel(items, "helper"));
     try testing.expect(!hasLabel(items, "if")); // "he" doesn't prefix "if"
+}
+
+fn itemFor(items: []const protocol.CompletionItem, label: []const u8) ?protocol.CompletionItem {
+    for (items) |it| {
+        if (std.mem.eql(u8, it.label, label)) return it;
+    }
+    return null;
+}
+
+test "complete attaches a builtin keyword's signature/doc as detail/documentation" {
+    const gpa = testing.allocator;
+    var a = try analyzeOk(gpa, "print 1\n");
+    defer a.deinit();
+    const mod = a.findModule("<test>").?;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const items = try complete(arena_state.allocator(), &a, mod, "or", .{ .line = 0, .character = 2 });
+    const ord_item = itemFor(items, "ord").?;
+    try testing.expectEqualStrings("func ord(string) -> int", ord_item.detail.?);
+    try testing.expect(ord_item.documentation != null);
+
+    // "or" itself (the plain logical-operator keyword) has no builtin
+    // entry, so it gets no detail/documentation.
+    const or_item = itemFor(items, "or").?;
+    try testing.expect(or_item.detail == null);
 }
 
 test "complete offers a local/param inside its own function" {
