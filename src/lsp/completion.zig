@@ -33,8 +33,7 @@ const keywords = [_][]const u8{
     "list",  "push",   "keys",    "has",    "delete", "json",   "stringify",
     "null",  "args",   "getenv",  "hasenv", "exit",   "throw",  "try",
     "catch", "exists", "listDir", "remove", "rename", "mkdir",  "exec",
-    "now",   "random", "struct",  "enum",   "ord",    "chr",
-    "join",
+    "now",   "random", "struct",  "enum",   "ord",    "chr",    "join",
 };
 
 const stdlib_imports = [_][]const u8{ "math.std.butter", "collections.std.butter", "string.std.butter", "io.std.butter" };
