@@ -5,6 +5,7 @@
   "repository": {},
   "version": "0.1.0",
   "publisher": "zbutter",
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.75.0"
   },
