@@ -25,6 +25,10 @@ pub const FunctionSymbol = struct {
     name_pos: Position,
     /// Zero-based line the declaration starts on (its `func` keyword).
     line: u32,
+    /// The `##`-prefixed doc comment directly above this declaration, if
+    /// any — see `tokens.zig`'s `docCommentAbove`. Rendered by hover.zig
+    /// below the declaration's signature.
+    doc: ?[]const u8 = null,
     /// Zero-based line its closing '}' is on, when found — used for a
     /// DocumentSymbol's `range` (the whole body), vs. `name_pos`'s own
     /// point position (its `selectionRange`).
@@ -157,12 +161,14 @@ fn paramSymbols(allocator: std.mem.Allocator, tokens: []const Token, open_idx: ?
     return out;
 }
 
-/// Builds `FileSymbols` for one parsed file. `tokens` must be the result
-/// of tokenizing that SAME file's source text (tokens.zig's `tokenize`) —
+/// Builds `FileSymbols` for one parsed file. `tokens` and `source` must
+/// both be that SAME file's own tokens/text (tokens.zig's `tokenize`) —
 /// mismatched tokens/AST silently recovers wrong (or no) positions rather
 /// than crashing, since every lookup here is a best-effort textual search,
-/// not a structural one.
-pub fn build(allocator: std.mem.Allocator, program: ast.Program, tokens: []const Token) !FileSymbols {
+/// not a structural one. `source` is used only for `docCommentAbove` — a
+/// raw-line scan, since doc comments never reach the token stream (the
+/// real lexer discards all `#` comments).
+pub fn build(allocator: std.mem.Allocator, program: ast.Program, tokens: []const Token, source: []const u8) !FileSymbols {
     var functions: std.ArrayList(FunctionSymbol) = .empty;
     var structs: std.ArrayList(StructSymbol) = .empty;
     var enums: std.ArrayList(EnumSymbol) = .empty;
@@ -179,6 +185,7 @@ pub fn build(allocator: std.mem.Allocator, program: ast.Program, tokens: []const
                     .name = f.name,
                     .name_pos = posOf(name_tok, stmt.line),
                     .line = @intCast(stmt.line - 1),
+                    .doc = try tk.docCommentAbove(allocator, source, stmt.line),
                     .end_line = endLineOf(tokens, body_open, stmt.line),
                     .params = try paramSymbols(allocator, tokens, open_idx, f.params, stmt.line),
                     .return_type = f.return_type,
@@ -201,6 +208,7 @@ pub fn build(allocator: std.mem.Allocator, program: ast.Program, tokens: []const
                     .name = md.name,
                     .name_pos = posOf(name_tok, stmt.line),
                     .line = @intCast(stmt.line - 1),
+                    .doc = try tk.docCommentAbove(allocator, source, stmt.line),
                     .end_line = endLineOf(tokens, body_open, stmt.line),
                     .params = try paramSymbols(allocator, tokens, open_idx, md.params, stmt.line),
                     .return_type = md.return_type,
@@ -302,7 +310,7 @@ fn parseAndBuild(arena: std.mem.Allocator, source: []const u8) !struct {
     const tokens = try tk.tokenize(arena, source);
     var parser = butter.parser.Parser.init(arena, tokens);
     const program = try parser.parseProgram();
-    const symbols = try build(arena, program, tokens);
+    const symbols = try build(arena, program, tokens, source);
     return .{ .symbols = symbols };
 }
 
@@ -319,6 +327,29 @@ test "build recovers a function's name position and parameter positions" {
     try testing.expectEqual(@as(usize, 2), f.params.len);
     try testing.expectEqualStrings("a", f.params[0].param.name);
     try testing.expectEqual(@as(u32, 2), f.end_line);
+}
+
+test "build attaches a multi-line '##' doc comment to a function, but not a plain '#' comment" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const result = try parseAndBuild(arena_state.allocator(),
+        \\## Adds two numbers together.
+        \\## Returns their sum.
+        \\func add(int a, int b) -> int {
+        \\    return a + b
+        \\}
+        \\# not a doc comment
+        \\func sub(int a, int b) -> int {
+        \\    return a - b
+        \\}
+        \\
+    );
+
+    const add = result.symbols.findFunction("add").?;
+    try testing.expectEqualStrings("Adds two numbers together.\nReturns their sum.", add.doc.?);
+
+    const sub = result.symbols.findFunction("sub").?;
+    try testing.expect(sub.doc == null);
 }
 
 test "build recovers a method's receiver and name position" {

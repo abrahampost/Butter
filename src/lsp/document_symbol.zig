@@ -104,7 +104,7 @@ fn buildFor(arena: std.mem.Allocator, source: []const u8) ![]const protocol.Docu
     const tokens = try tk.tokenize(arena, source);
     var parser = butter.parser.Parser.init(arena, tokens);
     const program = try parser.parseProgram();
-    const file_symbols = try symbols.build(arena, program, tokens);
+    const file_symbols = try symbols.build(arena, program, tokens, source);
     return build(arena, file_symbols, source);
 }
 

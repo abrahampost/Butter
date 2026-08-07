@@ -6,6 +6,8 @@ func square(int n) -> int {
     return n * n
 }
 
+## Returns the max of two integers
+## Multi-lines work as expected
 func max(int a, int b) -> int {
     if a > b {
         return a

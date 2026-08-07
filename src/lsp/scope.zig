@@ -193,7 +193,7 @@ fn buildScope(arena: std.mem.Allocator, source: []const u8) !FunctionScope {
     const tokens = try tk.tokenize(arena, source);
     var parser = butter.parser.Parser.init(arena, tokens);
     const program = try parser.parseProgram();
-    const file_symbols = try symbols.build(arena, program, tokens);
+    const file_symbols = try symbols.build(arena, program, tokens, source);
     return build(arena, tokens, file_symbols.functions[0]);
 }
 
@@ -274,10 +274,11 @@ test "resolve finds a try/catch error variable, typed as the built-in Error stru
 test "resolve finds a method's receiver binding" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const tokens = try tk.tokenize(arena_state.allocator(), "struct Point { int x }\nfunc (Point p) getX() -> int {\n    return p.x\n}\n");
+    const source = "struct Point { int x }\nfunc (Point p) getX() -> int {\n    return p.x\n}\n";
+    const tokens = try tk.tokenize(arena_state.allocator(), source);
     var parser = butter.parser.Parser.init(arena_state.allocator(), tokens);
     const program = try parser.parseProgram();
-    const file_symbols = try symbols.build(arena_state.allocator(), program, tokens);
+    const file_symbols = try symbols.build(arena_state.allocator(), program, tokens, source);
     const scope = try build(arena_state.allocator(), tokens, file_symbols.functions[0]);
 
     const recv = scope.resolve("p", 2);

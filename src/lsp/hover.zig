@@ -3,6 +3,13 @@
 //! expression-level type inference (e.g. hovering `a + b` to see the
 //! result type) — that needs the compiler's `inferType`, which has no
 //! standalone entry point today; see the top-level design plan.
+//!
+//! A function/method's hover also appends its doc comment (`symbols.
+//! FunctionSymbol.doc`, populated from source lines directly above the
+//! declaration that start with `##` — see `tokens.zig`'s
+//! `docCommentAbove`), below the signature's code fence. `writeDoc` joins
+//! its lines with a Markdown hard break rather than `d`'s own bare `\n`
+//! separators, so each `##` line still renders on its own line.
 
 const std = @import("std");
 const butter = @import("butter");
@@ -66,6 +73,24 @@ fn renderFunctionSig(w: *std.Io.Writer, allocator: std.mem.Allocator, f: symbols
     }
     const ret_t = try typeText(allocator, f.return_type, f.return_named_type, null, f.return_array_size);
     try w.print(") -> {s}\n```", .{ret_t});
+    if (f.doc) |d| try writeDoc(w, d);
+}
+
+/// Writes a (possibly multi-line) doc comment as Markdown, preceded by a
+/// blank line to separate it from the signature's code fence. `d`'s lines
+/// are joined with a Markdown HARD line break (two trailing spaces before
+/// the newline) rather than a bare `\n` — a bare `\n` is only a "soft"
+/// break, which Markdown renderers (including VS Code's hover popup)
+/// collapse into a single space, running every `##` line together.
+fn writeDoc(w: *std.Io.Writer, d: []const u8) !void {
+    try w.writeAll("\n\n");
+    var lines = std.mem.splitScalar(u8, d, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try w.writeAll("  \n");
+        try w.writeAll(line);
+        first = false;
+    }
 }
 
 fn renderStruct(w: *std.Io.Writer, allocator: std.mem.Allocator, s: symbols.StructSymbol) !void {
@@ -153,6 +178,30 @@ test "hover renders a function's signature" {
     defer arena_state.deinit();
     const h = (try hover(arena_state.allocator(), &a, mod, .{ .line = 3, .character = 7 })).?;
     try testing.expect(std.mem.indexOf(u8, h.contents.value, "func add(int a, int b) -> int") != null);
+}
+
+test "hover appends a function's multi-line '##' doc comment below its signature" {
+    const gpa = testing.allocator;
+    var a = try analyzeOk(gpa,
+        \\## Adds two numbers together.
+        \\## Returns their sum.
+        \\func add(int a, int b) -> int {
+        \\    return a + b
+        \\}
+        \\print add(1, 2)
+        \\
+    );
+    defer a.deinit();
+    const mod = a.findModule("<test>").?;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const h = (try hover(arena_state.allocator(), &a, mod, .{ .line = 5, .character = 6 })).?;
+    try testing.expect(std.mem.indexOf(u8, h.contents.value, "func add(int a, int b) -> int") != null);
+    // Lines are joined with a Markdown hard break ("  \n"), not a bare
+    // "\n", so a renderer shows them on separate lines instead of
+    // collapsing the soft break into a single space.
+    try testing.expect(std.mem.indexOf(u8, h.contents.value, "Adds two numbers together.  \nReturns their sum.") != null);
 }
 
 test "hover renders a struct field's declared type" {

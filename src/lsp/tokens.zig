@@ -91,6 +91,41 @@ fn lineText(source: []const u8, line_idx: u32) ?[]const u8 {
     return source[start..end];
 }
 
+/// The doc comment for a declaration starting on 1-based source line
+/// `decl_line` (`ast.Stmt.line`): a contiguous run of `##`-prefixed lines
+/// ending immediately above it, joined with `\n` after stripping each
+/// line's leading `##` (and one following space, if present). The real
+/// lexer discards every `#` comment outright as insignificant whitespace
+/// (see `lexer.zig`'s `skipInsignificantWhitespace`), so this scans
+/// `source`'s raw lines directly rather than the token stream, mirroring
+/// `lineText` above.
+///
+/// A single `#` (not `##`) comment, a blank line, or any other non-`##`
+/// line directly above `decl_line` stops the scan without being
+/// included — a doc comment must sit immediately adjacent to its
+/// declaration, no gap. Returns `null` when there's no `##` line directly
+/// above.
+pub fn docCommentAbove(allocator: std.mem.Allocator, source: []const u8, decl_line: usize) !?[]const u8 {
+    if (decl_line < 2) return null;
+    var collected: std.ArrayList([]const u8) = .empty;
+    defer collected.deinit(allocator);
+
+    var idx: u32 = @intCast(decl_line - 2);
+    while (true) {
+        const raw = lineText(source, idx) orelse break;
+        const trimmed = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "##")) break;
+        var text = trimmed[2..];
+        if (text.len > 0 and text[0] == ' ') text = text[1..];
+        try collected.append(allocator, text);
+        if (idx == 0) break;
+        idx -= 1;
+    }
+    if (collected.items.len == 0) return null;
+    std.mem.reverse([]const u8, collected.items);
+    return try std.mem.join(allocator, "\n", collected.items);
+}
+
 /// Byte offset in `line` of the codepoint `target` UTF-16 code units in
 /// (rounding down to a codepoint boundary if `target` would otherwise
 /// land inside a surrogate pair — not reachable from a spec-conforming
@@ -548,6 +583,34 @@ test "fromUtf16 handles a position past the end of the source gracefully" {
     const pos = Position.fromUtf16(source, .{ .line = 5, .character = 2 });
     try testing.expectEqual(@as(u32, 5), pos.line);
     try testing.expectEqual(@as(u32, 2), pos.character);
+}
+
+test "docCommentAbove joins consecutive '##' lines, stripping the marker and one space" {
+    const allocator = testing.allocator;
+    const source = "## Adds two numbers.\n## Returns their sum.\nfunc add(int a, int b) -> int {\n    return a + b\n}\n";
+    const doc = try docCommentAbove(allocator, source, 3);
+    defer allocator.free(doc.?);
+    try testing.expectEqualStrings("Adds two numbers.\nReturns their sum.", doc.?);
+}
+
+test "docCommentAbove stops at a blank line and does not reach further" {
+    const allocator = testing.allocator;
+    const source = "## unreachable, separated by a blank line\n\nfunc f() -> int {\n    return 1\n}\n";
+    const doc = try docCommentAbove(allocator, source, 3);
+    try testing.expect(doc == null);
+}
+
+test "docCommentAbove ignores a single '#' comment line" {
+    const allocator = testing.allocator;
+    const source = "# just a regular comment\nfunc f() -> int {\n    return 1\n}\n";
+    const doc = try docCommentAbove(allocator, source, 2);
+    try testing.expect(doc == null);
+}
+
+test "docCommentAbove returns null when nothing precedes the declaration" {
+    const allocator = testing.allocator;
+    const doc = try docCommentAbove(allocator, "func f() -> int {\n    return 1\n}\n", 1);
+    try testing.expect(doc == null);
 }
 
 test "findKeywordOnLine locates a declaration's leading keyword by line" {

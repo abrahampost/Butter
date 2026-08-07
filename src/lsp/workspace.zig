@@ -172,7 +172,7 @@ pub fn analyze(gpa: std.mem.Allocator, io: std.Io, source: []const u8, key: []co
             // than failing the whole pass over one file's position data.
             else => continue,
         };
-        const file_symbols = symbols.build(loader.allocator(), m.program, toks) catch |err| return err;
+        const file_symbols = symbols.build(loader.allocator(), m.program, toks, text) catch |err| return err;
         for (file_symbols.imports, 0..) |*imp, i| {
             if (i < m.imports.len) imp.resolved = m.imports[i];
         }
