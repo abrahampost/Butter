@@ -2,9 +2,14 @@
   "name": "butter-language",
   "displayName": "Butter Language",
   "description": "Syntax highlighting and language server support (diagnostics, hover, go-to-definition, completion) for the Butter programming language (.butter)",
-  "repository": {},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abrahampost/butter.git",
+    "directory": "editors/vscode-butter"
+  },
+  "license": "MIT",
   "version": "0.1.0",
-  "publisher": "zbutter",
+  "publisher": "butter",
   "icon": "icon.png",
   "engines": {
     "vscode": "^1.75.0"
@@ -40,7 +45,7 @@
         "butter.lsp.path": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the `butter-lsp` executable. Supports `${workspaceFolder}`. Leave empty to look it up on `PATH` (`butter-lsp` / `butter-lsp.exe`) — see [Language Server](https://github.com/abrahampost/Butter#language-server) for how to build/install it."
+          "markdownDescription": "Path to the `butter-lsp` executable. Supports `${workspaceFolder}`. Leave empty to use the server bundled with this extension, falling back to `PATH` (`butter-lsp` / `butter-lsp.exe`) if no bundled binary is present — see [Language Server](https://github.com/abrahampost/Butter#language-server) for how to build/install one yourself."
         }
       }
     }
@@ -49,7 +54,20 @@
     "vscode:prepublish": "npm run compile",
     "compile": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node18",
     "watch": "npm run compile -- --watch",
-    "package": "vsce package"
+    "stage-lsp": "node scripts/stage-lsp-binary.js",
+    "package": "npm run stage-lsp && vsce package",
+    "package:win32-x64": "node scripts/stage-lsp-binary.js win32-x64 && vsce package --target win32-x64",
+    "package:linux-x64": "node scripts/stage-lsp-binary.js linux-x64 && vsce package --target linux-x64",
+    "package:linux-arm64": "node scripts/stage-lsp-binary.js linux-arm64 && vsce package --target linux-arm64",
+    "package:darwin-x64": "node scripts/stage-lsp-binary.js darwin-x64 && vsce package --target darwin-x64",
+    "package:darwin-arm64": "node scripts/stage-lsp-binary.js darwin-arm64 && vsce package --target darwin-arm64",
+    "package:all": "npm run package:win32-x64 && npm run package:linux-x64 && npm run package:linux-arm64 && npm run package:darwin-x64 && npm run package:darwin-arm64",
+    "publish:win32-x64": "node scripts/stage-lsp-binary.js win32-x64 && vsce publish --target win32-x64",
+    "publish:linux-x64": "node scripts/stage-lsp-binary.js linux-x64 && vsce publish --target linux-x64",
+    "publish:linux-arm64": "node scripts/stage-lsp-binary.js linux-arm64 && vsce publish --target linux-arm64",
+    "publish:darwin-x64": "node scripts/stage-lsp-binary.js darwin-x64 && vsce publish --target darwin-x64",
+    "publish:darwin-arm64": "node scripts/stage-lsp-binary.js darwin-arm64 && vsce publish --target darwin-arm64",
+    "publish:all": "npm run publish:win32-x64 && npm run publish:linux-x64 && npm run publish:linux-arm64 && npm run publish:darwin-x64 && npm run publish:darwin-arm64"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -57,6 +75,7 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^3.2.1",
     "esbuild": "^0.28.1",
     "typescript": "^5.4.5"
   }

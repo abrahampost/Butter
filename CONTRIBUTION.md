@@ -70,6 +70,20 @@ to `master` — run the first two locally before opening a PR.
 ## Releases
 
 Tagging a commit `vX.Y.Z` and pushing the tag triggers
-`.github/workflows/release.yml`, which builds stripped `ReleaseFast`
-binaries for the target triples in `build.zig`'s `release` step
-(`zig build release`) and publishes them to a GitHub Release.
+`.github/workflows/release.yml`, which:
+
+1. Builds stripped `ReleaseFast` `butter` and `butter-lsp` binaries for
+   the target triples in `build.zig`'s `release` step (`zig build
+   release`) and publishes archives of them to a GitHub Release.
+2. Packages [editors/vscode-butter](editors/vscode-butter/) into a
+   `.vsix` per platform (each bundling that platform's `butter-lsp`,
+   staged via `scripts/stage-lsp-binary.js`), uploads those to the same
+   GitHub Release, and — if the `VSCE_PAT` repo secret is set — publishes
+   them to the VS Code Marketplace under the `zbutter` publisher. The
+   extension's published version always tracks the tag, regardless of
+   the `version` checked into `editors/vscode-butter/package.json`.
+
+Publishing to the Marketplace requires a one-time setup: a Marketplace
+publisher named `zbutter` and a Personal Access Token stored as the
+`VSCE_PAT` repo secret. Without that secret, the workflow still runs the
+GitHub Release steps and simply skips the Marketplace publish step.

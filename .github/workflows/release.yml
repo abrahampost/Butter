@@ -18,16 +18,16 @@ jobs:
 
       - run: zig build release
 
-      - name: Package binaries
+      - name: Package CLI + LSP binaries
         run: |
           set -euo pipefail
           mkdir -p dist
           for dir in zig-out/release/*/; do
             triple="$(basename "$dir")"
             if [ -f "$dir/butter.exe" ]; then
-              (cd "$dir" && zip -j "$OLDPWD/dist/butter-${triple}.zip" butter.exe)
+              (cd "$dir" && zip -j "$OLDPWD/dist/butter-${triple}.zip" butter.exe butter-lsp.exe)
             else
-              tar -C "$dir" -czf "dist/butter-${triple}.tar.gz" butter
+              tar -C "$dir" -czf "dist/butter-${triple}.tar.gz" butter butter-lsp
             fi
           done
 
@@ -35,3 +35,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "${{ github.ref_name }}" dist/* --title "${{ github.ref_name }}" --generate-notes
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install extension dependencies
+        working-directory: editors/vscode-butter
+        run: npm ci
+
+      - name: Package VS Code extension for every platform
+        working-directory: editors/vscode-butter
+        run: |
+          set -euo pipefail
+          # Extension version tracks the release tag (v0.2.0 -> 0.2.0),
+          # not whatever's checked into package.json.
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          mkdir -p dist-vsix
+          for target in win32-x64 linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            node scripts/stage-lsp-binary.js "$target"
+            npx vsce package --target "$target" --out "dist-vsix/butter-language-${target}-${VERSION}.vsix"
+          done
+
+      - name: Upload extension packages to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" editors/vscode-butter/dist-vsix/*.vsix
+
+      - name: Publish to VS Code Marketplace
+        if: ${{ secrets.VSCE_PAT != '' }}
+        working-directory: editors/vscode-butter
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx vsce publish --packagePath dist-vsix/*.vsix

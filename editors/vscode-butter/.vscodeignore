@@ -1,4 +1,5 @@
 src/**
+scripts/**
 node_modules/**
 out/**
 tsconfig.json

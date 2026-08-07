@@ -184,7 +184,7 @@ pub fn build(b: *std.Build) void {
         .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }, .name = "x86_64-windows-gnu" },
     };
 
-    const release_step = b.step("release", "Build stripped ReleaseFast binaries for common target triples into zig-out/release/<triple>/");
+    const release_step = b.step("release", "Build stripped ReleaseFast binaries (butter, butter-lsp) for common target triples into zig-out/release/<triple>/");
     for (release_targets) |release_target| {
         const release_target_resolved = b.resolveTargetQuery(release_target.query);
 
@@ -211,5 +211,23 @@ pub fn build(b: *std.Build) void {
             .dest_dir = .{ .override = .{ .custom = b.pathJoin(&.{ "release", release_target.name }) } },
         });
         release_step.dependOn(&install_release_exe.step);
+
+        const release_lsp_exe = b.addExecutable(.{
+            .name = "butter-lsp",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/lsp_main.zig"),
+                .target = release_target_resolved,
+                .optimize = .ReleaseFast,
+                .strip = true,
+                .imports = &.{
+                    .{ .name = "butter", .module = release_mod },
+                },
+            }),
+        });
+
+        const install_release_lsp_exe = b.addInstallArtifact(release_lsp_exe, .{
+            .dest_dir = .{ .override = .{ .custom = b.pathJoin(&.{ "release", release_target.name }) } },
+        });
+        release_step.dependOn(&install_release_lsp_exe.step);
     }
 }

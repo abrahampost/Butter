@@ -4,6 +4,8 @@
 // file's only job is starting it as a language server child process and
 // wiring it to VS Code's document/language APIs via vscode-languageclient.
 
+import * as fs from "fs";
+import * as path from "path";
 import * as vscode from "vscode";
 import {
   LanguageClient,
@@ -14,10 +16,11 @@ import {
 
 let client: LanguageClient | undefined;
 
-// No path override configured: fall back to PATH lookup, matching how
-// every other Butter CLI tool (butter itself) is expected to be
-// installed — see this extension's README for setup instructions.
-function resolveServerCommand(): string {
+// Priority: explicit `butter.lsp.path` override, then the platform
+// binary bundled into this extension's own `bin/` folder (see
+// scripts/stage-lsp-binary.js), then a PATH lookup for source/dev
+// builds that didn't go through the packaging step.
+function resolveServerCommand(context: vscode.ExtensionContext): string {
   const configured = vscode.workspace
     .getConfiguration("butter")
     .get<string>("lsp.path");
@@ -28,12 +31,18 @@ function resolveServerCommand(): string {
     }
     return configured;
   }
-  return process.platform === "win32" ? "butter-lsp.exe" : "butter-lsp";
+
+  const binaryName = process.platform === "win32" ? "butter-lsp.exe" : "butter-lsp";
+  const bundled = context.asAbsolutePath(path.join("bin", binaryName));
+  if (fs.existsSync(bundled)) {
+    return bundled;
+  }
+  return binaryName;
 }
 
-export function activate(_context: vscode.ExtensionContext): void {
+export function activate(context: vscode.ExtensionContext): void {
   const serverOptions: ServerOptions = {
-    command: resolveServerCommand(),
+    command: resolveServerCommand(context),
     args: [],
     transport: TransportKind.stdio,
   };
