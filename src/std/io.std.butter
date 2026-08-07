@@ -1,0 +1,15 @@
+## Reads an entire file and returns it as a default encoded string
+export func readFile(string path) -> string {
+    int f := open(path, read)
+    list bytes
+    int[256] buf
+    int n := read(f, buf)
+    while n > 0 {
+        for i in 0..n {
+            push(bytes, chr(buf[i]))
+        }
+        n := read(f, buf)
+    }
+    close f
+    return join(bytes, "")
+}

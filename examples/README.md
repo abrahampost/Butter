@@ -11,6 +11,7 @@
 | [stdlib_math.butter](stdlib_math.butter) | **Runs today** | `import "math.std.butter"` — the bundled standard library (src/stdlib.zig), resolved by name and embedded in the `butter` binary rather than read from a file on disk (ISA.bnf section 8). |
 | [stdlib_collections.butter](stdlib_collections.butter) | **Runs today** | `import "collections.std.butter"` — `Set`, `Stack`, and `Queue`, each a struct wrapping a `map` with the operations exposed as struct methods (src/std/collections.std.butter, GRAMMAR.bnf design note 3af): set union/intersection/difference/equality, LIFO add/pop/peek, and FIFO enqueue/dequeue/peek. |
 | [stdlib_string.butter](stdlib_string.butter) | **Runs today** | `import "string.std.butter"` — trim/case conversion/reverse, search (`contains`/`startsWith`/`endsWith`/`indexOf`), `split`/`join`/`replace`, `padStart`/`padEnd`/`repeat`, and character classification (`isDigit`/`isAlpha`/`isSpace`), all pure Butter (src/std/string.std.butter) built on the core language's byte-indexed strings plus the `ord`/`join` builtins. |
+| [stdlib_io.butter](stdlib_io.butter) | **Runs today** | `import "io.std.butter"` — `readFile(path) -> string`, the whole contents of a file in one call, pure Butter (src/std/io.std.butter) built on `open`/`read`/`close` plus `chr` (ord's inverse, GRAMMAR.bnf design note 3ab) and `join`. Creates/overwrites `examples/io_greeting.txt`. |
 | [io.butter](io.butter) | **Runs today** | `read`/`write` against `stdin`, `stdout`, and `stderr` — `write` as `print` without the newline, a short-read copy loop over a byte buffer, and a generic `int[]` buffer serving every size (GRAMMAR.bnf design note 3k, ISA.bnf section 9). Needs input piped in. |
 | [files.butter](files.butter) | **Runs today** | `open`/`read`/`write`/`close` against a real file — `write`/`append`/`read` modes, and a stream that's now a genuine runtime value rather than only ever one of `stdin`/`stdout`/`stderr` (GRAMMAR.bnf design note 3l, ISA.bnf section 10). Creates/overwrites `examples/greeting.txt`. |
 | [json.butter](json.butter) | **Runs today** | `map`/`list` as first-class heap values, bracket-indexing that chains through nested values, `has`/`keys`, `json(...)` parsing a byte buffer read from a real file into a map/list tree, and `stringify(...)` rendering a value back into (properly escaped) JSON text and writing it out again (GRAMMAR.bnf design notes 3m/3n/3o, ISA.bnf sections 11/12/13). Reads [data.json](data.json); creates/overwrites `dump.json`. |
@@ -33,6 +34,7 @@ zig build run -- examples/imports.butter
 zig build run -- examples/stdlib_math.butter
 zig build run -- examples/stdlib_collections.butter
 zig build run -- examples/stdlib_string.butter
+zig build run -- examples/stdlib_io.butter
 zig build run -- examples/files.butter
 zig build run -- examples/json.butter
 # or, reading from standard input instead of a file:
@@ -70,6 +72,10 @@ path when the program does its own reading.
 resolves at compile time relative to the importing file) — run it from the
 repo root as shown above, and it will create/overwrite
 `examples/greeting.txt` each time.
+
+`stdlib_io.butter` is the same story — `readFile` resolves its path the
+same way a bare `open` does, so run it from the repo root as shown above,
+and it will create/overwrite `examples/io_greeting.txt` each time.
 
 `json.butter` is the same story — it opens `examples/data.json` relative to
 the current directory, so it also needs to be run from the repo root as

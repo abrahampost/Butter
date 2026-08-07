@@ -1,0 +1,23 @@
+import "io.std.butter"
+
+int f := open("greeting.txt", write)
+write(f, "Hello, Butter!\nSecond line, tab\there.")
+close f
+
+string content := readFile("greeting.txt")
+print content
+print len(content)
+
+# Round-trip a byte string that hits both ends of the ord/chr range (0 and
+# 255) plus an embedded null in the middle, without printing raw control
+# bytes into this test's own expected output.
+list pieces := [chr(0), "mid", chr(255)]
+string raw := join(pieces, "")
+int g := open("raw.bin", write)
+write(g, raw)
+close g
+string roundtripped := readFile("raw.bin")
+print roundtripped == raw
+print len(roundtripped)
+print ord(roundtripped[0..1])
+print ord(roundtripped[(len(roundtripped) - 1)..len(roundtripped)])

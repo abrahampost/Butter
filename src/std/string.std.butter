@@ -18,11 +18,11 @@
 # Unicode-aware implementation of any of them.
 #
 # `toUpper`/`toLower` cover ASCII 'a'..'z'/'A'..'Z' only; every other byte
-# (including any non-ASCII one) passes through unchanged. There is no
-# `chr` (byte -> length-1 string) builtin yet (GRAMMAR.bnf design note
-# 3ab), so both are built from an explicit lookup table (`map`, populated
-# by 26 bracket-assignments) rather than arithmetic on `ord`'s result —
-# once `chr` exists this could shrink to a couple of arithmetic lines.
+# (including any non-ASCII one) passes through unchanged. Both predate
+# `chr` (byte -> length-1 string, GRAMMAR.bnf design note 3ab) and are
+# still built from an explicit lookup table (`map`, populated by 26
+# bracket-assignments) rather than arithmetic on `ord`'s result — could
+# shrink to a couple of arithmetic lines using `chr` now that it exists.
 #
 # Every lookup table here is rebuilt on each call: functions can't read a
 # top-level variable (GRAMMAR.bnf's Functions design note — "no nesting, no

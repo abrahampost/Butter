@@ -1,5 +1,6 @@
 .zig-cache/
 zig-out/
 examples/greeting.txt
+examples/io_greeting.txt
 examples/dump.json
 perf-*.json

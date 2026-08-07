@@ -380,6 +380,10 @@ test "dir_ops: exists/listDir/remove/rename/mkdir against a real scratch directo
     try expectCaseOutputWithFs("dir_ops");
 }
 
+test "io_read_file: the bundled io stdlib's readFile against a real scratch file" {
+    try expectCaseOutputWithFs("io_read_file");
+}
+
 test "time_random: random()/random(a, b) are exactly reproducible under a fixed seed" {
     try expectCaseOutputWithSeed("time_random", 20260804);
 }

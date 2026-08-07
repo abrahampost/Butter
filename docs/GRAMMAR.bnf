@@ -46,12 +46,12 @@ KEYWORD      ::= 'print' | 'if' | 'else' | 'while' | 'or' | 'and'
                | 'stdin' | 'stdout' | 'stderr' | 'append'
                | 'map' | 'list' | 'push' | 'keys' | 'has' | 'delete'
                | 'json' | 'stringify' | 'null' | 'args' | 'exit'
-               | 'try' | 'catch' | 'getenv' | 'hasenv'
+               | 'throw' | 'try' | 'catch' | 'getenv' | 'hasenv'
                | 'exists' | 'listDir' | 'remove' | 'rename' | 'mkdir'
                | 'exec'
                | 'now' | 'random'
                | 'struct' | 'enum'
-               | 'ord' | 'join'
+               | 'ord' | 'chr' | 'join'
 
 OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                | '(' | ')' | '{' | '}' | '[' | ']'
@@ -221,10 +221,10 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <logic-or>          ::= <logic-and> { 'or' <logic-and> }
 <logic-and>         ::= <equality> { 'and' <equality> }
 <equality>          ::= <comparison> { ( '==' | '!=' ) <comparison> }
-<comparison>        ::= <exponent> { ( '>' | '>=' | '<' | '<=' ) <exponent> }
-<exponent>          ::= <addition> { '**' <addition> }
+<comparison>        ::= <addition> { ( '>' | '>=' | '<' | '<=' ) <addition> }
 <addition>          ::= <multiplication> { ( '+' | '-' ) <multiplication> }
-<multiplication>    ::= <unary> { ( '*' | '/' | '%' ) <unary> }
+<multiplication>    ::= <exponent> { ( '*' | '/' | '%' ) <exponent> }
+<exponent>          ::= <unary> { '**' <unary> }
 <unary>             ::= ( '!' | '-' ) <unary>
                       | <primary>
 
@@ -282,6 +282,7 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
                       | <random-expr>
                       | <struct-literal>
                       | <ord-expr>
+                      | <chr-expr>
                       | <join-expr>
                       | 'stdin' | 'stdout' | 'stderr'
                       | 'args'
@@ -377,9 +378,12 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
 <random-expr>        ::= 'random' '(' ')'
                        | 'random' '(' <expression> ',' <expression> ')'
 
-(* Character conversion (design note 3ab). Not a <type> keyword, so a bare
-   `ord(...)` use is a legal <expr-stmt> too, same as getenv/exists/exec. *)
+(* Character conversion (design note 3ab). Neither is a <type> keyword, so a
+   bare `ord(...)`/`chr(...)` use is a legal <expr-stmt> too, same as
+   getenv/exists/exec. `chr` is `ord`'s inverse: INT (0..255) -> length-1
+   STRING. *)
 <ord-expr>           ::= 'ord' '(' <expression> ')'
+<chr-expr>           ::= 'chr' '(' <expression> ')'
 
 (* String join (design note 3ac). Not a <type> keyword, so a bare
    `join(...)` use is a legal <expr-stmt> too, same as ord/getenv/exists. *)
@@ -649,10 +653,14 @@ OP           ::= '+' | '-' | '*' | '**' | '/' | '%'
      still exactly one byte, so it's still a valid `ord` operand (yielding
      that raw byte, 0..255), even though it's never a valid codepoint on
      its own.
-   - Deliberately the narrow half of an `ord`/`chr` pair: only the
-     character-to-byte direction is provided in this pass, matching
-     `int(x)`'s own "only float-to-int, not the reverse" asymmetry above —
-     a `chr`-style byte-to-character builtin is not implemented here. *)
+   - `chr(n)` is the other half of the pair — the byte-to-character
+     direction `ord` deliberately left out above. `n` must be `int`-shaped
+     (`RuntimeError.TypeMismatch` otherwise) and in `0..255`
+     (`RuntimeError.ByteOutOfRange` otherwise, checked rather than
+     truncated/wrapped — the same range check `write`'s `int` buffer
+     argument gets), evaluating to the length-1 `string` whose single byte
+     is `n`. `ord(chr(n)) == n` for every `n` in range, and
+     `chr(ord(s)) == s` for every single-byte `s`. *)
 
 (* --- String join: join(list, sep) (design note 3ac) ---
    - `join(list, sep)` evaluates to a fresh `string`: every element of

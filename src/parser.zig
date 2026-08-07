@@ -969,20 +969,13 @@ pub const Parser = struct {
         });
     }
 
-    /// <comparison> ::= <exponent> { ( '>' | '>=' | '<' | '<=' ) <exponent> }
+    /// <comparison> ::= <addition> { ( '>' | '>=' | '<' | '<=' ) <addition> }
     fn comparison(self: *Parser) Error!*ast.Expr {
-        return self.binaryLevel(exponent, &.{
+        return self.binaryLevel(addition, &.{
             .{ .token = .greater, .op = .gt },
             .{ .token = .greater_equal, .op = .gte },
             .{ .token = .less, .op = .lt },
             .{ .token = .less_equal, .op = .lte },
-        });
-    }
-
-    /// <exponent> ::= <addition> { '**' <addition> }
-    fn exponent(self: *Parser) Error!*ast.Expr {
-        return self.binaryLevel(addition, &.{
-            .{ .token = .star_star, .op = .pow },
         });
     }
 
@@ -994,12 +987,19 @@ pub const Parser = struct {
         });
     }
 
-    /// <multiplication> ::= <unary> { ( '*' | '/' | '%' ) <unary> }
+    /// <multiplication> ::= <exponent> { ( '*' | '/' | '%' ) <exponent> }
     fn multiplication(self: *Parser) Error!*ast.Expr {
-        return self.binaryLevel(unary, &.{
+        return self.binaryLevel(exponent, &.{
             .{ .token = .star, .op = .mul },
             .{ .token = .slash, .op = .div },
             .{ .token = .percent, .op = .mod },
+        });
+    }
+
+    /// <exponent> ::= <unary> { '**' <unary> }
+    fn exponent(self: *Parser) Error!*ast.Expr {
+        return self.binaryLevel(unary, &.{
+            .{ .token = .star_star, .op = .pow },
         });
     }
 
@@ -1055,7 +1055,7 @@ pub const Parser = struct {
     ///         | <exists-expr> | <list-dir-expr> | <remove-expr> | <rename-expr>
     ///         | <exec-expr>
     ///         | <now-expr> | <random-expr>
-    ///         | <ord-expr> | <join-expr>
+    ///         | <ord-expr> | <chr-expr> | <join-expr>
     ///         | 'stdin' | 'stdout' | 'stderr' | 'args' | IDENTIFIER
     fn atom(self: *Parser) Error!*ast.Expr {
         const tok = self.peek();
@@ -1128,6 +1128,7 @@ pub const Parser = struct {
             .kw_now => return self.nowExpr(),
             .kw_random => return self.randomExpr(),
             .kw_ord => return self.ordExpr(),
+            .kw_chr => return self.chrExpr(),
             .kw_join => return self.joinExpr(),
             .kw_stdin => {
                 _ = self.advance();
@@ -1530,6 +1531,19 @@ pub const Parser = struct {
         return self.createExpr(.{ .char_ord = value });
     }
 
+    /// <chr-expr> ::= 'chr' '(' <expression> ')'
+    ///
+    /// Like `ord` above, `chr` is a keyword in expression position only —
+    /// it isn't also a <type> keyword, so a bare `chr(65)` is a legal (if
+    /// pointless) <expr-stmt> too.
+    fn chrExpr(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // 'chr'
+        _ = try self.expect(.lparen, "expected '(' after 'chr'");
+        const value = try self.expression();
+        _ = try self.expect(.rparen, "expected ')' after the value to convert");
+        return self.createExpr(.{ .char_chr = value });
+    }
+
     /// <join-expr> ::= 'join' '(' <expression> ',' <expression> ')'
     ///
     /// Like `has`/`delete` above, `join` is a keyword in expression
@@ -1668,8 +1682,10 @@ test "parses precedence: multiplication binds tighter than addition" {
     try expectExprSexpr("1 + 2 * 3", "(+ 1 (* 2 3))");
 }
 
-test "parses precedence: exponent binds tighter than addition (left-associative, per grammar)" {
+test "parses precedence: exponent binds tighter than multiplication and addition (left-associative)" {
     try expectExprSexpr("2 ** 3 ** 2", "(** (** 2 3) 2)");
+    try expectExprSexpr("3 + 2 ** 2", "(+ 3 (** 2 2))");
+    try expectExprSexpr("2 * 3 ** 2", "(* 2 (** 3 2))");
 }
 
 test "parses precedence: comparison binds tighter than equality" {
@@ -2163,6 +2179,22 @@ test "ord(x) CAN stand alone as a top-level statement, unlike int(x)" {
 
     try std.testing.expectEqual(@as(usize, 1), result.program.len);
     try std.testing.expectEqualStrings("A", result.program[0].kind.expr_stmt.char_ord.literal.string);
+}
+
+test "parses chr(...) as an expression" {
+    try expectExprSexpr("chr(65)", "(chr 65)");
+    try expectExprSexpr("chr(n)", "(chr n)");
+}
+
+test "chr(x) CAN stand alone as a top-level statement, unlike int(x)" {
+    // Same reasoning as ord(x) above: 'chr' isn't also a <type> keyword,
+    // so nothing dispatches on it before expression parsing begins.
+    const allocator = std.testing.allocator;
+    var result = try parseProgramSource(allocator, "chr(65)\n");
+    defer result.parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.program.len);
+    try std.testing.expectEqual(@as(i64, 65), result.program[0].kind.expr_stmt.char_chr.literal.int);
 }
 
 test "parses join(...) as an expression" {

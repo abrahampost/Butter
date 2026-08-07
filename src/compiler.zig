@@ -1251,6 +1251,7 @@ pub const Compiler = struct {
             .random_float => StaticType{ .scalar = .float },
             .random_range => StaticType{ .scalar = .int },
             .char_ord => StaticType{ .scalar = .int },
+            .char_chr => StaticType{ .scalar = .string },
             .list_join => StaticType{ .scalar = .string },
             .string_interp => StaticType{ .scalar = .string },
         };
@@ -1819,6 +1820,10 @@ pub const Compiler = struct {
             .char_ord => |e| {
                 try self.compileExpr(e);
                 _ = try self.chunk.emit(self.allocator, .ord);
+            },
+            .char_chr => |e| {
+                try self.compileExpr(e);
+                _ = try self.chunk.emit(self.allocator, .chr);
             },
             .list_join => |j| {
                 try self.compileExpr(j.list);
@@ -5282,6 +5287,71 @@ test "ord(...)'s argument may be any expression, not just a literal" {
         \\print ord(s[0..1])
     , &buf);
     try std.testing.expectEqualStrings("90\n", output);
+}
+
+test "chr(...) returns the length-1 string for a byte value" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\print chr(65)
+        \\print chr(97)
+        \\print chr(48)
+    , &buf);
+    try std.testing.expectEqualStrings("A\na\n0\n", output);
+}
+
+test "chr(...) is ord(...)'s inverse at both range boundaries" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\print ord(chr(0))
+        \\print ord(chr(255))
+    , &buf);
+    try std.testing.expectEqualStrings("0\n255\n", output);
+}
+
+test "chr(...)'s static type lets it initialize a string local" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\string c := chr(65)
+        \\print c
+    , &buf);
+    try std.testing.expectEqualStrings("A\n", output);
+}
+
+test "chr(...)'s static type is checked against the declared type" {
+    const allocator = std.testing.allocator;
+    try expectCompileError(allocator, "int n := chr(65)\n", SemanticError.TypeMismatch);
+}
+
+test "chr(...) outside 0..255 is a runtime ByteOutOfRange" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.ByteOutOfRange, runProgram(allocator,
+        \\print chr(256)
+    , &buf));
+    try std.testing.expectError(vm_mod.RuntimeError.ByteOutOfRange, runProgram(allocator,
+        \\print chr(-1)
+    , &buf));
+}
+
+test "chr(...) on a non-int value is a runtime TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(vm_mod.RuntimeError.TypeMismatch, runProgram(allocator,
+        \\print chr("A")
+    , &buf));
+}
+
+test "chr(...)'s argument may be any expression, not just a literal" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+    const output = try runProgram(allocator,
+        \\int code := 90
+        \\print chr(code)
+    , &buf);
+    try std.testing.expectEqualStrings("Z\n", output);
 }
 
 // ---- String join (GRAMMAR.bnf design note 3ac) ---------------------------

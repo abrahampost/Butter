@@ -291,6 +291,11 @@ pub const Expr = union(enum) {
     /// type. `RuntimeError.InvalidCharLength` (ISA.bnf section 21) if
     /// `s`'s length isn't exactly 1 — checked, not truncated.
     char_ord: *Expr,
+    /// `chr(n)` (design note 3ab) — the inverse of `ord`: the length-1
+    /// `string` whose single byte is `n`. `RuntimeError.ByteOutOfRange`
+    /// (ISA.bnf section 21) if `n` isn't in `0..255` — the same range
+    /// check `write`'s buffer argument gets, checked rather than masked.
+    char_chr: *Expr,
     /// `join(list, sep)` (design note 3ac) — every `string` element of
     /// `list`, concatenated with `sep` between them, as one fresh string.
     /// The single-pass counterpart to building a string via repeated `+`
@@ -873,6 +878,11 @@ pub fn printExpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!
         },
         .char_ord => |e| {
             try writer.writeAll("(ord ");
+            try printExpr(writer, e);
+            try writer.writeAll(")");
+        },
+        .char_chr => |e| {
+            try writer.writeAll("(chr ");
             try printExpr(writer, e);
             try writer.writeAll(")");
         },

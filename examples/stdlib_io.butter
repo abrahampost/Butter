@@ -1,0 +1,22 @@
+# Whole-file reads: `import "io.std.butter"` — the bundled standard
+# library (src/stdlib.zig), resolved by name and embedded in the `butter`
+# binary rather than read from a file on disk (ISA.bnf section 8), same
+# as stdlib_math.butter/stdlib_string.butter/stdlib_collections.butter.
+#
+#   zig build run -- examples/stdlib_io.butter
+#
+# Paths are resolved against the CURRENT DIRECTORY, not this examples/
+# folder (like a bare `open`, unlike `import`) — run it from the repo
+# root as shown above. Creates/overwrites examples/io_greeting.txt.
+
+import "io.std.butter"
+
+int f := open("examples/io_greeting.txt", write)
+write(f, "Hello from Butter!\nThis whole file was written by one program...")
+close f
+
+# ...and read back by another `readFile` call, as a single `string` —
+# no manual open/read-loop/close/chr/join needed at the call site.
+string contents := readFile("examples/io_greeting.txt")
+print contents
+print len(contents)

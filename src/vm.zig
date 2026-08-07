@@ -1924,6 +1924,24 @@ pub const Vm = struct {
                 try self.push(.{ .int = bytes[0] });
             },
 
+            // `ord`'s inverse: an INT 0..255 back to the length-1 string
+            // whose single byte it is.
+            .chr => {
+                const v = try self.pop();
+                if (v != .int) {
+                    // Past here it's an INT (a non-heap scalar), so unlike
+                    // `ord`'s string argument there's nothing left to
+                    // release on the success path — same shape as EXIT's
+                    // own code_val check elsewhere in this switch.
+                    v.decref(self.allocator);
+                    return RuntimeError.TypeMismatch;
+                }
+                if (v.int < 0 or v.int > 255) return self.failFile(RuntimeError.ByteOutOfRange, "chr", "", "chr requires an int in 0..255");
+                const byte: u8 = @intCast(v.int);
+                const result = try Value.newString(self.allocator, &[_]u8{byte});
+                try self.push(result);
+            },
+
             // ---- String join (ISA.bnf section 22) ----
 
             .join => {
@@ -5086,6 +5104,78 @@ test "ord on a non-string value is TypeMismatch" {
     const n = try chunk.addConstant(allocator, .{ .int = 65 });
     _ = try chunk.emitWithOperand(allocator, .push_const, n);
     _ = try chunk.emit(allocator, .ord);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);
+}
+
+fn expectChr(byte: i64, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const n = try chunk.addConstant(allocator, .{ .int = byte });
+    _ = try chunk.emitWithOperand(allocator, .push_const, n);
+    _ = try chunk.emit(allocator, .chr);
+    _ = try chunk.emit(allocator, .print);
+    _ = try chunk.emit(allocator, .halt);
+
+    var buf: [64]u8 = undefined;
+    const len = try runSource(&chunk, &buf);
+    var expected_buf: [32]u8 = undefined;
+    const expected_str = try std.fmt.bufPrint(&expected_buf, "{s}\n", .{expected});
+    try std.testing.expectEqualStrings(expected_str, buf[0..len]);
+}
+
+test "chr returns a byte value's single-character string" {
+    try expectChr(65, "A");
+    try expectChr(97, "a");
+    try expectChr(48, "0");
+    try expectChr(32, " ");
+}
+
+test "chr on a boundary byte 0..255 round-trips through ord, even non-ASCII" {
+    // Same byte-not-codepoint convention as `ord` itself (see `ord`'s own
+    // tests, above) — 0 and 255 are both valid bytes even though 255 is
+    // never a valid UTF-8 byte on its own.
+    try expectChr(0, &[_]u8{0});
+    try expectChr(255, &[_]u8{0xFF});
+}
+
+test "chr above 255 is ByteOutOfRange" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const n = try chunk.addConstant(allocator, .{ .int = 256 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, n);
+    _ = try chunk.emit(allocator, .chr);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.ByteOutOfRange);
+}
+
+test "chr below 0 is ByteOutOfRange" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const n = try chunk.addConstant(allocator, .{ .int = -1 });
+    _ = try chunk.emitWithOperand(allocator, .push_const, n);
+    _ = try chunk.emit(allocator, .chr);
+    _ = try chunk.emit(allocator, .halt);
+
+    try expectRuntimeError(&chunk, RuntimeError.ByteOutOfRange);
+}
+
+test "chr on a non-int value is TypeMismatch" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    const s = try chunk.addConstant(allocator, try Value.newString(allocator, "A"));
+    _ = try chunk.emitWithOperand(allocator, .push_const, s);
+    _ = try chunk.emit(allocator, .chr);
     _ = try chunk.emit(allocator, .halt);
 
     try expectRuntimeError(&chunk, RuntimeError.TypeMismatch);

@@ -158,9 +158,11 @@ pub const OpCode = enum(u8) {
     parse_float,
 
     // Character conversion (ISA.bnf section 21, GRAMMAR.bnf design note
-    // 3ab). No operand: like PARSE_INT/PARSE_FLOAT, the string to convert
-    // is an ordinary popped `Value`, not a compile-time constant.
+    // 3ab). No operand: like PARSE_INT/PARSE_FLOAT, the value to convert
+    // is an ordinary popped `Value`, not a compile-time constant. CHR is
+    // ORD's inverse (int 0..255 -> length-1 string).
     ord,
+    chr,
 
     // String join (ISA.bnf section 22, GRAMMAR.bnf design note 3ac). No
     // operand: both the list and the separator are ordinary popped
@@ -803,6 +805,20 @@ test "disassemble renders ord" {
     try chunk.disassemble(&writer);
 
     try std.testing.expectEqualStrings("0000 ord\n", writer.buffered());
+}
+
+test "disassemble renders chr" {
+    const allocator = std.testing.allocator;
+    var chunk: Chunk = .{};
+    defer chunk.deinit(allocator);
+
+    _ = try chunk.emit(allocator, .chr);
+
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try chunk.disassemble(&writer);
+
+    try std.testing.expectEqualStrings("0000 chr\n", writer.buffered());
 }
 
 test "disassemble renders join" {

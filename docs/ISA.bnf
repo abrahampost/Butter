@@ -2004,7 +2004,7 @@
 
 
 (* --------------------------------------------------------------------------
-   21. CHARACTER CONVERSION (ORD — one new opcode, no new value kind;
+   21. CHARACTER CONVERSION (ORD/CHR — two new opcodes, no new value kind;
        GRAMMAR.bnf design note 3ab)
    -------------------------------------------------------------------------- *)
 
@@ -2021,30 +2021,51 @@
                                                (GRAMMAR.bnf design note 3ab)
                                                compiles to.
 
-   No operand: like PARSE_INT/PARSE_FLOAT (section 13), the string to
-   convert is an ordinary popped `Value`, not a compile-time constant.
-   Touches no heap state and needs no refcount bookkeeping beyond the
-   ordinary decref of its own (string) operand — the result is a plain
-   INT, exactly like PARSE_INT's string branch.
+   CHR                    ( int -- string )   pops an INT (must be
+                                               int-shaped;
+                                               `RuntimeError.TypeMismatch`
+                                               otherwise); if it isn't in
+                                               0..255, `RuntimeError.
+                                               ByteOutOfRange` (with a
+                                               `Vm.diagnostic`, operation
+                                               "chr" — the same error a
+                                               WRITE_BYTES buffer element
+                                               out of range gets, section 9);
+                                               otherwise pushes the fresh
+                                               length-1 STRING whose single
+                                               byte is that value. ORD's
+                                               inverse: `ord(chr(n)) == n`
+                                               for every `n` in range, and
+                                               `chr(ord(s)) == s` for every
+                                               single-byte `s`. What
+                                               `chr(x)` (GRAMMAR.bnf design
+                                               note 3ab) compiles to.
+
+   Neither has an operand: like PARSE_INT/PARSE_FLOAT (section 13), the
+   value to convert is an ordinary popped `Value`, not a compile-time
+   constant. ORD touches no heap state beyond the ordinary decref of its
+   own (string) operand — the result is a plain INT, exactly like
+   PARSE_INT's string branch. CHR allocates exactly one fresh refcount-1
+   STRING object (`Value.newString`, the same choke point every other
+   dynamically-built string value goes through), with nothing to decref on
+   its own (INT) operand — the same "nothing to release once the type
+   check passes" shape EXIT's own range-checked INT argument has.
 
    NO SEPARATE `char` VALUE KIND. This deliberately extends the existing
    "a character is a length-1 string" convention (section 11's Strings
    addendum: `s[i]` already returns a fresh length-1 STRING, not a
-   dedicated character type) rather than introducing one — ORD is simply
-   the byte-level escape hatch that convention was missing, for code that
-   needs the numeric value (case conversion, character-class predicates)
-   rather than something to print or compare against a string literal.
+   dedicated character type) rather than introducing one — ORD/CHR are
+   simply the byte-level escape hatches that convention was missing: ORD
+   for code that needs the numeric value (case conversion, character-class
+   predicates), CHR for code that needs to build a string one byte at a
+   time (e.g. io.std.butter's `readFile`, turning each byte READ hands
+   back into a string piece to accumulate and JOIN).
 
    BYTE-VALUED, NOT CODEPOINT-VALUED, matching every other byte-oriented
    operation this VM already has (`s[i]`, `s[a..b]`, `read`/`write`'s `int`
    buffers): a lone UTF-8 continuation byte of a multi-byte character is
-   still exactly one byte, so it's still a valid ORD operand — the result
-   is that raw byte, not a decoded codepoint.
-
-   ONLY THE CHARACTER-TO-BYTE DIRECTION IS PROVIDED HERE — no CHR/byte-to-
-   character counterpart opcode exists in this pass, the same "one
-   direction only" scope PARSE_INT's own float-to-int (not int-to-float)
-   cast already takes (section 13).
+   still exactly one valid ORD/CHR byte (0..255) each way, not a decoded
+   codepoint.
 
 
 (* --------------------------------------------------------------------------

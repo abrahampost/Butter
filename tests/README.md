@@ -19,6 +19,7 @@ which test one stage (lexer, parser, compiler, VM) in isolation.
 | [array_stats.butter](cases/array_stats.butter) | Sum, float average, min, and max of an array. |
 | [quadratic_formula.butter](cases/quadratic_formula.butter) | Quadratic roots via the bundled `math.std.butter`'s `sqrt`/`pow`. |
 | [string_utils.butter](cases/string_utils.butter) | Word stats (count, longest, case conversion, join/split/trim/pad/classify) via the bundled `string.std.butter`. |
+| [io_read_file.butter](cases/io_read_file.butter) | `readFile` via the bundled `io.std.butter` — reads back what it just `write`-wrote, and round-trips a byte string hitting both ends of the `ord`/`chr` range (0 and 255) plus an embedded null. |
 | [string_indexing.butter](cases/string_indexing.butter) | Hand-rolled `key=value;...` parsing via `s[i]` (single-character compare) and `s[a..b]` (slicing), plus basic index/slice reads. |
 | [strings.butter](cases/strings.butter) | String concatenation (`+`) and lexicographic ordering (`<`/`<=`/`>`/`>=`), including a bubble sort by string value. |
 | [string_interpolation.butter](cases/string_interpolation.butter) | `"...${expr}..."` interpolation — variables, arithmetic, struct fields, calls, list/map values and indexing, an enum, escaping `\$`, and nesting. |

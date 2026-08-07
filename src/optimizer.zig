@@ -274,6 +274,7 @@ fn optimizeExpr(allocator: std.mem.Allocator, expr: *ast.Expr) std.mem.Allocator
             try optimizeExpr(allocator, r.end);
         },
         .char_ord => |e| try optimizeExpr(allocator, e),
+        .char_chr => |e| try optimizeExpr(allocator, e),
         .list_join => |j| {
             try optimizeExpr(allocator, j.list);
             try optimizeExpr(allocator, j.sep);
